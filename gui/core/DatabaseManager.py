@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import datetime
+import json
 
 class DatabaseManager:
     def __init__(self, db_path):
@@ -8,12 +9,11 @@ class DatabaseManager:
         self.init_db()
 
     def init_db(self):
-        # 디렉토리가 없으면 생성
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # hv 컬럼을 문자열(TEXT)도 수용할 수 있도록 유연하게 설계
+        
+        # 기존 레거시 스키마 생성 (혹시 파일이 아예 없을 경우를 대비)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS run_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,26 +23,52 @@ class DatabaseManager:
                 config_dump TEXT
             )
         ''')
+        
+        cursor.execute("PRAGMA table_info(run_history)")
+        columns = [info[1] for info in cursor.fetchall()]
+        if 'env_metadata' not in columns:
+            cursor.execute("ALTER TABLE run_history ADD COLUMN env_metadata TEXT")
+        if 'daq_summary' not in columns:
+            cursor.execute("ALTER TABLE run_history ADD COLUMN daq_summary TEXT")
+        if 'production_summary' not in columns:
+            cursor.execute("ALTER TABLE run_history ADD COLUMN production_summary TEXT")
+            
         conn.commit()
         conn.close()
 
-    def record_run_start(self, output_file, hv_str, config_path):
-        """DAQ 런 시작 시각과 메타데이터, .conf 파일의 스냅샷을 DB에 기록합니다."""
+    def record_run_start(self, output_file, env_dict, config_path):
         config_dump = ""
         if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                config_dump = f.read()
+            with open(config_path, 'r') as f: config_dump = f.read()
+            
+        env_json = json.dumps(env_dict, ensure_ascii=False)
+        hv_fallback = env_dict.get("Applied HV", "Unknown") # 레거시 hv 컬럼 호환용
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         cursor.execute('''
-            INSERT INTO run_history (start_time, output_file, hv, config_dump)
-            VALUES (?, ?, ?, ?)
-        ''', (start_time, output_file, str(hv_str), config_dump))
-        
+            INSERT INTO run_history (start_time, output_file, hv, env_metadata, config_dump)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (start_time, output_file, hv_fallback, env_json, config_dump))
         run_id = cursor.lastrowid
         conn.commit()
         conn.close()
         return run_id
+
+    def update_daq_summary(self, run_id, summary_dict):
+        summary_json = json.dumps(summary_dict, ensure_ascii=False)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE run_history SET daq_summary = ? WHERE id = ?", (summary_json, run_id))
+        conn.commit()
+        conn.close()
+
+    def update_production_summary(self, raw_file_path, summary_dict):
+        summary_json = json.dumps(summary_dict, ensure_ascii=False)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE run_history SET production_summary = ? WHERE output_file = ?", (summary_json, raw_file_path))
+        conn.commit()
+        conn.close()
