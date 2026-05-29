@@ -13,7 +13,7 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # 기존 레거시 스키마 생성 (혹시 파일이 아예 없을 경우를 대비)
+        # 레거시 스키마 호환 유지
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS run_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,6 +24,7 @@ class DatabaseManager:
             )
         ''')
         
+        # 🌟 제1원리: 기존 DB 파괴 없이 JSON 메타데이터 및 통계 컬럼 동적 추가
         cursor.execute("PRAGMA table_info(run_history)")
         columns = [info[1] for info in cursor.fetchall()]
         if 'env_metadata' not in columns:
@@ -42,7 +43,7 @@ class DatabaseManager:
             with open(config_path, 'r') as f: config_dump = f.read()
             
         env_json = json.dumps(env_dict, ensure_ascii=False)
-        hv_fallback = env_dict.get("Applied HV", "Unknown") # 레거시 hv 컬럼 호환용
+        hv_fallback = env_dict.get("AppliedHV", "Unknown") 
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
