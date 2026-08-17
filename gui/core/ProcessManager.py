@@ -1,11 +1,14 @@
 import subprocess
 import re
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 
 class ProcessManager(QThread):
     log_signal = pyqtSignal(str)
     stat_signal = pyqtSignal(dict) 
     finished_signal = pyqtSignal(int)
+    
+    temp_signal = pyqtSignal(float)
+    led_signal = pyqtSignal(dict)
 
     def __init__(self, cmd, cwd=None):
         super().__init__()
@@ -15,6 +18,9 @@ class ProcessManager(QThread):
         self.is_running = False
         
         self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\r')
+        self.re_temp = re.compile(r"\[STATUS\] TEMP:\s*([\d\.]+)")
+        # 6개 LED 인디케이터 상태 파싱 정규식
+        self.re_led = re.compile(r"\[STATUS\] LED:\s*LOCK=(\d),\s*BYPS=(\d),\s*RUN=(\d),\s*TRG=(\d),\s*DRDY=(\d),\s*BUSY=(\d)")
 
     def run(self):
         self.is_running = True
@@ -39,6 +45,20 @@ class ProcessManager(QThread):
                     
                     if "[LIVE DAQ]" in clean_line:
                         self._parse_and_emit_stats(clean_line)
+                    elif "[STATUS] TEMP:" in clean_line:
+                        m = self.re_temp.search(clean_line)
+                        if m: self.temp_signal.emit(float(m.group(1)))
+                    elif "[STATUS] LED:" in clean_line:
+                        m = self.re_led.search(clean_line)
+                        if m:
+                            self.led_signal.emit({
+                                'PLL LOCK': int(m.group(1)),
+                                'PLL BYPS': int(m.group(2)),
+                                'RUN': int(m.group(3)),
+                                'TRG': int(m.group(4)),
+                                'DRDY': int(m.group(5)),
+                                'BUSY': int(m.group(6))
+                            })
                     else:
                         self.log_signal.emit(clean_line)
             

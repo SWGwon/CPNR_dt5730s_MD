@@ -1,9 +1,9 @@
 import re
 import os
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
-from PyQt5.QtCore import Qt, pyqtSlot, QSettings, QProcess
+from PyQt6.QtCore import Qt, pyqtSlot, QSettings, QProcess
 from core.DatabaseManager import DatabaseManager
 
 class ProductionTab(QWidget):
@@ -15,7 +15,7 @@ class ProductionTab(QWidget):
             curr = os.path.dirname(curr)
         self.proj_dir = curr if curr != '/' else os.getcwd()
         
-        self.bin_dir = os.path.join(self.proj_dir, "build", "bin")
+        self.bin_dir = os.path.join(self.proj_dir, "bin")
         self.data_dir = os.path.join(self.proj_dir, "data")
         os.makedirs(self.data_dir, exist_ok=True)
         
@@ -48,7 +48,6 @@ class ProductionTab(QWidget):
         io_layout.addWidget(QLabel("Output ROOT (.root):"), 1, 0); io_layout.addWidget(self.output_edit, 1, 1); io_layout.addWidget(self.btn_browse_out, 1, 2)
         io_group.setLayout(io_layout); layout.addWidget(io_group)
 
-        # 🌟 디버그 인터랙티브 버튼 지원
         opt_group = QGroupBox("Conversion Options & Time-Machine Debugger")
         opt_layout = QHBoxLayout()
         self.chk_save_waveforms = QCheckBox("Save Waveforms (-w)")
@@ -79,11 +78,11 @@ class ProductionTab(QWidget):
 
         dash_group = QGroupBox("Conversion Status Dashboard")
         dash_layout = QVBoxLayout()
-        self.progress_bar = QProgressBar(); self.progress_bar.setValue(0); self.progress_bar.setAlignment(Qt.AlignCenter); self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #5cb85c; }")
+        self.progress_bar = QProgressBar(); self.progress_bar.setValue(0); self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter); self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #5cb85c; }")
         stat_layout = QHBoxLayout()
         self.lbl_events = QLabel("Events: 0"); self.lbl_speed = QLabel("Speed: 0.0 MB/s"); self.lbl_eta = QLabel("ETA: 0 s")
         font = self.lbl_events.font(); font.setPointSize(11); font.setBold(True)
-        for lbl in [self.lbl_events, self.lbl_speed, self.lbl_eta]: lbl.setFont(font); lbl.setAlignment(Qt.AlignCenter); stat_layout.addWidget(lbl)
+        for lbl in [self.lbl_events, self.lbl_speed, self.lbl_eta]: lbl.setFont(font); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); stat_layout.addWidget(lbl)
         dash_layout.addWidget(self.progress_bar); dash_layout.addLayout(stat_layout); dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
 
@@ -94,7 +93,7 @@ class ProductionTab(QWidget):
         self.set_debug_controls_enabled(False)
 
     def toggle_debug_ui(self, state):
-        self.spin_debug_start.setEnabled(state == Qt.Checked)
+        self.spin_debug_start.setEnabled(self.chk_debug_mode.isChecked())
 
     def set_debug_controls_enabled(self, enabled):
         self.btn_prev.setEnabled(enabled); self.btn_next.setEnabled(enabled); self.spin_jump.setEnabled(enabled); self.btn_jump.setEnabled(enabled); self.btn_quit.setEnabled(enabled)
@@ -147,15 +146,15 @@ class ProductionTab(QWidget):
         self.process.start(exe_path, args)
 
     def stop_all(self):
-        if self.process.state() == QProcess.Running:
+        if self.process.state() == QProcess.ProcessState.Running:
             self.process.terminate()
             self.process.waitForFinished(1000)
-            if self.process.state() == QProcess.Running: self.process.kill()
+            if self.process.state() == QProcess.ProcessState.Running: self.process.kill()
             self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
             self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
 
     def send_debug_command(self, cmd_str):
-        if self.process.state() == QProcess.Running: self.process.write(cmd_str.encode('utf-8'))
+        if self.process.state() == QProcess.ProcessState.Running: self.process.write(cmd_str.encode('utf-8'))
 
     @pyqtSlot()
     def handle_stdout(self):
@@ -181,7 +180,7 @@ class ProductionTab(QWidget):
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
         self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
-        if exitStatus == QProcess.NormalExit and exitCode == 0:
+        if exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0:
             self.log_console.append(f"<span style='color:#5cb85c;'><b>[System] Conversion Successfully Finished!</b></span>")
             if self.current_raw_file and self.last_stats:
                 self.db.update_production_summary(self.current_raw_file, self.last_stats)

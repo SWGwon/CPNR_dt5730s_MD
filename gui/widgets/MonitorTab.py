@@ -2,11 +2,10 @@ import struct
 import numpy as np
 import pyqtgraph as pg
 import zmq
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox
-from PyQt5.QtCore import QTimer
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox, QProgressBar, QMessageBox
+from PyQt6.QtCore import QTimer, pyqtSlot
 from collections import deque
 
-# ExtTTT(Q), EvtID(I), RecLen(I), Mask(H), Pattern(H), Reserved(I)
 HEADER_FORMAT = "=QIIHHI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
@@ -18,11 +17,12 @@ class MonitorTab(QWidget):
         self.curves_qlong = {}  
         self.q_long_hists = {}  
         
-        # 채널 8개 동시 오버레이 시 시인성 보장을 위한 팔레트
         self.colors = [
             '#0d6efd', '#198754', '#dc3545', '#fd7e14', 
             '#6f42c1', '#0dcaf0', '#d63384', '#6c757d'
         ]
+        
+        self.warning_latched = False 
         
         self.setup_zmq()
         self.setup_ui()
@@ -48,12 +48,11 @@ class MonitorTab(QWidget):
         self.cb_monitor.currentIndexChanged.connect(self.toggle_monitor)
         ctrl_layout.addWidget(self.cb_monitor)
 
-        # [신규 UX] 최대 히스토리 누적 수 동적 조절기
         ctrl_layout.addWidget(QLabel("  |  <b>Spectrum History:</b>"))
         self.spin_history = QSpinBox()
         self.spin_history.setRange(100, 100000)
         self.spin_history.setSingleStep(500)
-        self.spin_history.setValue(2000) # 연구원님 요청 기본값 2000
+        self.spin_history.setValue(2000)
         self.spin_history.setSuffix(" Evts")
         self.spin_history.valueChanged.connect(self.update_history_size)
         ctrl_layout.addWidget(self.spin_history)
@@ -62,6 +61,15 @@ class MonitorTab(QWidget):
         self.btn_clear.setStyleSheet("font-weight: bold; padding: 4px 15px; margin-left: 10px;")
         self.btn_clear.clicked.connect(self.clear_data)
         ctrl_layout.addWidget(self.btn_clear)
+        
+        ctrl_layout.addWidget(QLabel("  |  <b>ADC Temp:</b>"))
+        self.temp_bar = QProgressBar()
+        self.temp_bar.setRange(0, 100)
+        self.temp_bar.setFormat("%v °C")
+        self.temp_bar.setFixedWidth(100)
+        self.temp_bar.setStyleSheet("QProgressBar { text-align: center; } QProgressBar::chunk { background-color: #198754; }")
+        ctrl_layout.addWidget(self.temp_bar)
+        
         ctrl_layout.addStretch() 
         layout.addLayout(ctrl_layout)
 
@@ -81,12 +89,28 @@ class MonitorTab(QWidget):
         self.plot_qlong.setLabel('left', "Counts (Log)")
         self.plot_qlong.addLegend(offset=(10, 10))
 
+    @pyqtSlot(float)
+    def update_temperature(self, temp: float):
+        self.temp_bar.setValue(int(temp))
+        
+        if temp >= 80.0:
+            self.temp_bar.setStyleSheet("QProgressBar { text-align: center; } QProgressBar::chunk { background-color: #dc3545; }")
+            if not self.warning_latched:
+                self.warning_latched = True
+                QMessageBox.warning(
+                    self, 
+                    "Over-Temperature Warning", 
+                    "ADC 내부 온도가 80°C를 초과했습니다.\n85°C 도달 시 하드웨어 보호를 위해 ADC가 강제 종료됩니다."
+                )
+        else:
+            self.temp_bar.setStyleSheet("QProgressBar { text-align: center; } QProgressBar::chunk { background-color: #198754; }")
+            if temp < 75.0:
+                self.warning_latched = False
+
     def update_history_size(self):
-        """스핀박스 값 변경 시, 즉각적으로 큐(deque)의 maxlen을 갱신합니다."""
         new_size = self.spin_history.value()
         for ch in self.q_long_hists:
             current_data = list(self.q_long_hists[ch])
-            # 새 크기에 맞춰 기존 데이터를 잘라내고 새로운 큐 생성
             self.q_long_hists[ch] = deque(current_data[-new_size:], maxlen=new_size)
 
     def rebuild_plots(self, mask):
@@ -107,7 +131,6 @@ class MonitorTab(QWidget):
             pen = pg.mkPen(color, width=1.5)
             self.curves_wave[ch] = self.plot_wave.plot(name=f"CH {ch}", pen=pen)
             
-            # 8개 채널 중첩 시에도 투명도를 유지하도록 alpha 100 고정
             brush = pg.mkColor(color)
             brush.setAlpha(100)
             self.curves_qlong[ch] = self.plot_qlong.plot(name=f"CH {ch}", stepMode="center", fillLevel=0, brush=brush, pen=color)
@@ -153,7 +176,6 @@ class MonitorTab(QWidget):
                     if wave_bytes:
                         wave_arr = np.frombuffer(wave_bytes, dtype=np.uint16)
                         if len(wave_arr) > 200:
-                            # 다양한 RecordLength에도 동적으로 대응하는 25% 베이스라인 윈도우
                             baseline_end = record_len // 4 
                             baseline = np.mean(wave_arr[:baseline_end])
                             pulse_area = np.sum(baseline - wave_arr[baseline_end:]) 

@@ -21,6 +21,10 @@ DAQManager::DAQManager(const std::string &config_file,
   zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
   int hwm = 5000;
   zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+  
+  // DAQ 재시작 시 ZMQ 포트(5555) TIME_WAIT 충돌 방지
+  int linger = 0;
+  zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger));
   zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555");
 
   // [Output File & Buffer 초기화]
@@ -69,7 +73,6 @@ void DAQManager::SetupHardware() {
       }
   }
 
-  // 획득 모드 및 외부/내부 트리거 설정
   CAEN_DGTZ_TriggerMode_t trg_mode = CAEN_DGTZ_TRGMODE_ACQ_ONLY;
   
   int ext_trg = config_.GetInt("Digitizer", "ExtTriggerMode", 1);
@@ -93,6 +96,12 @@ void DAQManager::SetupHardware() {
 
 void DAQManager::Start(std::atomic<bool>& is_running) {
   std::cout << "\033[1;32m[DAQManager]\033[0m Starting Acquisition...\n";
+  
+  std::cout << " - Stop Condition : ";
+  if (max_events_ > 0) std::cout << max_events_ << " Events\n";
+  else if (run_time_sec_ > 0) std::cout << run_time_sec_ << " Seconds\n";
+  else std::cout << "Unlimited (Manual Stop)\n";
+
   CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_.GetHandle()));
   AcquisitionLoop(is_running);
 }
@@ -131,70 +140,76 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
     try {
       uint32_t bsize = 0;
       CAEN_CHECK(CAEN_DGTZ_ReadData(handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT, caen_buffer, &bsize));
-      if (bsize == 0) continue; 
+      
+      // [버그 픽스] 데이터가 없을 때 continue를 해버리면 하단 타이머가 돌지 않으므로, 
+      // 데이터가 있을 때(bsize > 0)만 블록 안에서 처리하도록 구조 변경
+      if (bsize > 0) {
+        uint32_t num_events = 0;
+        CAEN_CHECK(CAEN_DGTZ_GetNumEvents(handle, caen_buffer, bsize, &num_events));
 
-      uint32_t num_events = 0;
-      CAEN_CHECK(CAEN_DGTZ_GetNumEvents(handle, caen_buffer, bsize, &num_events));
+        for (uint32_t i = 0; i < num_events; ++i) {
+          CAEN_DGTZ_EventInfo_t evt_info;
+          char *evt_ptr = nullptr;
+          
+          CAEN_CHECK(CAEN_DGTZ_GetEventInfo(handle, caen_buffer, bsize, i, &evt_info, &evt_ptr));
+          CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
 
-      for (uint32_t i = 0; i < num_events; ++i) {
-        CAEN_DGTZ_EventInfo_t evt_info;
-        char *evt_ptr = nullptr;
-        
-        CAEN_CHECK(CAEN_DGTZ_GetEventInfo(handle, caen_buffer, bsize, i, &evt_info, &evt_ptr));
-        CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
+          uint32_t current_ttt = evt_info.TriggerTimeTag & TTT_MASK;
+          if (current_ttt < prev_ttt) ttt_rollovers++;
+          prev_ttt = current_ttt;
 
-        uint32_t current_ttt = evt_info.TriggerTimeTag & TTT_MASK;
-        if (current_ttt < prev_ttt) ttt_rollovers++;
-        prev_ttt = current_ttt;
-
-        uint32_t actual_trace_size = 0;
-        for (int ch = 0; ch < MAX_CH; ++ch) {
-            if ((evt_info.ChannelMask >> ch) & 1) {
-                actual_trace_size = caen_event->ChSize[ch];
-                break; 
-            }
-        }
-
-        std::memset(header, 0, sizeof(EventHeader));
-        header->ExtendedTTT = (ttt_rollovers << 31) | current_ttt;
-        header->EventID = event_count++;
-        header->RecordLength = actual_trace_size; 
-        header->ChannelMask = evt_info.ChannelMask;
-        header->Pattern = evt_info.Pattern;
-
-        size_t payload_size = sizeof(EventHeader);
-        for (int ch = 0; ch < MAX_CH; ++ch) {
-          if ((header->ChannelMask >> ch) & 1) {
-            uint16_t *wave_src = caen_event->DataChannel[ch];
-            uint32_t trace_size = caen_event->ChSize[ch];
-            
-            if (trace_size == 0) continue;
-
-            if (payload_size + trace_size * sizeof(uint16_t) > raw_buffer_pool_.size()) {
-                break; 
-            }
-
-            std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t),
-                        wave_src, trace_size * sizeof(uint16_t));
-            
-            payload_size += trace_size * sizeof(uint16_t);
+          uint32_t actual_trace_size = 0;
+          for (int ch = 0; ch < MAX_CH; ++ch) {
+              if ((evt_info.ChannelMask >> ch) & 1) {
+                  actual_trace_size = caen_event->ChSize[ch];
+                  break; 
+              }
           }
-        }
 
-        if (out_stream_.is_open()) {
-            out_stream_.write(raw_buffer_pool_.data(), payload_size);
-            total_bytes_written += payload_size; 
+          std::memset(header, 0, sizeof(EventHeader));
+          header->ExtendedTTT = (ttt_rollovers << 31) | current_ttt;
+          header->EventID = event_count++;
+          header->RecordLength = actual_trace_size; 
+          header->ChannelMask = evt_info.ChannelMask;
+          header->Pattern = evt_info.Pattern;
+
+          size_t payload_size = sizeof(EventHeader);
+          for (int ch = 0; ch < MAX_CH; ++ch) {
+            if ((header->ChannelMask >> ch) & 1) {
+              uint16_t *wave_src = caen_event->DataChannel[ch];
+              uint32_t trace_size = caen_event->ChSize[ch];
+              
+              if (trace_size == 0) continue;
+
+              if (payload_size + trace_size * sizeof(uint16_t) > raw_buffer_pool_.size()) {
+                  break; 
+              }
+
+              std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t),
+                          wave_src, trace_size * sizeof(uint16_t));
+              
+              payload_size += trace_size * sizeof(uint16_t);
+            }
+          }
+
+          if (out_stream_.is_open()) {
+              out_stream_.write(raw_buffer_pool_.data(), payload_size);
+              total_bytes_written += payload_size; 
+          }
+          
+          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) {
+              if (zmq_errno() == EAGAIN) zmq_drops++;
+          }
+          log_events++;
         }
-        
-        if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) {
-            if (zmq_errno() == EAGAIN) zmq_drops++;
-        }
-        log_events++;
-      }
+      } // End of bsize > 0
     } catch (const std::exception& e) {
         std::cerr << "\n\033[1;33m[Warning] Readout Soft-Error: \033[0m" << e.what() << "\n";
     }
 
+    // -------------------------------------------------------------
+    // [보장됨] bsize가 0이더라도 이 아래 로직은 무조건 도달합니다.
+    // -------------------------------------------------------------
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
     if (elapsed_ms >= 1000.0) {
@@ -205,6 +220,27 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
       auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
       int mins = total_sec / 60;
       int secs = total_sec % 60;
+
+      uint32_t temp_reg = 0, status_reg = 0;
+      if (CAEN_DGTZ_ReadRegister(handle, 0x10A8, &temp_reg) == CAEN_DGTZ_Success) {
+          std::cout << "\n[STATUS] TEMP: " << static_cast<float>(temp_reg & 0xFF) << std::endl;
+      }
+      
+      if (CAEN_DGTZ_ReadRegister(handle, 0x8104, &status_reg) == CAEN_DGTZ_Success) {
+          int run      = (status_reg >> 0) & 0x1; 
+          int drdy     = (status_reg >> 2) & 0x1; 
+          int busy     = (status_reg >> 3) & 0x1; 
+          int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0; 
+          int trg      = (rate > 0.0) ? 1 : 0; 
+          int pll_byps = 0; 
+
+          std::cout << "[STATUS] LED: LOCK=" << pll_lock 
+                    << ", BYPS=" << pll_byps
+                    << ", RUN=" << run 
+                    << ", TRG=" << trg 
+                    << ", DRDY=" << drdy
+                    << ", BUSY=" << busy << std::endl;
+      }
 
       std::cout << "\r\033[K\033[1;36m[LIVE DAQ]\033[0m "
                 << "Time: \033[1m" << std::setfill('0') << std::setw(2) << mins << ":" << std::setw(2) << secs << "\033[0m | "

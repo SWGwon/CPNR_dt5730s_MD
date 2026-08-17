@@ -1,11 +1,11 @@
 import os
 import configparser
 import pyqtgraph as pg
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
                              QFileDialog, QCheckBox)
-from PyQt5.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings
 
 class ConfigTab(QWidget):
     def __init__(self, parent=None):
@@ -47,10 +47,21 @@ class ConfigTab(QWidget):
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Section", "Parameter", "Value"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         left_layout.addWidget(self.table)
+
+        # 수동 캘리브레이션 로직 분리 및 Advanced Settings 추가
+        self.advanced_group = QGroupBox("Advanced Settings (DT5730S Auto-calibrated)")
+        advanced_layout = QVBoxLayout()
+        self.btn_calibrate = QPushButton("Manual ADC Calibration")
+        self.btn_calibrate.setToolTip("DT5730S 보드는 전원 인가 시 자동 캘리브레이션되므로 일반적인 런에서는 필요하지 않습니다.")
+        self.btn_calibrate.setStyleSheet("background-color: #6c757d; color: white;")
+        advanced_layout.addWidget(self.btn_calibrate)
+        self.advanced_group.setLayout(advanced_layout)
+        left_layout.addWidget(self.advanced_group)
+
         layout.addLayout(left_layout, stretch=5)
 
         right_layout = QVBoxLayout()
@@ -58,7 +69,6 @@ class ConfigTab(QWidget):
         mask_vbox = QVBoxLayout()
         chk_layout = QGridLayout()
         self.ch_checks = []
-        # 🌟 DT5730S는 8채널 (CH0~CH7)
         for i in range(8):
             chk = QCheckBox(f"CH{i}")
             if i == 0: chk.setChecked(True)
@@ -96,7 +106,6 @@ class ConfigTab(QWidget):
         time_group.setLayout(time_vbox)
         right_layout.addWidget(time_group)
 
-        # 🌟 DT5730S 14-bit, 2Vpp 시뮬레이터 적용
         sim_group = QGroupBox("ADC Parameter Simulator (14-bit, 2Vpp)")
         sim_vbox = QVBoxLayout()
         input_grid = QGridLayout()
@@ -121,7 +130,7 @@ class ConfigTab(QWidget):
         self.plot_sim.setYRange(0, 16383, padding=0)
         self.plot_sim.setXRange(0, 1, padding=0); self.plot_sim.hideAxis('bottom')
         self.plot_sim.setLabel('left', "ADC Bins (14-bit)")
-        self.line_base = pg.InfiniteLine(angle=0, pen=pg.mkPen('#198754', width=2, style=Qt.DashLine))
+        self.line_base = pg.InfiniteLine(angle=0, pen=pg.mkPen('#198754', width=2, style=Qt.PenStyle.DashLine))
         self.line_trg = pg.InfiniteLine(angle=0, pen=pg.mkPen('#dc3545', width=2))
         self.plot_sim.addItem(self.line_base); self.plot_sim.addItem(self.line_trg)
         sim_vbox.addWidget(self.plot_sim)
@@ -170,7 +179,6 @@ class ConfigTab(QWidget):
     def update_time_simulator(self):
         rec_len = self.spin_record.value()
         target_t0_ns = self.spin_target_t0.value()
-        # 🌟 DT5730S는 500MS/s 고정이므로 2ns/Sample 적용
         dt_ns = 2.0 
         total_time_ns = rec_len * dt_ns
         if target_t0_ns >= total_time_ns: return
@@ -196,7 +204,6 @@ class ConfigTab(QWidget):
         base_pct = self.spin_base_pct.value() / 100.0
         trg_mv = self.spin_trg_mv.value()
         dac_offset = int((1.0 - base_pct) * 65535)
-        # 🌟 14-bit(16384 bins), 2Vpp (1 LSB = 2000mV / 16384 = 0.12207 mV)
         adc_baseline = int(base_pct * 16383)
         adc_trg_drop = int(trg_mv / 0.12207) 
         adc_trigger = adc_baseline - adc_trg_drop
@@ -219,16 +226,16 @@ class ConfigTab(QWidget):
                 if param == "DCOffset" or param == "TriggerThreshold":
                     val = calc_offset if param == "DCOffset" else calc_trg
                     self.table.setItem(row, 2, QTableWidgetItem(val))
-                    self.table.item(row, 2).setBackground(Qt.yellow)
+                    self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
 
     def set_table_value(self, target_section, target_param, value):
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).text() == target_section and self.table.item(row, 1).text() == target_param:
-                self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.yellow)
+                self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
                 return
         row = self.table.rowCount(); self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(target_section)); self.table.setItem(row, 1, QTableWidgetItem(target_param))
-        self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.yellow)
+        self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
 
     def save_config(self):
         if not self.current_config_path: return
@@ -237,5 +244,5 @@ class ConfigTab(QWidget):
             sec = self.table.item(row, 0).text(); key = self.table.item(row, 1).text(); val = self.table.item(row, 2).text()
             if not self.config.has_section(sec): self.config.add_section(sec)
             self.config.set(sec, key, val)
-            self.table.item(row, 2).setBackground(Qt.white) 
+            self.table.item(row, 2).setBackground(Qt.GlobalColor.white) 
         with open(self.current_config_path, 'w') as configfile: self.config.write(configfile)

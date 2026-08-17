@@ -1,27 +1,32 @@
 import os
 import shutil
 import configparser
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
+import re
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
                              QGroupBox, QSpinBox, QComboBox, QFileDialog)
-from PyQt5.QtGui import QFont, QTextCursor
-from PyQt5.QtCore import QTimer, QSettings
+from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtCore import QTimer, QSettings, pyqtSignal
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
 
 class DaqTab(QWidget):
+    # MainWindow와 영구적으로 통신할 브릿지 시그널 선언
+    hardware_led_signal = pyqtSignal(dict)
+    hardware_temp_signal = pyqtSignal(float)
+    daq_finished_signal = pyqtSignal(int)
+
     def __init__(self, parent=None, env_data_provider=None):
         super().__init__(parent)
         self.env_data_provider = env_data_provider
         self.daq_process = None
         
-        # 프로젝트 최상위 폴더 동적 앵커링
         curr = os.path.abspath(os.path.dirname(__file__))
         while curr != '/' and not os.path.exists(os.path.join(curr, 'CMakeLists.txt')):
             curr = os.path.dirname(curr)
         self.proj_dir = curr if curr != '/' else os.getcwd()
         
-        self.bin_dir = os.path.join(self.proj_dir, "build", "bin")
+        self.bin_dir = os.path.join(self.proj_dir, "bin")
         self.data_dir = os.path.join(self.proj_dir, "data")
         self.config_dir = os.path.join(self.proj_dir, "config")
         
@@ -32,6 +37,7 @@ class DaqTab(QWidget):
         self.current_batch = 0; self.total_batches = 1
         self.base_output_path = ""; self.scan_values = [] 
         self.last_stats = {}; self.current_run_id = -1
+        self.current_run_no = 1
         
         self.setup_ui()
         self.load_settings()
@@ -53,14 +59,23 @@ class DaqTab(QWidget):
         self.btn_browse_config.clicked.connect(self.browse_config)
         file_layout.addWidget(self.btn_browse_config, 0, 2)
 
-        file_layout.addWidget(QLabel("Output (.dat):"), 1, 0)
+        file_layout.addWidget(QLabel("Base Output (.dat):"), 1, 0)
+        
+        # Output 경로 옆에 Run No. 스핀박스 배치 (자동 증가)
+        out_layout = QHBoxLayout()
         self.output_input = QLineEdit("data/data_run.dat")
-        file_layout.addWidget(self.output_input, 1, 1)
+        out_layout.addWidget(self.output_input)
+        self.spin_run_no = QSpinBox()
+        self.spin_run_no.setPrefix("Run No: ")
+        self.spin_run_no.setRange(1, 99999)
+        self.spin_run_no.setToolTip("데이터 덮어쓰기 방지: 매 시작마다 파일명 끝에 _runNNN 이 붙고 자동 증가합니다.")
+        out_layout.addWidget(self.spin_run_no)
+        file_layout.addLayout(out_layout, 1, 1)
+        
         self.btn_browse_output = QPushButton("Browse")
         self.btn_browse_output.clicked.connect(self.browse_output)
         file_layout.addWidget(self.btn_browse_output, 1, 2)
 
-        # 🌟 설정 파일에서 읽어올 핵심 메타데이터 UI
         file_layout.addWidget(QLabel("Run Metadata:"), 2, 0)
         env_layout = QHBoxLayout()
         self.operator_input = QLineEdit("Unknown")
@@ -81,17 +96,26 @@ class DaqTab(QWidget):
         cond_group = QGroupBox("Run Conditions & Mode")
         cond_main_layout = QVBoxLayout()
         cond_layout1 = QHBoxLayout()
-        cond_layout1.addWidget(QLabel("Max Events:"))
-        self.spin_events = QSpinBox(); self.spin_events.setRange(0, 2000000000)
+        
+        # 획득 제한 조건 콤보박스 (상호 배타적 제어 UI)
+        cond_layout1.addWidget(QLabel("Stop Cond:"))
+        self.combo_stop_cond = QComboBox()
+        self.combo_stop_cond.addItems(["Unlimited", "Max Events", "Max Time"])
+        self.combo_stop_cond.currentIndexChanged.connect(self.toggle_stop_cond)
+        cond_layout1.addWidget(self.combo_stop_cond)
+        
+        self.spin_events = QSpinBox(); self.spin_events.setRange(0, 2000000000); self.spin_events.setPrefix("Evts: ")
         cond_layout1.addWidget(self.spin_events)
-        cond_layout1.addWidget(QLabel("Max Time (sec):"))
-        self.spin_time = QSpinBox(); self.spin_time.setRange(0, 86400)
+        
+        self.spin_time = QSpinBox(); self.spin_time.setRange(0, 86400); self.spin_time.setPrefix("Sec: ")
         cond_layout1.addWidget(self.spin_time)
-        cond_layout1.addWidget(QLabel("Run Mode:"))
+        
+        cond_layout1.addWidget(QLabel("  |  Run Mode:"))
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Single Continuous", "Split/Batch Mode", "Auto Threshold Scan"])
         self.combo_mode.currentIndexChanged.connect(self.toggle_batch_mode)
         cond_layout1.addWidget(self.combo_mode)
+        
         self.lbl_batch = QLabel("Batches:")
         self.spin_batch = QSpinBox(); self.spin_batch.setRange(2, 999); self.spin_batch.setEnabled(False)
         cond_layout1.addWidget(self.lbl_batch)
@@ -101,7 +125,6 @@ class DaqTab(QWidget):
         self.scan_layout = QHBoxLayout()
         self.scan_layout.addWidget(QLabel("Scan Range (14-bit ADC):"))
         self.scan_layout.addWidget(QLabel("Start:"))
-        # 🌟 DT5730S 14-bit 해상도(0~16383) 한계치 적용
         self.spin_scan_start = QSpinBox(); self.spin_scan_start.setRange(0, 16383); self.spin_scan_start.setValue(14000)
         self.scan_layout.addWidget(self.spin_scan_start)
         self.scan_layout.addWidget(QLabel("End:"))
@@ -146,19 +169,29 @@ class DaqTab(QWidget):
         self.terminal.setStyleSheet("background-color: #ffffff; color: #212529; border: 1px solid #ced4da;")
         layout.addWidget(self.terminal)
 
+    def toggle_stop_cond(self, idx):
+        """콤보박스 선택에 따라 설정 불가능한 스핀박스를 비활성화하여 오입력 차단"""
+        self.spin_events.setEnabled(idx == 1)
+        self.spin_time.setEnabled(idx == 2)
+
     def load_settings(self):
         saved_config = self.settings.value("last_config", "config/dt5730s_inorganic_master.conf")
         self.config_input.setText(saved_config)
         self.output_input.setText(self.settings.value("last_output", "data/data_run.dat"))
+        self.spin_run_no.setValue(int(self.settings.value("last_run_no", 1)))
         self.spin_events.setValue(int(self.settings.value("last_events", 0)))
         self.spin_time.setValue(int(self.settings.value("last_time", 3600)))
+        self.combo_stop_cond.setCurrentIndex(int(self.settings.value("last_stop_cond", 0)))
+        self.toggle_stop_cond(self.combo_stop_cond.currentIndex())
         if saved_config: self.parse_env_from_config(saved_config)
 
     def save_settings(self):
         self.settings.setValue("last_config", self.config_input.text())
         self.settings.setValue("last_output", self.output_input.text())
+        self.settings.setValue("last_run_no", self.spin_run_no.value())
         self.settings.setValue("last_events", self.spin_events.value())
         self.settings.setValue("last_time", self.spin_time.value())
+        self.settings.setValue("last_stop_cond", self.combo_stop_cond.currentIndex())
 
     def parse_env_from_config(self, filepath):
         if not os.path.isabs(filepath): full_path = os.path.abspath(os.path.join(self.proj_dir, filepath))
@@ -168,7 +201,6 @@ class DaqTab(QWidget):
         cfg = configparser.ConfigParser()
         cfg.optionxform = str
         cfg.read(full_path)
-        # 🌟 설정 파일에서 [Environment] 색인을 읽어와 동기화
         if cfg.has_section("Environment"):
             self.operator_input.setText(cfg.get("Environment", "Operator", fallback="Unknown"))
             self.hv_input.setText(cfg.get("Environment", "AppliedHV", fallback="0V"))
@@ -188,7 +220,7 @@ class DaqTab(QWidget):
             self.save_settings()
 
     def browse_output(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Select Output File", self.data_dir, "Data Files (*.dat);;All Files (*)")
+        path, _ = QFileDialog.getSaveFileName(self, "Select Base Output File", self.data_dir, "Data Files (*.dat);;All Files (*)")
         if path: 
             self.output_input.setText(os.path.relpath(path, self.proj_dir))
             self.save_settings()
@@ -211,7 +243,7 @@ class DaqTab(QWidget):
         elif safe_text.strip().startswith("[") and "]" in safe_text: color = "#d63384" 
         b_open = "<b>" if bold else ""; b_close = "</b>" if bold else ""
         self.terminal.append(f'<span style="color: {color};">{b_open}{safe_text}{b_close}</span>')
-        self.terminal.moveCursor(QTextCursor.End)
+        self.terminal.moveCursor(QTextCursor.MoveOperation.End)
 
     def update_dashboard(self, stats):
         self.last_stats = stats
@@ -224,6 +256,8 @@ class DaqTab(QWidget):
         self.val_drops.setText(str(drops))
 
     def start_daq_sequence(self):
+        self.current_run_no = self.spin_run_no.value()
+        
         self.save_settings()
         self.base_output_path = self.output_input.text()
         self.current_batch = 1
@@ -235,20 +269,28 @@ class DaqTab(QWidget):
             self.scan_values = list(range(start, end + 1, step)) if start <= end else list(range(start, end - 1, -step))
             self.total_batches = len(self.scan_values)
 
-        self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True); self.combo_mode.setEnabled(False)
+        self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
+        self.combo_mode.setEnabled(False); self.combo_stop_cond.setEnabled(False)
+        self.spin_run_no.setEnabled(False)
+        
         self.run_single_batch()
 
     def run_single_batch(self):
         self.last_stats = {}
         self.val_batch.setText(f"{self.current_batch} / {self.total_batches}")
-        output_file = self.base_output_path
-        name, ext = os.path.splitext(self.base_output_path)
-        mode = self.combo_mode.currentIndex()
         
-        if mode == 1: output_file = f"{name}_part{self.current_batch:02d}{ext}"
+        # 파일명에 자동 증가하는 _runNNN 부착
+        name, ext = os.path.splitext(self.base_output_path)
+        name_with_run = f"{name}_run{self.current_run_no:03d}"
+        
+        mode = self.combo_mode.currentIndex()
+        if mode == 0: 
+            output_file = f"{name_with_run}{ext}"
+        elif mode == 1: 
+            output_file = f"{name_with_run}_part{self.current_batch:02d}{ext}"
         elif mode == 2:
             current_th = self.scan_values[self.current_batch - 1]
-            output_file = f"{name}_th{current_th}{ext}"
+            output_file = f"{name_with_run}_th{current_th}{ext}"
 
         out_file_full = os.path.abspath(os.path.join(self.proj_dir, output_file))
         os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
@@ -256,20 +298,16 @@ class DaqTab(QWidget):
         config_path_str = self.config_input.text()
         config_full = os.path.abspath(os.path.join(self.proj_dir, config_path_str))
 
-        # 🌟 수집 직전, UI의 사용자 입력을 .conf 설정 파일(SSOT)에 덮어쓰기
-        config = configparser.ConfigParser()
-        config.optionxform = str
-        config.read(config_full)
-        if not config.has_section("Environment"): config.add_section("Environment")
-        config.set("Environment", "Operator", self.operator_input.text().strip())
-        config.set("Environment", "AppliedHV", self.hv_input.text().strip())
-        config.set("Environment", "Temperature", self.temp_input.text().strip())
+        # [버그 픽스] configparser의 write()는 원본의 주석을 날려버립니다. 
+        # 스캔 모드(Threshold 자동 갱신)가 아닐 경우, 원본 config 파일을 파괴하지 않도록 처리합니다.
+        run_config_path_str = config_path_str
         if mode == 2:
-            for sec in config.sections():
-                if sec.startswith("Channel_"): config.set(sec, "TriggerThreshold", str(current_th))
-        with open(config_full, 'w') as f: config.write(f)
-
-        if mode == 2: self.append_log(f"\n[SCAN AUTOMATION] Target Threshold updated to {current_th} ADC.")
+            with open(config_full, 'r') as f: content = f.read()
+            content = re.sub(r'TriggerThreshold\s*=\s*\d+', f'TriggerThreshold={current_th}', content)
+            temp_scan_path = os.path.join(self.proj_dir, "config", f"temp_scan_th{current_th}.conf")
+            with open(temp_scan_path, 'w') as f: f.write(content)
+            run_config_path_str = os.path.relpath(temp_scan_path, self.proj_dir)
+            self.append_log(f"\n[SCAN AUTOMATION] Target Threshold updated to {current_th} ADC.")
 
         current_env_data = {
             "Operator": self.operator_input.text().strip(),
@@ -282,21 +320,30 @@ class DaqTab(QWidget):
         self.append_log(f"\n========== [ Batch/Scan {self.current_batch}/{self.total_batches} Started ] ==========")
         self.append_log(f"--- Output: {output_file} | DB ID: {self.current_run_id} ---")
         
-        # 🌟 DT5730S 바이너리 앵커링
         exe_path = os.path.join(self.bin_dir, "frontend_dt5730")
-        cmd = [exe_path, "-c", config_path_str, "-o", output_file]
-        if self.spin_events.value() > 0: cmd.extend(["-n", str(self.spin_events.value())])
-        if self.spin_time.value() > 0: cmd.extend(["-t", str(self.spin_time.value())])
+        cmd = [exe_path, "-c", run_config_path_str, "-o", output_file]
+        
+        # 상호 배타적 획득 제한 인자 전달
+        stop_idx = self.combo_stop_cond.currentIndex()
+        if stop_idx == 1 and self.spin_events.value() > 0:
+            cmd.extend(["-n", str(self.spin_events.value())])
+        elif stop_idx == 2 and self.spin_time.value() > 0:
+            cmd.extend(["-t", str(self.spin_time.value())])
 
         self.daq_process = ProcessManager(cmd, cwd=self.proj_dir)
         self.daq_process.log_signal.connect(self.append_log)
         self.daq_process.stat_signal.connect(self.update_dashboard)
+        
+        # ProcessManager의 하드웨어 시그널을 DaqTab의 영구 시그널로 포워딩
+        self.daq_process.led_signal.connect(self.hardware_led_signal.emit)
+        self.daq_process.temp_signal.connect(self.hardware_temp_signal.emit)
+        self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
         self.daq_process.finished_signal.connect(self.on_batch_finished)
+
         self.daq_process.start()
 
     def on_batch_finished(self, returncode):
         self.append_log(f">>> Process Exited (Code: {returncode})")
-        # 🌟 수집 종료 시 통계 데이터베이스 푸쉬
         if self.current_run_id > 0 and self.last_stats:
             self.db.update_daq_summary(self.current_run_id, self.last_stats)
             self.append_log("[DB] DAQ Summary successfully pushed to database.")
@@ -306,7 +353,13 @@ class DaqTab(QWidget):
             self.run_single_batch()
         else:
             self.append_log("\n========== [ All DAQ Sequences Completed ] ==========")
-            self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False); self.combo_mode.setEnabled(True)
+            self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
+            self.combo_mode.setEnabled(True); self.combo_stop_cond.setEnabled(True)
+            self.spin_run_no.setEnabled(True)
+            
+            # [자동 번호 증가] 완료(혹은 정지) 시 무조건 Run No 를 +1 증가시킵니다.
+            self.spin_run_no.setValue(self.current_run_no + 1)
+            self.save_settings()
 
     def stop_all(self):
         self.total_batches = 0 
