@@ -4,14 +4,13 @@ import configparser
 import re
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
-                             QGroupBox, QSpinBox, QComboBox, QFileDialog)
+                             QGroupBox, QSpinBox, QComboBox, QFileDialog, QMessageBox)
 from PyQt6.QtGui import QFont, QTextCursor
-from PyQt6.QtCore import QTimer, QSettings, pyqtSignal
+from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
 
 class DaqTab(QWidget):
-    # MainWindow와 영구적으로 통신할 브릿지 시그널 선언
     hardware_led_signal = pyqtSignal(dict)
     hardware_temp_signal = pyqtSignal(float)
     daq_finished_signal = pyqtSignal(int)
@@ -61,7 +60,6 @@ class DaqTab(QWidget):
 
         file_layout.addWidget(QLabel("Base Output (.dat):"), 1, 0)
         
-        # Output 경로 옆에 Run No. 스핀박스 배치 (자동 증가)
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit("data/data_run.dat")
         out_layout.addWidget(self.output_input)
@@ -97,7 +95,6 @@ class DaqTab(QWidget):
         cond_main_layout = QVBoxLayout()
         cond_layout1 = QHBoxLayout()
         
-        # 획득 제한 조건 콤보박스 (상호 배타적 제어 UI)
         cond_layout1.addWidget(QLabel("Stop Cond:"))
         self.combo_stop_cond = QComboBox()
         self.combo_stop_cond.addItems(["Unlimited", "Max Events", "Max Time"])
@@ -146,11 +143,15 @@ class DaqTab(QWidget):
         
         dash_layout.addWidget(QLabel("Storage:", styleSheet=lbl_style), 0, 0); self.val_disk = QLabel("Checking...", styleSheet=self.val_style); dash_layout.addWidget(self.val_disk, 0, 1)
         dash_layout.addWidget(QLabel("Batch/Scan:", styleSheet=lbl_style), 0, 2); self.val_batch = QLabel("1/1", styleSheet=self.val_style); dash_layout.addWidget(self.val_batch, 0, 3)
-        dash_layout.addWidget(QLabel("Time:", styleSheet=lbl_style), 0, 4); self.val_time = QLabel("00:00", styleSheet=self.val_style); dash_layout.addWidget(self.val_time, 0, 5)
+        
+        # [신규 추가] Live Time & Dead Time UI
+        dash_layout.addWidget(QLabel("Live Time:", styleSheet=lbl_style), 0, 4); self.val_live_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_live_time, 0, 5)
         dash_layout.addWidget(QLabel("Events:", styleSheet=lbl_style), 0, 6); self.val_events = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_events, 0, 7)
-        dash_layout.addWidget(QLabel("Trg Rate:", styleSheet=lbl_style), 1, 0); self.val_rate = QLabel("0.0 Hz", styleSheet=self.val_style); dash_layout.addWidget(self.val_rate, 1, 1)
-        dash_layout.addWidget(QLabel("Data Speed:", styleSheet=lbl_style), 1, 2); self.val_speed = QLabel("0.00 MB/s", styleSheet=self.val_style); dash_layout.addWidget(self.val_speed, 1, 3)
-        dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 4); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 5)
+        
+        dash_layout.addWidget(QLabel("Data Speed:", styleSheet=lbl_style), 1, 0); self.val_speed = QLabel("0.00 MB/s", styleSheet=self.val_style); dash_layout.addWidget(self.val_speed, 1, 1)
+        dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 2); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 3)
+        dash_layout.addWidget(QLabel("Dead Time:", styleSheet=lbl_style), 1, 4); self.val_dead_time = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_dead_time, 1, 5)
+        
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
 
@@ -170,7 +171,6 @@ class DaqTab(QWidget):
         layout.addWidget(self.terminal)
 
     def toggle_stop_cond(self, idx):
-        """콤보박스 선택에 따라 설정 불가능한 스핀박스를 비활성화하여 오입력 차단"""
         self.spin_events.setEnabled(idx == 1)
         self.spin_time.setEnabled(idx == 2)
 
@@ -247,13 +247,30 @@ class DaqTab(QWidget):
 
     def update_dashboard(self, stats):
         self.last_stats = stats
-        self.val_time.setText(stats.get('time', '00:00'))
+        self.val_live_time.setText(stats.get('live_time', '0.0 s'))
         self.val_events.setText(stats.get('events', '0'))
-        self.val_rate.setText(stats.get('rate', '0.0 Hz'))
         self.val_speed.setText(stats.get('speed', '0.00 MB/s')) 
+        
+        self.val_dead_time.setText(stats.get('dead_time', '0.000 %'))
+        try:
+            dt_val = float(stats.get('dead_time', '0').replace('%', '').strip())
+            self.val_dead_time.setStyleSheet(self.val_style_warn if dt_val > 5.0 else self.val_style)
+        except ValueError:
+            pass
+
         drops = int(stats.get('drops', '0'))
         self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
         self.val_drops.setText(str(drops))
+
+    @pyqtSlot(str)
+    def handle_fatal_error(self, err_type):
+        if err_type == "OVER_TEMP_SOFT_KILL":
+            QMessageBox.critical(
+                self, 
+                "Critical Hardware Error", 
+                "ADC 내부 온도가 82°C에 도달하여 하드웨어 보호를 위해 DAQ 루프를 강제 종료(Soft-kill)했습니다.\n장비 쿨링 후 재시작하십시오."
+            )
+            self.stop_all()
 
     def start_daq_sequence(self):
         self.current_run_no = self.spin_run_no.value()
@@ -279,7 +296,6 @@ class DaqTab(QWidget):
         self.last_stats = {}
         self.val_batch.setText(f"{self.current_batch} / {self.total_batches}")
         
-        # 파일명에 자동 증가하는 _runNNN 부착
         name, ext = os.path.splitext(self.base_output_path)
         name_with_run = f"{name}_run{self.current_run_no:03d}"
         
@@ -298,8 +314,6 @@ class DaqTab(QWidget):
         config_path_str = self.config_input.text()
         config_full = os.path.abspath(os.path.join(self.proj_dir, config_path_str))
 
-        # [버그 픽스] configparser의 write()는 원본의 주석을 날려버립니다. 
-        # 스캔 모드(Threshold 자동 갱신)가 아닐 경우, 원본 config 파일을 파괴하지 않도록 처리합니다.
         run_config_path_str = config_path_str
         if mode == 2:
             with open(config_full, 'r') as f: content = f.read()
@@ -323,7 +337,6 @@ class DaqTab(QWidget):
         exe_path = os.path.join(self.bin_dir, "frontend_dt5730")
         cmd = [exe_path, "-c", run_config_path_str, "-o", output_file]
         
-        # 상호 배타적 획득 제한 인자 전달
         stop_idx = self.combo_stop_cond.currentIndex()
         if stop_idx == 1 and self.spin_events.value() > 0:
             cmd.extend(["-n", str(self.spin_events.value())])
@@ -334,9 +347,9 @@ class DaqTab(QWidget):
         self.daq_process.log_signal.connect(self.append_log)
         self.daq_process.stat_signal.connect(self.update_dashboard)
         
-        # ProcessManager의 하드웨어 시그널을 DaqTab의 영구 시그널로 포워딩
         self.daq_process.led_signal.connect(self.hardware_led_signal.emit)
         self.daq_process.temp_signal.connect(self.hardware_temp_signal.emit)
+        self.daq_process.fatal_signal.connect(self.handle_fatal_error)
         self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
         self.daq_process.finished_signal.connect(self.on_batch_finished)
 
@@ -357,7 +370,6 @@ class DaqTab(QWidget):
             self.combo_mode.setEnabled(True); self.combo_stop_cond.setEnabled(True)
             self.spin_run_no.setEnabled(True)
             
-            # [자동 번호 증가] 완료(혹은 정지) 시 무조건 Run No 를 +1 증가시킵니다.
             self.spin_run_no.setValue(self.current_run_no + 1)
             self.save_settings()
 

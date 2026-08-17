@@ -9,6 +9,7 @@ class ProcessManager(QThread):
     
     temp_signal = pyqtSignal(float)
     led_signal = pyqtSignal(dict)
+    fatal_signal = pyqtSignal(str) # Soft-kill 이벤트 감지 시그널
 
     def __init__(self, cmd, cwd=None):
         super().__init__()
@@ -19,7 +20,6 @@ class ProcessManager(QThread):
         
         self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\r')
         self.re_temp = re.compile(r"\[STATUS\] TEMP:\s*([\d\.]+)")
-        # 6개 LED 인디케이터 상태 파싱 정규식
         self.re_led = re.compile(r"\[STATUS\] LED:\s*LOCK=(\d),\s*BYPS=(\d),\s*RUN=(\d),\s*TRG=(\d),\s*DRDY=(\d),\s*BUSY=(\d)")
 
     def run(self):
@@ -43,7 +43,9 @@ class ProcessManager(QThread):
                     if not clean_line:
                         continue
                     
-                    if "[LIVE DAQ]" in clean_line:
+                    if "[FATAL] OVER_TEMP_SOFT_KILL" in clean_line:
+                        self.fatal_signal.emit("OVER_TEMP_SOFT_KILL")
+                    elif "[LIVE DAQ]" in clean_line:
                         self._parse_and_emit_stats(clean_line)
                     elif "[STATUS] TEMP:" in clean_line:
                         m = self.re_temp.search(clean_line)
@@ -75,16 +77,14 @@ class ProcessManager(QThread):
             stats = {}
             parts = line.split("|")
             for part in parts:
-                if "Time:" in part:
-                    stats['time'] = part.split("Time:")[1].strip()
+                if "Live:" in part:
+                    stats['live_time'] = part.split("Live:")[1].strip()
+                elif "DT:" in part:
+                    stats['dead_time'] = part.split("DT:")[1].strip()
                 elif "Events:" in part:
                     stats['events'] = part.split("Events:")[1].strip()
-                elif "Trg Rate:" in part:
-                    stats['rate'] = part.split("Trg Rate:")[1].strip()
                 elif "Speed:" in part:
                     stats['speed'] = part.split("Speed:")[1].strip()
-                elif "ZMQ Drops" in part:
-                    stats['drops'] = part.split(":")[1].strip()
             self.stat_signal.emit(stats)
         except Exception:
             pass
