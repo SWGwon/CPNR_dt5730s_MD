@@ -141,11 +141,14 @@ int main(int argc, char **argv) {
 
     std::vector<uint16_t> raw_waveform_buffer;
     uint32_t current_event = 0;
-
-    // [추가] Offline Dead Time 연산용 변수
+    
+    // =========================================================================
+    // [추가] Offline Dead Time 및 Live Time 연산용 추적 변수 (물리적 제1원리)
+    // =========================================================================
     bool is_first_event = true;
     uint64_t first_ttt = 0;
     uint64_t last_ttt = 0;
+    uint64_t total_acquired_samples = 0;
     uint32_t prev_board_counter = 0;
     uint64_t lost_events = 0;
 
@@ -158,7 +161,9 @@ int main(int argc, char **argv) {
         current_event++;
         record_len_branch = header.RecordLength; 
 
-        // [추가] TTT 및 EventCounter 추적 로직 (24-bit 롤오버 방어 포함)
+        // ---------------------------------------------------------------------
+        // [추가] 8ns 해상도 TTT 및 진성 데드타임(보드가 수집 윈도우를 열어둔 시간) 누적
+        // ---------------------------------------------------------------------
         if (is_first_event) {
             first_ttt = header.ExtendedTTT;
             prev_board_counter = header.BoardEventCounter;
@@ -166,11 +171,14 @@ int main(int argc, char **argv) {
         } else {
             uint32_t diff = (header.BoardEventCounter - prev_board_counter) & 0xFFFFFF;
             if (diff > 1) {
-                lost_events += (diff - 1);
+                lost_events += (diff - 1); // 진성 버퍼풀로 누락된 카운트 추적
             }
         }
         last_ttt = header.ExtendedTTT;
         prev_board_counter = header.BoardEventCounter;
+        
+        total_acquired_samples += header.RecordLength;
+        // ---------------------------------------------------------------------
 
         int active_ch = 0;
         for (int i = 0; i < MAX_CH; ++i) {
@@ -334,26 +342,35 @@ int main(int argc, char **argv) {
     if (g_running && debug_event_id < 0) {
         std::cout << "\r\033[K[Progress] 100.0% | Events: " << current_event << " | Done.          \n";
 
-        // [추가] 오프라인 변환 요약 출력
-        double live_time_sec = (last_ttt > first_ttt) ? (last_ttt - first_ttt) * 16e-9 : 0.0;
+        // =====================================================================
+        // [추가] 오프라인 변환 요약 출력 및 TParameter 영구 저장 (물리적 제1원리)
+        // =====================================================================
+        double real_time_sec = (last_ttt > first_ttt) ? (last_ttt - first_ttt) * 8e-9 : 0.0;
+        double dead_time_sec = total_acquired_samples * 2e-9; // 1 Sample = 2ns
+        double live_time_sec = real_time_sec - dead_time_sec;
+        if (live_time_sec < 0) live_time_sec = 0.0;
+        
         uint64_t total_triggers = current_event + lost_events;
-        double dead_time_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
+        double lost_events_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
+        double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
 
         std::cout << "\n\033[1;36m========== [ ROOT Conversion Summary ] ==========\033[0m\n"
                   << " - Recorded Events : " << current_event << "\n"
-                  << " - Lost Events     : " << lost_events << " (Board Buffer Full)\n"
-                  << " - Hardware Live   : " << std::fixed << std::setprecision(2) << live_time_sec << " sec\n"
-                  << " - Dead Time       : " << std::fixed << std::setprecision(3) << dead_time_pct << " %\n"
+                  << " - Lost Events     : " << lost_events << " (" << std::fixed << std::setprecision(3) << lost_events_pct << " %, Board Buffer Full)\n"
+                  << " - HW Real Time    : " << std::fixed << std::setprecision(2) << real_time_sec << " sec\n"
+                  << " - HW Live Time    : " << std::fixed << std::setprecision(2) << live_time_sec << " sec\n"
+                  << " - True Dead Time  : " << std::fixed << std::setprecision(5) << dead_time_pct << " % (Record Window)\n"
                   << "\033[1;36m=================================================\033[0m\n\n";
 
-        // [추가] ROOT 파일 내부에 메타데이터(TParameter) 영구 저장
         if (fOut) {
             fOut->cd();
+            TParameter<double> p_real("RealTime_sec", real_time_sec);
             TParameter<double> p_live("LiveTime_sec", live_time_sec);
             TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
             TParameter<int> p_lost("LostEvents_count", lost_events);
             TParameter<int> p_rec("RecordedEvents_count", current_event);
             
+            p_real.Write();
             p_live.Write();
             p_dead.Write();
             p_lost.Write();
