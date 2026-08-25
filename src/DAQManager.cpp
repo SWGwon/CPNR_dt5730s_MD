@@ -16,13 +16,11 @@ DAQManager::DAQManager(const std::string &config_file,
       run_time_sec_(run_time_sec), running_(false),
       digitizer_(CAEN_DGTZ_USB, 0, 0, 0) {
         
-  // [ZMQ Pub Socket 초기화]
   zmq_ctx_ = zmq_ctx_new();
   zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
   int hwm = 5000;
   zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm));
   
-  // ZMQ 포트 TIME_WAIT 충돌 방지
   int linger = 0;
   zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger));
   zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555");
@@ -50,48 +48,37 @@ void DAQManager::SetupHardware() {
   std::cout << "\033[1;36m[DAQManager]\033[0m Configuring Hardware from Config...\n";
   int handle = digitizer_.GetHandle();
   
-  // 링잉 거부 카운트 오류 해결 (진성 Dead Time 모드)
   uint32_t acq_ctrl = 0;
   CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x8100, &acq_ctrl));
   CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x8100, acq_ctrl & ~(1 << 3)));
 
   uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
   uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
-  uint32_t post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
+  uint32_t conf_post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
+
+  record_length = ((record_length + 7) / 8) * 8; // 8-byte 정렬
 
   // =========================================================================
-  // [디버그 패치 1] 하드웨어 고유 지연 방어 및 파형 블록 메모리 동적 정렬
+  // [물리적 하드웨어 지연 보상 로직]
   // =========================================================================
-  // DT5730의 RecordLength는 8 단위 블록 정렬이 필수적임
-  record_length = ((record_length + 7) / 8) * 8;
-
-  // 하드웨어 Intrinsic Delay(약 150ns) + Baseline 연산 마진(10ns) = 절대 최소 160ns 확보
-  uint32_t pre_trigger_ns = record_length * (100 - post_trigger) * 2 / 100;
+  // 1. UI 설정(%)을 바탕으로 논리적인 Pre-trigger 샘플 수 산출
+  uint32_t logical_pre_samples = record_length * (100 - conf_post_trigger) / 100;
   
-  if (pre_trigger_ns < 160) { 
-      std::cerr << "\n\033[1;33m[Warning] Pre-trigger window (" << pre_trigger_ns 
-                << " ns) is too close to the DT5730 hardware latency limit (~150 ns).\033[0m\n";
-      
-      // 160ns를 확보할 수 있는 절대적인 Pre-trigger 비율(%)을 동적 역산 (소수점 올림 처리)
-      uint32_t required_pre_pct = (160 * 100 + (record_length * 2 - 1)) / (record_length * 2);
-      
-      if (required_pre_pct >= 100) {
-          // RecordLength 자체가 너무 짧아 160ns를 물리적으로 확보할 수 없는 치명적 상태
-          std::cerr << "\033[1;31m[Error] RecordLength (" << record_length << " Samples) is fundamentally too short.\033[0m\n";
-          record_length = 512;
-          post_trigger = 80;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusted RecordLength to 512 and PostTrigger to 80%.\033[0m\n";
-      } else {
-          // 하드코딩 70%가 아닌, 현재 RecordLength에 맞춘 안전한 PostTrigger 동적 도출
-          post_trigger = 100 - required_pre_pct;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusting PostTrigger dynamically to " << post_trigger << "% to secure baseline.\033[0m\n";
-      }
+  // 2. CAEN DT5730 고유 지연 시간(약 60샘플, 120ns) 보상
+  uint32_t hw_pre_samples = logical_pre_samples + 60;
+  
+  // 3. RecordLength 오버플로우 방어
+  if (hw_pre_samples >= record_length) {
+      hw_pre_samples = record_length - 8; 
   }
+  
+  // 4. 하드웨어에 최종 인가할 실제 PostTrigger 역산
+  uint32_t actual_post_trigger = 100 - (hw_pre_samples * 100 / record_length);
   // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
   CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
-  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, post_trigger));
+  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); // 보정된 값 인가
 
   int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
 
@@ -154,22 +141,13 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   const uint32_t TTT_MASK = 0x7FFFFFFF;
   
   bool is_first_event = true;
-  uint32_t first_ttt = 0;
-  uint32_t current_ttt = 0;
-  uint32_t prev_ttt = 0;
-  uint64_t ttt_rollovers = 0;
-  
-  uint32_t prev_event_counter = 0;
-  uint64_t lost_events = 0;
+  uint32_t first_ttt = 0, current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
+  uint64_t ttt_rollovers = 0, lost_events = 0;
 
   auto start_time = std::chrono::steady_clock::now();
   auto last_log_time = start_time;
-  uint32_t log_events = 0;
-  uint32_t zmq_drops = 0;
-  size_t total_bytes_written = 0; 
-  size_t last_bytes_written = 0; 
-  
-  uint32_t loop_counter = 0; 
+  uint32_t log_events = 0, zmq_drops = 0, loop_counter = 0;
+  size_t total_bytes_written = 0, last_bytes_written = 0; 
 
   while (is_running) {
     if (max_events_ > 0 && (int)event_count >= max_events_) break;
@@ -197,28 +175,17 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
           uint32_t current_event_counter = ((uint32_t*)evt_ptr)[2] & 0xFFFFFF;
 
           if (is_first_event) {
-              first_ttt = current_ttt;
-              prev_ttt = current_ttt;
-              prev_event_counter = current_event_counter;
-              is_first_event = false;
+              first_ttt = current_ttt; prev_ttt = current_ttt; prev_event_counter = current_event_counter; is_first_event = false;
           } else {
-              if (current_ttt < prev_ttt) {
-                  ttt_rollovers++;
-              }
+              if (current_ttt < prev_ttt) ttt_rollovers++;
               uint32_t diff = (current_event_counter - prev_event_counter) & 0xFFFFFF;
-              if (diff > 1) {
-                  lost_events += (diff - 1); 
-              }
+              if (diff > 1) lost_events += (diff - 1); 
           }
-          prev_ttt = current_ttt;
-          prev_event_counter = current_event_counter;
+          prev_ttt = current_ttt; prev_event_counter = current_event_counter;
 
           uint32_t actual_trace_size = 0;
           for (int ch = 0; ch < MAX_CH; ++ch) {
-              if ((evt_info.ChannelMask >> ch) & 1) {
-                  actual_trace_size = caen_event->ChSize[ch];
-                  break; 
-              }
+              if ((evt_info.ChannelMask >> ch) & 1) { actual_trace_size = caen_event->ChSize[ch]; break; }
           }
 
           std::memset(header, 0, sizeof(EventHeader));
@@ -237,20 +204,13 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
               if (trace_size == 0) continue;
               if (payload_size + trace_size * sizeof(uint16_t) > raw_buffer_pool_.size()) break; 
 
-              std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t),
-                          wave_src, trace_size * sizeof(uint16_t));
+              std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t), wave_src, trace_size * sizeof(uint16_t));
               payload_size += trace_size * sizeof(uint16_t);
             }
           }
 
-          if (out_stream_.is_open()) {
-              out_stream_.write(raw_buffer_pool_.data(), payload_size);
-              total_bytes_written += payload_size; 
-          }
-          
-          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) {
-              if (zmq_errno() == EAGAIN) zmq_drops++;
-          }
+          if (out_stream_.is_open()) { out_stream_.write(raw_buffer_pool_.data(), payload_size); total_bytes_written += payload_size; }
+          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) { if (zmq_errno() == EAGAIN) zmq_drops++; }
           log_events++;
         }
       }
@@ -260,7 +220,6 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
 
     if (bsize > 0 || ++loop_counter % 10000 == 0) {
         auto now = std::chrono::steady_clock::now();
-        
         if (run_time_sec_ > 0) {
             if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) break;
         }
@@ -271,6 +230,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             int mins = total_sec / 60;
             int secs = total_sec % 60;
 
+            // 트리거 레이트(Hz) 연산 및 터미널 출력 사용
             double rate = (log_events / elapsed_ms) * 1000.0;
             double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
             last_bytes_written = total_bytes_written;
@@ -278,7 +238,6 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             uint32_t temp_reg = 0, status_reg = 0;
             if (CAEN_DGTZ_ReadRegister(handle, 0x10A8, &temp_reg) == CAEN_DGTZ_Success) {
                 float temp_celsius = static_cast<float>(temp_reg & 0xFF);
-                std::cout << "\n[STATUS] TEMP: " << temp_celsius << std::endl;
                 if (temp_celsius >= 82.0) {
                     std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
                     is_running = false;
@@ -286,19 +245,6 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                 }
             }
             
-            if (CAEN_DGTZ_ReadRegister(handle, 0x8104, &status_reg) == CAEN_DGTZ_Success) {
-                int run      = (status_reg >> 0) & 0x1; 
-                int drdy     = (status_reg >> 2) & 0x1; 
-                int busy     = (status_reg >> 3) & 0x1; 
-                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0; 
-                int trg      = (rate > 0.0) ? 1 : 0; 
-                int pll_byps = 0; 
-
-                std::cout << "[STATUS] LED: LOCK=" << pll_lock << ", BYPS=" << pll_byps
-                          << ", RUN=" << run << ", TRG=" << trg << ", DRDY=" << drdy
-                          << ", BUSY=" << busy << std::endl;
-            }
-
             uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
             uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
             
@@ -314,14 +260,13 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                       << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << hw_real_time_sec << " s\033[0m | "
                       << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
                       << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
+                      << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " // <-- 트리거 레이트 삽입 완료
                       << "Events: \033[1;33m" << event_count << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
                       << "Drops: " << zmq_drops
                       << std::flush;
               
-            log_events = 0;
-            zmq_drops = 0;
-            last_log_time = now;
+            log_events = 0; zmq_drops = 0; last_log_time = now;
         }
     }
   }

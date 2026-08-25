@@ -52,7 +52,6 @@ class ConfigTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         left_layout.addWidget(self.table)
 
-        # 수동 캘리브레이션 로직 분리 및 Advanced Settings 추가
         self.advanced_group = QGroupBox("Advanced Settings (DT5730S Auto-calibrated)")
         advanced_layout = QVBoxLayout()
         self.btn_calibrate = QPushButton("Manual ADC Calibration")
@@ -181,13 +180,23 @@ class ConfigTab(QWidget):
         target_t0_ns = self.spin_target_t0.value()
         dt_ns = 2.0 
         total_time_ns = rec_len * dt_ns
-        if target_t0_ns >= total_time_ns: return
-        pre_pct = (target_t0_ns / total_time_ns) * 100.0
+        
+        # [제1원리 보정] 하드웨어 트리거 래치 지연시간(120 ns) 선행 보상
+        intrinsic_latency_ns = 120.0
+        required_pre_ns = target_t0_ns + intrinsic_latency_ns
+
+        if required_pre_ns >= total_time_ns: 
+            required_pre_ns = total_time_ns - 16.0 # RecordLength 오버플로우 방어
+            
+        pre_pct = (required_pre_ns / total_time_ns) * 100.0
         post_pct = int(round(100.0 - pre_pct))
+        
         if post_pct < 10: post_pct = 10
         if post_pct > 90: post_pct = 90
-        pre_samples = int(rec_len * ((100 - post_pct) / 100.0))
-        recommended_pedestal = int(pre_samples * 0.8) 
+        
+        target_t0_samples = int(target_t0_ns / dt_ns)
+        recommended_pedestal = int(target_t0_samples * 0.8) 
+        
         self.lbl_res_post.setText(f"{post_pct} %")
         self.lbl_res_pedestal.setText(f"{recommended_pedestal} Samples")
         self.calculated_post_pct = post_pct
