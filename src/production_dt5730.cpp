@@ -204,19 +204,26 @@ int main(int argc, char **argv) {
                     baseline /= baseline_samples;
                     baseline_ch[ch] = baseline;
 
+                    // ====================================================================
+                    // [핵심 교정] 노이즈 상쇄(Zero-Sum)가 완벽히 적용된 전하량 적분
+                    // ====================================================================
                     double charge = 0.0;
                     double min_adc = baseline; 
                     
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
-                        if (trace_ptr[i] < baseline) {
-                            charge += (baseline - trace_ptr[i]);
-                            if (trace_ptr[i] < min_adc) {
-                                min_adc = trace_ptr[i];
-                            }
+                        // 1. 빗장(if)을 완전히 제거하여 위/아래 노이즈 요동을 모두 더해 0으로 상쇄
+                        charge += (baseline - trace_ptr[i]);
+                        
+                        // 2. 최대 파고(Pulse Height) 탐색은 실제 펄스의 최저점을 찾아야 하므로 유지
+                        if (trace_ptr[i] < min_adc) {
+                            min_adc = trace_ptr[i];
                         }
                     }
+                    
+                    // 3. 적분 결과가 순수 노이즈 덩어리(결과값이 0 이하)인 경우에만 0으로 컷오프
                     charge_ch[ch] = (charge > 0) ? charge : 0.0;
                     pulse_height_ch[ch] = (baseline - min_adc > 0) ? (baseline - min_adc) : 0.0; 
+                    // ====================================================================
 
                     double trigger_threshold = baseline - 30.0; 
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
@@ -310,7 +317,6 @@ int main(int argc, char **argv) {
         double lost_events_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
         double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
         
-        // [신규] 평균 트리거 레이트 연산
         double avg_rate = (real_time_sec > 0) ? (current_event / real_time_sec) : 0.0;
 
         std::cout << "\n\033[1;36m========== [ ROOT Conversion Summary ] ==========\033[0m\n"
@@ -329,7 +335,7 @@ int main(int argc, char **argv) {
             TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
             TParameter<int> p_lost("LostEvents_count", lost_events);
             TParameter<int> p_rec("RecordedEvents_count", current_event);
-            TParameter<double> p_rate("TriggerRate_Hz", avg_rate); // [신규] ROOT 내부 영구 저장
+            TParameter<double> p_rate("TriggerRate_Hz", avg_rate); 
             
             p_real.Write(); p_live.Write(); p_dead.Write(); p_lost.Write(); p_rec.Write(); p_rate.Write();
         }
