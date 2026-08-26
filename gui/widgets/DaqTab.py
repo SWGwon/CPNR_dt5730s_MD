@@ -5,15 +5,102 @@ import re
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
                              QGroupBox, QSpinBox, QComboBox, QFileDialog, QMessageBox)
-from PyQt6.QtGui import QFont, QTextCursor
-from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QFont, QTextCursor, QPainter, QColor, QPen, QBrush, QLinearGradient
+from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
+
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
+
+# =========================================================================
+# [물리적 방향성(Negative Pulse)이 적용된 1D 스캔 비주얼라이저]
+# =========================================================================
+class ADCScanVisualizer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(45)  
+        self.setMaximumHeight(45)
+        self.start_val = 14000
+        self.end_val = 13000
+        self.baseline = 14744      
+        self.max_val = 16383       
+        
+    def update_range(self, start, end):
+        self.start_val = start
+        self.end_val = end
+        self.update() 
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#e9ecef"))
+        painter.drawRoundedRect(0, 0, w, h, 5, 5)
+        
+        def val_to_x(v): 
+            return int((v / self.max_val) * w)
+        
+        x_start = val_to_x(self.start_val)
+        x_end = val_to_x(self.end_val)
+        x_base = val_to_x(self.baseline)
+        
+        left_x = min(x_start, x_end)
+        right_x = max(x_start, x_end)
+        rect_w = max(right_x - left_x, 4)
+        
+        is_danger = max(self.start_val, self.end_val) > (self.baseline - 15)
+        
+        gradient = QLinearGradient(x_start, 0, x_end, 0)
+        if is_danger:
+            gradient.setColorAt(0.0, QColor(255, 120, 120, 180)) 
+            gradient.setColorAt(1.0, QColor(200, 0, 0, 220))     
+        else:
+            gradient.setColorAt(0.0, QColor(120, 180, 255, 160)) 
+            gradient.setColorAt(1.0, QColor(13, 80, 253, 220))   
+            
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(left_x, 0, rect_w, h, 3, 3)
+        
+        pen_base = QPen(QColor("#198754"), 3)
+        painter.setPen(pen_base)
+        painter.drawLine(x_base, 0, x_base, h)
+        
+        font_small = QFont("Arial", 8, QFont.Weight.Bold)
+        painter.setFont(font_small)
+        painter.setPen(QColor("#6c757d"))
+        painter.drawText(5, h - 5, "0")
+        painter.drawText(w - 40, h - 5, "16383")
+        
+        painter.setPen(QColor("#0d6efd")) 
+        painter.drawText(15, 15, "⟵ Deeper Voltage Drop (Smaller ADC)")
+        
+        painter.setPen(QColor("#198754"))
+        painter.drawText(x_base - 55, 15, "Baseline")
+        
+        if rect_w > 50:
+            painter.setPen(QColor(255, 255, 255))
+            y_pos = h // 2 + 4
+            if self.start_val >= self.end_val:
+                painter.drawText(x_start - 35, y_pos, "Start")
+                painter.drawText(x_end + 5, y_pos, "End ⟵")
+            else:
+                painter.drawText(x_start + 5, y_pos, "Start ⟶")
+                painter.drawText(x_end - 30, y_pos, "End")
+                
+        if is_danger:
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(left_x + (rect_w // 2) - 25, h // 2 + 4, "⚠ DANGER")
 
 class DaqTab(QWidget):
     hardware_led_signal = pyqtSignal(dict)
     hardware_temp_signal = pyqtSignal(float)
     daq_finished_signal = pyqtSignal(int)
+    
+    scanRangeChanged = pyqtSignal(int, int)
+    scanModeToggled = pyqtSignal(bool)
 
     def __init__(self, parent=None, env_data_provider=None):
         super().__init__(parent)
@@ -125,13 +212,22 @@ class DaqTab(QWidget):
         self.spin_scan_start = QSpinBox(); self.spin_scan_start.setRange(0, 16383); self.spin_scan_start.setValue(14000)
         self.scan_layout.addWidget(self.spin_scan_start)
         self.scan_layout.addWidget(QLabel("End:"))
-        self.spin_scan_end = QSpinBox(); self.spin_scan_end.setRange(0, 16383); self.spin_scan_end.setValue(14500)
+        self.spin_scan_end = QSpinBox(); self.spin_scan_end.setRange(0, 16383); self.spin_scan_end.setValue(13000)
         self.scan_layout.addWidget(self.spin_scan_end)
         self.scan_layout.addWidget(QLabel("Step:"))
         self.spin_scan_step = QSpinBox(); self.spin_scan_step.setRange(1, 1000); self.spin_scan_step.setValue(20)
         self.scan_layout.addWidget(self.spin_scan_step)
-        self.set_scan_enabled(False)
+        
+        self.spin_scan_start.valueChanged.connect(self.emit_scan_range)
+        self.spin_scan_end.valueChanged.connect(self.emit_scan_range)
+        
         cond_main_layout.addLayout(self.scan_layout)
+
+        self.scan_visualizer = ADCScanVisualizer()
+        self.scan_visualizer.setVisible(False)
+        cond_main_layout.addWidget(self.scan_visualizer)
+
+        self.set_scan_enabled(False)
         cond_group.setLayout(cond_main_layout)
         layout.addWidget(cond_group)
 
@@ -144,13 +240,20 @@ class DaqTab(QWidget):
         dash_layout.addWidget(QLabel("Storage:", styleSheet=lbl_style), 0, 0); self.val_disk = QLabel("Checking...", styleSheet=self.val_style); dash_layout.addWidget(self.val_disk, 0, 1)
         dash_layout.addWidget(QLabel("Batch/Scan:", styleSheet=lbl_style), 0, 2); self.val_batch = QLabel("1/1", styleSheet=self.val_style); dash_layout.addWidget(self.val_batch, 0, 3)
         
-        # [신규 추가] Live Time & Dead Time UI
         dash_layout.addWidget(QLabel("Live Time:", styleSheet=lbl_style), 0, 4); self.val_live_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_live_time, 0, 5)
         dash_layout.addWidget(QLabel("Events:", styleSheet=lbl_style), 0, 6); self.val_events = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_events, 0, 7)
         
         dash_layout.addWidget(QLabel("Data Speed:", styleSheet=lbl_style), 1, 0); self.val_speed = QLabel("0.00 MB/s", styleSheet=self.val_style); dash_layout.addWidget(self.val_speed, 1, 1)
         dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 2); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 3)
         dash_layout.addWidget(QLabel("Dead Time:", styleSheet=lbl_style), 1, 4); self.val_dead_time = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_dead_time, 1, 5)
+        
+        # =========================================================================
+        # [신규 추가] 레이아웃 우측 하단에 Trig Rate 블록 추가
+        # =========================================================================
+        dash_layout.addWidget(QLabel("Trig Rate:", styleSheet=lbl_style), 1, 6)
+        self.val_rate = QLabel("0.0 Hz", styleSheet=self.val_style)
+        dash_layout.addWidget(self.val_rate, 1, 7)
+        # =========================================================================
         
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
@@ -169,6 +272,13 @@ class DaqTab(QWidget):
         self.terminal = QTextEdit(); self.terminal.setReadOnly(True); self.terminal.setFont(QFont("Monospace", 10))
         self.terminal.setStyleSheet("background-color: #ffffff; color: #212529; border: 1px solid #ced4da;")
         layout.addWidget(self.terminal)
+
+    @pyqtSlot()
+    def emit_scan_range(self):
+        s_val = self.spin_scan_start.value()
+        e_val = self.spin_scan_end.value()
+        self.scanRangeChanged.emit(s_val, e_val)
+        self.scan_visualizer.update_range(s_val, e_val)
 
     def toggle_stop_cond(self, idx):
         self.spin_events.setEnabled(idx == 1)
@@ -210,7 +320,14 @@ class DaqTab(QWidget):
         self.spin_scan_start.setEnabled(enabled); self.spin_scan_end.setEnabled(enabled); self.spin_scan_step.setEnabled(enabled)
 
     def toggle_batch_mode(self, idx):
-        self.spin_batch.setEnabled(idx == 1); self.set_scan_enabled(idx == 2)
+        self.spin_batch.setEnabled(idx == 1)
+        is_scan_mode = (idx == 2)
+        self.set_scan_enabled(is_scan_mode)
+        
+        self.scan_visualizer.setVisible(is_scan_mode)
+        self.scanModeToggled.emit(is_scan_mode)
+        if is_scan_mode:
+            self.emit_scan_range()
 
     def browse_config(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Config File", self.config_dir, "Config Files (*.conf *.ini);;All Files (*)")
@@ -247,18 +364,29 @@ class DaqTab(QWidget):
 
     def update_dashboard(self, stats):
         self.last_stats = stats
-        self.val_live_time.setText(stats.get('live_time', '0.0 s'))
-        self.val_events.setText(stats.get('events', '0'))
-        self.val_speed.setText(stats.get('speed', '0.00 MB/s')) 
+        self.val_live_time.setText(stats.get('live_time', stats.get('Live', '0.0 s')))
+        self.val_events.setText(stats.get('events', stats.get('Events', '0')))
+        self.val_speed.setText(stats.get('speed', stats.get('Speed', '0.00 MB/s'))) 
         
-        self.val_dead_time.setText(stats.get('dead_time', '0.000 %'))
+        # =========================================================================
+        # [신규 추가] Rate 업데이트 파싱 강화
+        # 파이썬 파서가 넘겨줄 때 'Rate' 혹은 'rate' 키워드를 모두 추적하여 UI에 반영
+        # =========================================================================
+        rate_val = stats.get('rate', stats.get('Rate', '0.0 Hz'))
+        if "Hz" not in rate_val and rate_val != "0.0": 
+            rate_val += " Hz"
+        self.val_rate.setText(rate_val)
+        # =========================================================================
+        
+        dt_str = stats.get('dead_time', stats.get('DT', '0.000 %'))
+        self.val_dead_time.setText(dt_str)
         try:
-            dt_val = float(stats.get('dead_time', '0').replace('%', '').strip())
+            dt_val = float(dt_str.replace('%', '').strip())
             self.val_dead_time.setStyleSheet(self.val_style_warn if dt_val > 5.0 else self.val_style)
         except ValueError:
             pass
 
-        drops = int(stats.get('drops', '0'))
+        drops = int(stats.get('drops', stats.get('Drops', '0')))
         self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
         self.val_drops.setText(str(drops))
 

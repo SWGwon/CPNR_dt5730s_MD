@@ -32,17 +32,25 @@ class MainWindow(QMainWindow):
 
         self.init_statusbar()
         
-        # [핵심 변경] 재생성되는 ProcessManager에 의존하지 않고, DaqTab 자체와 영구적으로 시그널 연동
         self.daq_tab.hardware_led_signal.connect(self.update_led_dashboard)
         self.daq_tab.hardware_temp_signal.connect(self.monitor_tab.update_temperature)
         self.daq_tab.daq_finished_signal.connect(self.reset_led_dashboard)
+
+        # =========================================================================
+        # [신규 추가] DAQ Control 탭과 Hardware Config 탭의 스캔 범위 시각화 파이프라인
+        # =========================================================================
+        self.daq_tab.scanRangeChanged.connect(self.config_tab.update_scan_region)
+        self.daq_tab.scanModeToggled.connect(self.config_tab.toggle_scan_region_visibility)
+        
+        # 초기화 시 현재 스핀박스 값으로 1회 동기화 수행
+        self.daq_tab.emit_scan_range()
+        # =========================================================================
 
     def init_statusbar(self):
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
 
         self.led_widgets = {}
-        # 6개 장비 전면 패널 상태 인디케이터
         led_names = ['PLL LOCK', 'PLL BYPS', 'RUN', 'TRG', 'DRDY', 'BUSY']
         
         container = QWidget()
@@ -52,7 +60,6 @@ class MainWindow(QMainWindow):
         for name in led_names:
             lbl_title = QLabel(f"<b>{name}</b>")
             lbl_led = QLabel("●")
-            # 기본 비활성화 색상 (회색)
             lbl_led.setStyleSheet("color: #555555; font-size: 18px; margin-right: 15px;")
             
             layout.addWidget(lbl_title)
@@ -80,7 +87,6 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def reset_led_dashboard(self, returncode):
-        """DAQ 정지 시 오해를 방지하기 위해 모든 LED를 즉시 회색(Off)으로 초기화합니다."""
         for key in self.led_widgets:
             self.led_widgets[key].setStyleSheet("color: #555555; font-size: 18px; margin-right: 15px;")
 

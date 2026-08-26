@@ -4,8 +4,8 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
-                             QFileDialog, QCheckBox)
-from PyQt6.QtCore import Qt, QSettings
+                             QFileDialog, QCheckBox, QMessageBox)
+from PyQt6.QtCore import Qt, QSettings, pyqtSlot
 
 class ConfigTab(QWidget):
     def __init__(self, parent=None):
@@ -129,13 +129,43 @@ class ConfigTab(QWidget):
         self.plot_sim.setYRange(0, 16383, padding=0)
         self.plot_sim.setXRange(0, 1, padding=0); self.plot_sim.hideAxis('bottom')
         self.plot_sim.setLabel('left', "ADC Bins (14-bit)")
+        
         self.line_base = pg.InfiniteLine(angle=0, pen=pg.mkPen('#198754', width=2, style=Qt.PenStyle.DashLine))
         self.line_trg = pg.InfiniteLine(angle=0, pen=pg.mkPen('#dc3545', width=2))
-        self.plot_sim.addItem(self.line_base); self.plot_sim.addItem(self.line_trg)
+        self.plot_sim.addItem(self.line_base)
+        self.plot_sim.addItem(self.line_trg)
+
+        # ====================================================================
+        # [신규 추가] 스캔 범위를 표시할 수평 방향 반투명 면적 시각화
+        # ====================================================================
+        self.scan_region = pg.LinearRegionItem(orientation='horizontal', brush=pg.mkBrush(0, 100, 255, 50), movable=False)
+        self.scan_region.setRegion([14000, 14500])
+        self.scan_region.hide() 
+        self.plot_sim.addItem(self.scan_region)
+        # ====================================================================
+
         sim_vbox.addWidget(self.plot_sim)
         sim_group.setLayout(sim_vbox)
         right_layout.addWidget(sim_group, stretch=1)
         layout.addLayout(right_layout, stretch=3)
+
+    # ====================================================================
+    # [신규 추가] DaqTab 스캔 관련 시그널 수신 슬롯
+    # ====================================================================
+    @pyqtSlot(int, int)
+    def update_scan_region(self, start_val, end_val):
+        self.scan_region.setRegion([start_val, end_val])
+        
+        current_baseline = self.line_base.value()
+        if start_val > (current_baseline - 15) or end_val > (current_baseline - 15):
+            self.scan_region.setBrush(pg.mkBrush(255, 0, 0, 70))  # 위험
+        else:
+            self.scan_region.setBrush(pg.mkBrush(0, 100, 255, 50)) # 안전
+
+    @pyqtSlot(bool)
+    def toggle_scan_region_visibility(self, is_visible):
+        self.scan_region.setVisible(is_visible)
+    # ====================================================================
 
     def load_settings(self):
         saved_path = self.settings.value("last_loaded_config", "")
@@ -181,12 +211,14 @@ class ConfigTab(QWidget):
         dt_ns = 2.0 
         total_time_ns = rec_len * dt_ns
         
+        # ====================================================================
         # [제1원리 보정] 하드웨어 트리거 래치 지연시간(120 ns) 선행 보상
+        # ====================================================================
         intrinsic_latency_ns = 120.0
         required_pre_ns = target_t0_ns + intrinsic_latency_ns
 
         if required_pre_ns >= total_time_ns: 
-            required_pre_ns = total_time_ns - 16.0 # RecordLength 오버플로우 방어
+            required_pre_ns = total_time_ns - 16.0 
             
         pre_pct = (required_pre_ns / total_time_ns) * 100.0
         post_pct = int(round(100.0 - pre_pct))
@@ -221,6 +253,11 @@ class ConfigTab(QWidget):
         self.lbl_res_trg.setText(f"{adc_trigger}  (Baseline {adc_baseline} - Drop {adc_trg_drop})")
         self.line_base.setValue(adc_baseline)
         self.line_trg.setValue(adc_trigger)
+        
+        # 베이스라인이 바뀔 때 스캔 영역의 경고 여부도 재평가
+        if hasattr(self, 'scan_region') and self.scan_region.isVisible():
+            r = self.scan_region.getRegion()
+            self.update_scan_region(int(r[0]), int(r[1]))
 
     def apply_adc_to_table(self):
         if self.table.rowCount() == 0: return

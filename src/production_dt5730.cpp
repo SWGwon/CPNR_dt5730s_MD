@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     uint32_t record_len_branch = 0; 
     std::vector<uint16_t> wave_ch[8];
     double charge_ch[8] = {0.0};
+    double pulse_height_ch[8] = {0.0};
     double pulse_start_time_ch[8] = {0.0}; 
     double baseline_ch[8] = {0.0}; 
 
@@ -121,6 +122,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < 8; ++i) {
             tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
+            tOut->Branch(Form("PulseHeight_CH%d", i), &pulse_height_ch[i], Form("PulseHeight_CH%d/D", i));
             tOut->Branch(Form("PulseStart_T0_CH%d", i), &pulse_start_time_ch[i], Form("PulseStart_T0_CH%d/D", i));
             tOut->Branch(Form("Baseline_CH%d", i), &baseline_ch[i], Form("Baseline_CH%d/D", i)); 
             if (save_waveform) tOut->Branch(Form("Waveform_CH%d", i), &wave_ch[i]);
@@ -137,6 +139,8 @@ int main(int argc, char **argv) {
 
     auto start_time = std::chrono::steady_clock::now();
     std::cout << "\033[1;32m[Production] Starting Universal Conversion...\033[0m\n";
+    if (save_waveform) std::cout << " - Mode: Charge/Height Spectrum + Waveform Archiving (-w ON)\n";
+    else std::cout << " - Mode: Charge/Height Spectrum Only (Waveform Dropped)\n";
 
     while (g_running && ifs.read(reinterpret_cast<char *>(&header), sizeof(EventHeader))) {
         processed_bytes += sizeof(EventHeader);
@@ -160,6 +164,7 @@ int main(int argc, char **argv) {
             if ((header.ChannelMask >> i) & 1) active_ch++;
             wave_ch[i].clear();
             charge_ch[i] = 0.0;
+            pulse_height_ch[i] = 0.0; 
             pulse_start_time_ch[i] = -1.0;
             baseline_ch[i] = 0.0;
         }
@@ -178,11 +183,14 @@ int main(int argc, char **argv) {
                 size_t trace_len = header.RecordLength;
 
                 if (trace_len > 0) {
-                    // [동적 베이스라인 방어 로직]: 펄스 하강 지점을 능동적으로 찾아 그 앞부분까지만 계산함
+                    size_t init_window = std::min((size_t)5, trace_len);
+                    double init_base = 0.0;
+                    for (size_t i = 0; i < init_window; ++i) init_base += trace_ptr[i];
+                    init_base /= init_window;
+
                     size_t baseline_samples = trace_len / 4; 
-                    double init_base = trace_ptr[0];
-                    for (size_t i = 1; i < trace_len; ++i) {
-                        if (init_base - trace_ptr[i] > 30.0) { // 30 ADC drop 임계점
+                    for (size_t i = init_window; i < trace_len; ++i) {
+                        if (init_base - trace_ptr[i] > 30.0) { 
                             baseline_samples = (i > 5) ? i - 5 : 1; 
                             break;
                         }
@@ -197,10 +205,18 @@ int main(int argc, char **argv) {
                     baseline_ch[ch] = baseline;
 
                     double charge = 0.0;
+                    double min_adc = baseline; 
+                    
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
-                        if (trace_ptr[i] < baseline) charge += (baseline - trace_ptr[i]);
+                        if (trace_ptr[i] < baseline) {
+                            charge += (baseline - trace_ptr[i]);
+                            if (trace_ptr[i] < min_adc) {
+                                min_adc = trace_ptr[i];
+                            }
+                        }
                     }
                     charge_ch[ch] = (charge > 0) ? charge : 0.0;
+                    pulse_height_ch[ch] = (baseline - min_adc > 0) ? (baseline - min_adc) : 0.0; 
 
                     double trigger_threshold = baseline - 30.0; 
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
@@ -242,8 +258,9 @@ int main(int argc, char **argv) {
                 x[i] = i * 2.0; y[i] = wave_ch[disp_ch][i];
             }
             TGraph *gr = new TGraph(header.RecordLength, x.data(), y.data());
-            gr->SetTitle(Form("Event %d (CH%d) - Charge: %.1f, T0: %.1f ns;Time (ns);ADC Value", 
-                              debug_event_id, disp_ch, charge_ch[disp_ch], pulse_start_time_ch[disp_ch]));
+            
+            gr->SetTitle(Form("Event %d (CH%d) - Charge: %.1f, Height: %.1f, T0: %.1f ns;Time (ns);ADC Value", 
+                              debug_event_id, disp_ch, charge_ch[disp_ch], pulse_height_ch[disp_ch], pulse_start_time_ch[disp_ch]));
             gr->SetLineColor(kBlue); gr->SetLineWidth(2); gr->Draw("AL");
 
             TGraph* bl_line = new TGraph(2);
@@ -292,6 +309,9 @@ int main(int argc, char **argv) {
         uint64_t total_triggers = current_event + lost_events;
         double lost_events_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
         double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
+        
+        // [신규] 평균 트리거 레이트 연산
+        double avg_rate = (real_time_sec > 0) ? (current_event / real_time_sec) : 0.0;
 
         std::cout << "\n\033[1;36m========== [ ROOT Conversion Summary ] ==========\033[0m\n"
                   << " - Recorded Events : " << current_event << "\n"
@@ -299,6 +319,7 @@ int main(int argc, char **argv) {
                   << " - HW Real Time    : " << std::fixed << std::setprecision(2) << real_time_sec << " sec\n"
                   << " - HW Live Time    : " << std::fixed << std::setprecision(2) << live_time_sec << " sec\n"
                   << " - True Dead Time  : " << std::fixed << std::setprecision(5) << dead_time_pct << " % (Record Window)\n"
+                  << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n"
                   << "\033[1;36m=================================================\033[0m\n\n";
 
         if (fOut) {
@@ -308,7 +329,9 @@ int main(int argc, char **argv) {
             TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
             TParameter<int> p_lost("LostEvents_count", lost_events);
             TParameter<int> p_rec("RecordedEvents_count", current_event);
-            p_real.Write(); p_live.Write(); p_dead.Write(); p_lost.Write(); p_rec.Write();
+            TParameter<double> p_rate("TriggerRate_Hz", avg_rate); // [신규] ROOT 내부 영구 저장
+            
+            p_real.Write(); p_live.Write(); p_dead.Write(); p_lost.Write(); p_rec.Write(); p_rate.Write();
         }
     }
 

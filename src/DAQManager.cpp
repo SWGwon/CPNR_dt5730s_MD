@@ -54,31 +54,32 @@ void DAQManager::SetupHardware() {
 
   uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
   uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
-  uint32_t conf_post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
+  uint32_t post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
 
-  record_length = ((record_length + 7) / 8) * 8; // 8-byte 정렬
+  record_length = ((record_length + 7) / 8) * 8; 
 
-  // =========================================================================
-  // [물리적 하드웨어 지연 보상 로직]
-  // =========================================================================
-  // 1. UI 설정(%)을 바탕으로 논리적인 Pre-trigger 샘플 수 산출
-  uint32_t logical_pre_samples = record_length * (100 - conf_post_trigger) / 100;
+  uint32_t pre_trigger_ns = record_length * (100 - post_trigger) * 2 / 100;
   
-  // 2. CAEN DT5730 고유 지연 시간(약 60샘플, 120ns) 보상
-  uint32_t hw_pre_samples = logical_pre_samples + 60;
-  
-  // 3. RecordLength 오버플로우 방어
-  if (hw_pre_samples >= record_length) {
-      hw_pre_samples = record_length - 8; 
+  if (pre_trigger_ns < 160) { 
+      std::cerr << "\n\033[1;33m[Warning] Pre-trigger window (" << pre_trigger_ns 
+                << " ns) is too close to the DT5730 hardware latency limit (~150 ns).\033[0m\n";
+      
+      uint32_t required_pre_pct = (160 * 100 + (record_length * 2 - 1)) / (record_length * 2);
+      
+      if (required_pre_pct >= 100) {
+          std::cerr << "\033[1;31m[Error] RecordLength (" << record_length << " Samples) is fundamentally too short.\033[0m\n";
+          record_length = 512;
+          post_trigger = 80;
+          std::cerr << "\033[1;33m[Warning] Auto-adjusted RecordLength to 512 and PostTrigger to 80%.\033[0m\n";
+      } else {
+          post_trigger = 100 - required_pre_pct;
+          std::cerr << "\033[1;33m[Warning] Auto-adjusting PostTrigger dynamically to " << post_trigger << "% to secure baseline.\033[0m\n";
+      }
   }
-  
-  // 4. 하드웨어에 최종 인가할 실제 PostTrigger 역산
-  uint32_t actual_post_trigger = 100 - (hw_pre_samples * 100 / record_length);
-  // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
   CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
-  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); // 보정된 값 인가
+  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, post_trigger));
 
   int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
 
@@ -230,7 +231,6 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             int mins = total_sec / 60;
             int secs = total_sec % 60;
 
-            // 트리거 레이트(Hz) 연산 및 터미널 출력 사용
             double rate = (log_events / elapsed_ms) * 1000.0;
             double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
             last_bytes_written = total_bytes_written;
@@ -245,6 +245,19 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                 }
             }
             
+            if (CAEN_DGTZ_ReadRegister(handle, 0x8104, &status_reg) == CAEN_DGTZ_Success) {
+                int run      = (status_reg >> 0) & 0x1; 
+                int drdy     = (status_reg >> 2) & 0x1; 
+                int busy     = (status_reg >> 3) & 0x1; 
+                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0; 
+                int trg      = (rate > 0.0) ? 1 : 0; 
+                int pll_byps = 0; 
+
+                std::cout << "[STATUS] LED: LOCK=" << pll_lock << ", BYPS=" << pll_byps
+                          << ", RUN=" << run << ", TRG=" << trg << ", DRDY=" << drdy
+                          << ", BUSY=" << busy << std::endl;
+            }
+
             uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
             uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
             
@@ -260,7 +273,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                       << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << hw_real_time_sec << " s\033[0m | "
                       << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
                       << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
-                      << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " // <-- 트리거 레이트 삽입 완료
+                      << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " 
                       << "Events: \033[1;33m" << event_count << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
                       << "Drops: " << zmq_drops
@@ -288,6 +301,8 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
   auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
+  double avg_rate = (final_real_time_sec > 0) ? (event_count / final_real_time_sec) : 0.0;
+
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
             << " - Wall Clock Time : " << wall_clock_duration << " seconds\n"
@@ -295,6 +310,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             << " - HW Live Time    : " << std::fixed << std::setprecision(2) << final_live_time_sec << " seconds\n"
             << " - True Dead Time  : " << std::fixed << std::setprecision(5) << final_dead_time_pct << " %\n"
             << " - Total Events    : " << event_count << " events\n"
+            << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n" 
             << " - Lost Events     : " << lost_events << " events (Buffer Full)\n"
             << " - Data Size Saved : " << std::fixed << std::setprecision(2) << (total_bytes_written / (1024.0 * 1024.0)) << " MB\n"
             << "\033[1;36m=========================================\033[0m\n\n";
