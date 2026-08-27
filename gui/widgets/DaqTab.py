@@ -11,6 +11,9 @@ from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
 
+DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic.conf"
+LEGACY_DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic_master.conf"
+
 # =========================================================================
 # [물리적 방향성(Negative Pulse)이 적용된 1D 스캔 비주얼라이저]
 # =========================================================================
@@ -124,6 +127,7 @@ class DaqTab(QWidget):
         self.base_output_path = ""; self.scan_values = [] 
         self.last_stats = {}; self.current_run_id = -1
         self.current_run_no = 1
+        self.validated_config_full = ""
         
         self.setup_ui()
         self.load_settings()
@@ -139,7 +143,7 @@ class DaqTab(QWidget):
         file_group = QGroupBox("File & Configuration Environment")
         file_layout = QGridLayout()
         file_layout.addWidget(QLabel("Config (.conf):"), 0, 0)
-        self.config_input = QLineEdit("config/dt5730s_inorganic_master.conf")
+        self.config_input = QLineEdit(DEFAULT_CONFIG_PATH)
         file_layout.addWidget(self.config_input, 0, 1)
         self.btn_browse_config = QPushButton("Browse")
         self.btn_browse_config.clicked.connect(self.browse_config)
@@ -285,7 +289,11 @@ class DaqTab(QWidget):
         self.spin_time.setEnabled(idx == 2)
 
     def load_settings(self):
-        saved_config = self.settings.value("last_config", "config/dt5730s_inorganic_master.conf")
+        saved_config = self.settings.value("last_config", DEFAULT_CONFIG_PATH)
+        legacy_full_path = os.path.abspath(os.path.join(self.proj_dir, LEGACY_DEFAULT_CONFIG_PATH))
+        if saved_config == LEGACY_DEFAULT_CONFIG_PATH and not os.path.isfile(legacy_full_path):
+            saved_config = DEFAULT_CONFIG_PATH
+            self.settings.setValue("last_config", saved_config)
         self.config_input.setText(saved_config)
         self.output_input.setText(self.settings.value("last_output", "data/data_run.dat"))
         self.spin_run_no.setValue(int(self.settings.value("last_run_no", 1)))
@@ -308,9 +316,14 @@ class DaqTab(QWidget):
         else: full_path = filepath
         if not os.path.exists(full_path): return
 
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
         cfg.optionxform = str
-        cfg.read(full_path)
+        try:
+            with open(full_path, 'r', encoding='utf-8') as config_file:
+                cfg.read_file(config_file)
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            self.append_log(f"[Config Warning] 환경 메타데이터를 읽지 못했습니다: {exc}")
+            return
         if cfg.has_section("Environment"):
             self.operator_input.setText(cfg.get("Environment", "Operator", fallback="Unknown"))
             self.hv_input.setText(cfg.get("Environment", "AppliedHV", fallback="0V"))
@@ -400,7 +413,98 @@ class DaqTab(QWidget):
             )
             self.stop_all()
 
+    def validate_config_before_start(self):
+        config_path = self.config_input.text().strip()
+        if not config_path:
+            raise ValueError("설정 파일 경로가 비어 있습니다.")
+
+        config_full = config_path if os.path.isabs(config_path) else os.path.join(self.proj_dir, config_path)
+        config_full = os.path.abspath(config_full)
+        if not os.path.isfile(config_full):
+            raise ValueError(f"설정 파일을 찾을 수 없습니다: {config_full}")
+
+        try:
+            with open(config_full, 'r', encoding='utf-8') as config_file:
+                config_lines = config_file.readlines()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"설정 파일을 읽을 수 없습니다: {exc}") from exc
+
+        config_data = {}
+        current_section = None
+        for line_number, raw_line in enumerate(config_lines, start=1):
+            line = raw_line.replace('\u00a0', ' ').strip()
+            if not line or line[0] in '#;':
+                continue
+
+            if line.startswith('['):
+                if not line.endswith(']'):
+                    raise ValueError(f"잘못된 섹션 문법입니다 (line {line_number}).")
+                current_section = line[1:-1].strip()
+                if not current_section:
+                    raise ValueError(f"빈 섹션 이름입니다 (line {line_number}).")
+                if current_section in config_data:
+                    raise ValueError(f"중복 섹션입니다: [{current_section}] (line {line_number})")
+                config_data[current_section] = {}
+                continue
+
+            if '=' not in line or current_section is None:
+                raise ValueError(f"잘못된 설정 문법입니다 (line {line_number}).")
+            key, raw_value = (part.strip() for part in line.split('=', 1))
+            if not key or not raw_value:
+                raise ValueError(f"빈 설정 키 또는 값입니다 (line {line_number}).")
+            if key in config_data[current_section]:
+                raise ValueError(
+                    f"중복 설정 키입니다: [{current_section}] {key} (line {line_number})"
+                )
+            config_data[current_section][key] = raw_value
+
+        if not any(config_data.values()):
+            raise ValueError("설정 파일에 적용할 값이 없습니다.")
+
+        def required_int(section, key, min_value, max_value):
+            if section not in config_data or key not in config_data[section]:
+                raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
+            raw_value = config_data[section][key]
+            if not re.fullmatch(r'[+-]?[0-9]+', raw_value):
+                raise ValueError(f"정수가 아닌 설정값입니다: [{section}] {key}={raw_value}")
+            value = int(raw_value, 10)
+            if not min_value <= value <= max_value:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"(허용 {min_value}..{max_value})"
+                )
+            return value
+
+        record_length = required_int("Digitizer", "RecordLength", 128, 102400)
+        channel_mask = required_int("Digitizer", "ChannelMask", 1, (1 << 8) - 1)
+        post_trigger = required_int("Digitizer", "PostTrigger", 0, 100)
+        required_int("Digitizer", "TriggerPolarity", 0, 1)
+        ext_trigger = required_int("Digitizer", "ExtTriggerMode", 0, 1)
+        self_trigger = required_int("Digitizer", "SelfTriggerMode", 0, 1)
+
+        if record_length % 8 != 0:
+            raise ValueError("[Digitizer] RecordLength는 8의 배수여야 합니다.")
+        if record_length * (100 - post_trigger) < 8000:
+            raise ValueError("[Digitizer] 트리거 이전 구간이 최소 160 ns보다 짧습니다.")
+        if ext_trigger == 0 and self_trigger == 0:
+            raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
+        for ch in range(8):
+            if (channel_mask >> ch) & 1:
+                section = f"Channel_{ch}"
+                required_int(section, "DCOffset", 0, 65535)
+                required_int(section, "TriggerThreshold", 0, 16383)
+
+        return config_full
+
     def start_daq_sequence(self):
+        try:
+            self.validated_config_full = self.validate_config_before_start()
+        except ValueError as exc:
+            message = f"DAQ를 시작하지 않았습니다.\n\n{exc}"
+            self.append_log(f"[Config Error] {exc}")
+            QMessageBox.critical(self, "Invalid DAQ Configuration", message)
+            return
+
         self.current_run_no = self.spin_run_no.value()
         
         self.save_settings()
@@ -439,16 +543,20 @@ class DaqTab(QWidget):
         out_file_full = os.path.abspath(os.path.join(self.proj_dir, output_file))
         os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
 
-        config_path_str = self.config_input.text()
-        config_full = os.path.abspath(os.path.join(self.proj_dir, config_path_str))
-
-        run_config_path_str = config_path_str
+        config_full = self.validated_config_full
+        run_config_path_str = config_full
         if mode == 2:
-            with open(config_full, 'r') as f: content = f.read()
-            content = re.sub(r'TriggerThreshold\s*=\s*\d+', f'TriggerThreshold={current_th}', content)
+            with open(config_full, 'r', encoding='utf-8') as f: content = f.read()
+            content, replacement_count = re.subn(
+                r'(?m)^(\s*TriggerThreshold\s*=\s*)[+-]?[0-9]+\s*$',
+                rf'\g<1>{current_th}',
+                content
+            )
+            if replacement_count == 0:
+                raise RuntimeError("검증된 설정에서 TriggerThreshold를 갱신하지 못했습니다.")
             temp_scan_path = os.path.join(self.proj_dir, "config", f"temp_scan_th{current_th}.conf")
-            with open(temp_scan_path, 'w') as f: f.write(content)
-            run_config_path_str = os.path.relpath(temp_scan_path, self.proj_dir)
+            with open(temp_scan_path, 'w', encoding='utf-8') as f: f.write(content)
+            run_config_path_str = temp_scan_path
             self.append_log(f"\n[SCAN AUTOMATION] Target Threshold updated to {current_th} ADC.")
 
         current_env_data = {

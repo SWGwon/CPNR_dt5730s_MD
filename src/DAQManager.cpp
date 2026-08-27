@@ -12,7 +12,8 @@
 DAQManager::DAQManager(const std::string &config_file,
                        const std::string &output_file, int max_events,
                        int run_time_sec)
-    : config_(config_file), output_file_(output_file), max_events_(max_events),
+    : config_(config_file), hardware_settings_(LoadDAQHardwareSettings(config_)),
+      output_file_(output_file), max_events_(max_events),
       run_time_sec_(run_time_sec), running_(false),
       digitizer_(CAEN_DGTZ_USB, 0, 0, 0) {
         
@@ -52,42 +53,20 @@ void DAQManager::SetupHardware() {
   CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x8100, &acq_ctrl));
   CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x8100, acq_ctrl & ~(1 << 3)));
 
-  uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
-  uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
-  uint32_t post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
-
-  record_length = ((record_length + 7) / 8) * 8; 
-
-  uint32_t pre_trigger_ns = record_length * (100 - post_trigger) * 2 / 100;
-  
-  if (pre_trigger_ns < 160) { 
-      std::cerr << "\n\033[1;33m[Warning] Pre-trigger window (" << pre_trigger_ns 
-                << " ns) is too close to the DT5730 hardware latency limit (~150 ns).\033[0m\n";
-      
-      uint32_t required_pre_pct = (160 * 100 + (record_length * 2 - 1)) / (record_length * 2);
-      
-      if (required_pre_pct >= 100) {
-          std::cerr << "\033[1;31m[Error] RecordLength (" << record_length << " Samples) is fundamentally too short.\033[0m\n";
-          record_length = 512;
-          post_trigger = 80;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusted RecordLength to 512 and PostTrigger to 80%.\033[0m\n";
-      } else {
-          post_trigger = 100 - required_pre_pct;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusting PostTrigger dynamically to " << post_trigger << "% to secure baseline.\033[0m\n";
-      }
-  }
+  uint32_t record_length = hardware_settings_.record_length;
+  uint32_t channel_mask = hardware_settings_.channel_mask;
+  uint32_t post_trigger = hardware_settings_.post_trigger;
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
   CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
   CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, post_trigger));
 
-  int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
+  int pol_val = hardware_settings_.trigger_polarity;
 
   for (int ch = 0; ch < MAX_CH; ++ch) {
       if ((channel_mask >> ch) & 1) {
-          std::string ch_sec = "Channel_" + std::to_string(ch);
-          uint32_t offset = config_.GetInt(ch_sec, "DCOffset", 7050);
-          uint32_t thr = config_.GetInt(ch_sec, "TriggerThreshold", 15000);
+          uint32_t offset = hardware_settings_.channels[ch].dc_offset;
+          uint32_t thr = hardware_settings_.channels[ch].trigger_threshold;
           
           CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(handle, ch, offset));
           CAEN_CHECK(CAEN_DGTZ_SetTriggerPolarity(handle, ch, (pol_val == 0) ? CAEN_DGTZ_TriggerOnRisingEdge : CAEN_DGTZ_TriggerOnFallingEdge));
@@ -96,11 +75,11 @@ void DAQManager::SetupHardware() {
   }
 
   CAEN_DGTZ_TriggerMode_t trg_mode = CAEN_DGTZ_TRGMODE_ACQ_ONLY;
-  int ext_trg = config_.GetInt("Digitizer", "ExtTriggerMode", 1);
+  int ext_trg = hardware_settings_.ext_trigger_mode;
   if (ext_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, trg_mode));
   else CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, CAEN_DGTZ_TRGMODE_DISABLED));
   
-  int self_trg = config_.GetInt("Digitizer", "SelfTriggerMode", 1);
+  int self_trg = hardware_settings_.self_trigger_mode;
   if (self_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, channel_mask));
   else CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
 
@@ -110,7 +89,7 @@ void DAQManager::SetupHardware() {
   std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard OR Logic (Software Coincidence Ready).\n";
 
   digitizer_.AllocateBuffers();
-  
+
   size_t max_safe_size = sizeof(EventHeader) + (record_length + 1024) * sizeof(uint16_t) * MAX_CH;
   raw_buffer_pool_.resize(max_safe_size);
 }
@@ -258,7 +237,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                           << ", BUSY=" << busy << std::endl;
             }
 
-            uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
+            uint32_t record_length = hardware_settings_.record_length;
             uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
             
             double hw_real_time_sec = total_ticks * 8e-9; 
@@ -290,7 +269,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   auto t = std::time(nullptr);
   auto tm = *std::localtime(&t);
   
-  uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
+  uint32_t record_length = hardware_settings_.record_length;
   uint64_t final_total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
   
   double final_real_time_sec = final_total_ticks * 8e-9;

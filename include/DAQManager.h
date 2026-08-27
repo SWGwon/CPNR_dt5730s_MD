@@ -2,6 +2,7 @@
 #define DAQ_MANAGER_H
 
 #include "CaenDigitizer.h"
+#include "DAQConfig.h"
 #include "ConfigParser.h"
 #include "EventHeader.h"
 #include <atomic>
@@ -24,6 +25,8 @@ private:
   void AcquisitionLoop(std::atomic<bool>& is_running);
 
   ConfigParser config_;
+  // config_ 다음, digitizer_ 이전에 초기화되어 잘못된 설정으로 장비를 여는 것을 차단합니다.
+  DAQHardwareSettings hardware_settings_;
   std::string output_file_;
   int max_events_;
   int run_time_sec_;

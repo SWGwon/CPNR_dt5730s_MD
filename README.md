@@ -141,6 +141,18 @@ cmake ..
 make -j4
 ```
 
+하드웨어 SDK나 ROOT/ZeroMQ 없이 설정 검증 회귀 테스트만 실행할 수도 있습니다.
+
+```bash
+cmake -S . -B build-test -DBUILD_DAQ_APPLICATIONS=OFF -DBUILD_TESTING=ON
+cmake --build build-test
+ctest --test-dir build-test --output-on-failure
+```
+
+DAQ 시작 전 설정 검증은 `RecordLength` 128–102400(8의 배수), 1개 이상의 활성 채널,
+최소 160 ns의 pre-trigger 구간 및 활성 채널별 DAC/threshold 범위를 요구합니다.
+검증에 실패하면 디지타이저를 열지 않고 실행을 중단합니다.
+
 ---
 
 ## 🖥️ Usage
