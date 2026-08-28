@@ -11,7 +11,7 @@
 
 기존 일체형(Monolithic) DAQ 소프트웨어가 가지는 UI 렌더링 병목 현상과 메모리 누수 문제를 원천 차단하기 위해, **데이터 생산(C++)과 소비(Python)를 물리적으로 완벽히 분리(Decoupling)한 3-Tier 아키텍처**로 설계되었습니다. 
 
-최신 업데이트를 통해 다중 채널 비트마스크 파싱, SQLite 기반 측정 이력 영구 보존, 동적 HTML 색상 로그, 그리고 유료 펌웨어 없이도 완벽한 시간차 동시 계수를 지원하는 **제1원리 소프트웨어 DSP(Software Coincidence DSP)** 프레임워크가 결합되어 상용(Commercial) 프로덕션 레벨의 완성도를 제공합니다.
+최신 업데이트를 통해 기록 채널과 self-trigger 참여 채널을 독립적으로 선택할 수 있으며, DT5730S의 인접 채널 pair에 AND/OR 논리를 적용할 수 있습니다. SQLite 기반 측정 이력, 동적 HTML 로그 및 오프라인 시간차 동시 계수 분석도 함께 제공합니다.
 
 ```text
 CPNR_dt5730s/
@@ -19,7 +19,10 @@ CPNR_dt5730s/
 ├── README.md                   # 프로젝트 개요 및 빌드/실행 가이드 (최종 마스터판)
 │
 ├── config/                     # [환경 설정] 장비 및 DAQ 파라미터 
-│   ├── dt5730s_inorganic.conf  # 무기/유기 섬광체용 마스터 설정 파일
+│   ├── dt5730s_master.conf     # CH0/1 AND, CH0~3 기록 예제
+│   ├── dt5730s_inorganic.conf  # 무기 섬광체용 설정 파일
+│   ├── dt5730s_ls_coin.conf    # 액체 섬광체 CH0/1 coincidence 예제
+│   ├── dt5730s_ext_clock.conf  # 외부 클록/트리거 전용 예제
 │   └── test.conf               # 테스트용 설정 파일
 │
 ├── include/                    # [C++ 헤더] 공용 자료구조 및 래퍼
@@ -33,7 +36,7 @@ CPNR_dt5730s/
 │   ├── frontend_dt5730.cpp     # (Tier 1) 프론트엔드 독립 실행 메인 프로그램
 │   └── production_dt5730.cpp   # (Tier 2) 이진 데이터 ROOT 변환 및 Micro-Time(T0) 추출기
 │
-├── gui/                        # [Tier 3] Python PyQt5 엣지 컴퓨팅 기반 제어 센터
+├── gui/                        # [Tier 3] Python PyQt6 엣지 컴퓨팅 기반 제어 센터
 │   ├── main.py                 # GUI 어플리케이션 진입점 (Entry Point)
 │   ├── core/                   # GUI 백그라운드 엔진
 │   │   ├── DatabaseManager.py  # SQLite DB 관리 (런 히스토리 및 .conf 스냅샷 영구 보존)
@@ -95,7 +98,7 @@ CPNR_dt5730s/
    * **역할:** 이진 데이터(`.dat`)를 물리 분석용 ROOT 형식(`.root`)으로 고속 변환.
    * **특징:** 파일 포인터 점프(fseek) 기법을 활용해 파형 저장이 불필요할 경우 변환 속도를 10배 이상 끌어올렸으며, 특정 이벤트의 아날로그 파형을 즉각적으로 확인할 수 있는 **Interactive Debugging Mode (`-d`)**를 네이티브 지원합니다.
 
-3. **Tier 3: Control Center GUI (Python PyQt5)**
+3. **Tier 3: Control Center GUI (Python PyQt6)**
    * **역할:** 실험 환경의 직관적인 제어 및 엣지 컴퓨팅(Edge Computing) 기반의 실시간 모니터링.
    * **특징:** C++ 프론트엔드를 QThread 워커로 구동하여 표준 출력을 낚아채고(Stream Routing), 데이터를 분기하여 2단 대시보드 메트릭과 시인성 높은 **HTML 기반 동적 컬러 로그**를 렌더링합니다.
 
@@ -103,7 +106,7 @@ CPNR_dt5730s/
 
 ## ✨ Key Features
 
-* **Software Coincidence DSP (Micro-Time Extraction):** 장비의 표준 펌웨어가 가지는 하드웨어 로직의 한계를 극복하기 위해, 오프라인 변환기(Tier 2)가 파형 내부에서 펄스가 하강을 시작한 **정밀 상대 시간(T0, Micro-Time)**을 ns 단위로 자동 추출합니다. 이를 통해 ROOT 상에서 완벽한 20ns 윈도우 동시 계수 필터링을 지원합니다.
+* **Software Coincidence DSP (Micro-Time Extraction):** 오프라인 변환기(Tier 2)가 파형 내부에서 펄스가 하강을 시작한 **정밀 상대 시간(T0, Micro-Time)**을 ns 단위로 추출하여, ROOT 분석 단계에서 사용자가 정한 시간차 조건을 적용할 수 있습니다.
 * **Automated Threshold Scan Engine:** 단일 광자(Single Photon) 캘리브레이션 및 노이즈 플로어 탐색을 위해, 지정된 스텝(Step) 크기만큼 하드웨어 임계값을 실시간으로 변화시키며 무한 루프를 도는 자동 획득 제어 기능을 탑재했습니다. (`_th14500.dat` 형식으로 분할 저장)
 * **Auto Multi-Channel Edge Computing Monitor:** Python 워커 스레드가 수신된 ZMQ 패킷의 `ChannelMask`를 실시간으로 역산출하여, 켜져 있는 모든 채널을 자동으로 감지하고 다중 오버레이(Multi-Overlay) 스펙트럼 적분을 수행합니다.
 * **Continuous / Batch Mode:** 단일 구동뿐만 아니라, 지정된 이벤트 수(-n)나 시간(-t) 단위로 파일 번호를 자동 증가(`_part01`)시키며 분할 저장하는 무한 백그라운드 배치 모드를 지원합니다.
@@ -125,7 +128,7 @@ CPNR_dt5730s/
   * ROOT 6 (built with C++17 지원 플래그)
   * ZeroMQ (`libzmq3-dev`)
 * **Python Libraries:** 
-  * `PyQt5`, `pyqtgraph`, `numpy`, `pyzmq`
+  * `PyQt6`, `pyqtgraph`, `numpy`, `pyzmq`
 
 ---
 
@@ -134,8 +137,8 @@ CPNR_dt5730s/
 CMake를 활용하여 C++ 백엔드를 빌드함과 동시에, GUI 구동을 위한 Python 모듈들이 `bin/` 디렉토리로 자동 배포(Deployment)됩니다.
 
 ```bash
-git clone [https://github.com/opercjy/CPNR_dt5730s.git](https://github.com/opercjy/CPNR_dt5730s.git)
-cd CPNR_dt5730s
+git clone https://github.com/SWGwon/CPNR_dt5730s_MD.git
+cd CPNR_dt5730s_MD
 mkdir build && cd build
 cmake ..
 make -j4
@@ -152,6 +155,46 @@ ctest --test-dir build-test --output-on-failure
 DAQ 시작 전 설정 검증은 `RecordLength` 128–102400(8의 배수), 1개 이상의 활성 채널,
 최소 160 ns의 pre-trigger 구간 및 활성 채널별 DAC/threshold 범위를 요구합니다.
 검증에 실패하면 디지타이저를 열지 않고 실행을 중단합니다.
+
+### 기록 채널과 트리거 채널 설정
+
+`ChannelMask`와 `SelfTriggerMask`는 8비트 값을 10진수로 적습니다. 비트 0부터 비트 7까지가 각각 CH0부터 CH7에 대응합니다.
+
+- `ChannelMask`: 이벤트가 승인되었을 때 파형을 기록할 채널
+- `SelfTriggerMask`: 입력 임계값 비교기가 self-trigger 생성에 참여할 채널. 기록하지 않는 채널은 선택할 수 없으므로 `ChannelMask`의 부분집합이어야 합니다.
+- `PairLogic`: 고정 인접 pair에 적용할 `AND` 또는 `OR` 논리
+
+새 마스크 방식을 사용할 때는 `SelfTriggerMask`와 `PairLogic`을 함께 설정해야 합니다. 두 항목을 모두 생략한 기존 설정은 이전 동작을 보존하기 위해 `ChannelMask`를 self-trigger 마스크로 사용하고 pair 레지스터를 직접 변경하지 않습니다. `[SoftwareDSP] CoincidenceWindow`는 저장된 이벤트를 오프라인에서 분석할 때 쓰는 별도 값이며 하드웨어 트리거 조건을 바꾸지 않습니다.
+
+DT5730S x730 계열의 self-trigger 논리는 `(CH0, CH1)`, `(CH2, CH3)`, `(CH4, CH5)`, `(CH6, CH7)`의 고정 pair 구조를 사용합니다. `OR`에서는 선택한 채널 하나만 임계값을 넘어도 해당 pair가 트리거를 만들고, `AND`에서는 pair의 두 채널 threshold comparator 출력이 실제로 겹칠 때만 트리거를 만듭니다. 이는 고정된 ns 단위 coincidence window가 아니므로 신호 폭과 threshold에 따라 유효 겹침 시간이 달라집니다. `AND`를 사용할 때는 같은 pair의 두 비트를 모두 `SelfTriggerMask`에 포함해야 합니다. 여러 pair를 활성화하면 각 pair의 결과는 서로 OR로 결합됩니다. 이 레지스터 구성은 표준 waveform firmware에서만 적용되며, DPP firmware가 감지되면 잘못된 레지스터 쓰기를 막기 위해 DAQ 시작을 중단합니다. 설정한 레지스터는 시작 시 readback으로 확인하지만, DT5730S에 처음 적용할 때는 pulser로 CH0/CH1 단독 입력과 동시 입력을 각각 시험해 실제 trigger 동작도 확인하는 것을 권장합니다.
+
+아래는 **CH0 AND CH1로 트리거하면서 CH0~CH3을 모두 기록**하는 설정입니다.
+
+```ini
+[Digitizer]
+ChannelMask=15
+SelfTriggerMask=3
+ExtTriggerMode=0
+SelfTriggerMode=1
+
+[HardwareCoincidence]
+PairLogic=AND
+```
+
+이 경우 CH2와 CH3의 임계값은 트리거 결정에 관여하지 않습니다. 다만 readout-only 채널도 연속으로 독립 기록되는 것은 아니며, CH0/CH1 coincidence로 global trigger가 승인될 때 같은 이벤트 시간 구간이 함께 저장됩니다.
+
+전면 패널 `TRG-IN`만 사용하는 외부 트리거 전용 구성은 다음처럼 self-trigger 참여 마스크를 0으로 둡니다. 이 모드에서는 `PairLogic`을 하드웨어에 적용하지 않으며, 외부 트리거가 들어올 때 `ChannelMask`에 포함된 채널이 기록됩니다.
+
+```ini
+[Digitizer]
+ChannelMask=15
+SelfTriggerMask=0
+ExtTriggerMode=1
+SelfTriggerMode=0
+
+[HardwareCoincidence]
+PairLogic=OR
+```
 
 ---
 
@@ -171,7 +214,7 @@ DAQ 시작 전 설정 검증은 `RecordLength` 128–102400(8의 배수), 1개 �
 
 ### GUI 탭(Tab)별 기능 명세서
 * **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, ZMQ Drops 등) 및 컬러 파싱 터미널 창 제공.
-* **⚙️ Hardware Config:** 장비 조준경(DCOffset, Threshold, RecordLength 등)을 GUI 상의 표(TableWidget)에서 즉시 편집하고 `.conf`에 반영(Single Source of Truth). **Time & DSP / ADC Simulator**를 통한 제1원리 파라미터 자동 산출.
+* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, Threshold, RecordLength 등을 GUI에서 편집하고 `.conf`에 반영합니다. **Time & DSP / ADC Simulator**를 통한 파라미터 산출도 지원합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
 * **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Micro-Time(T0) 추출, 파형 강제 저장(-w) 옵션, 변환 시간(ETA) 출력 기능 및 특정 Event ID 하드코어 팝업 디버깅(-d).
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.

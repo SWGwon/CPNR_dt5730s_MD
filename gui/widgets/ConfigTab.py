@@ -4,10 +4,16 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
-                             QFileDialog, QCheckBox, QMessageBox)
+                             QFileDialog, QCheckBox, QMessageBox, QComboBox)
 from PyQt6.QtCore import Qt, QSettings, pyqtSlot
 
 class ConfigTab(QWidget):
+    CONTROLLED_TABLE_KEYS = frozenset({
+        ("Digitizer", "ChannelMask"),
+        ("Digitizer", "SelfTriggerMask"),
+        ("HardwareCoincidence", "PairLogic"),
+    })
+
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -20,10 +26,12 @@ class ConfigTab(QWidget):
         self.settings = QSettings("CPNR", "DT5730S_ConfigTab")
         self.current_config_path = ""
         self.config = configparser.ConfigParser()
-        self.config.optionxform = str 
+        self.config.optionxform = str
+        self.trigger_controls_load_error = None
         self.setup_ui()
         self.load_settings()
         self.update_mask_calc()
+        self.update_trigger_mask_calc()
         self.update_adc_simulator()
         self.update_time_simulator()
 
@@ -50,6 +58,7 @@ class ConfigTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.cellChanged.connect(self.on_table_cell_changed)
         left_layout.addWidget(self.table)
 
         self.advanced_group = QGroupBox("Advanced Settings (DT5730S Auto-calibrated)")
@@ -64,24 +73,61 @@ class ConfigTab(QWidget):
         layout.addLayout(left_layout, stretch=5)
 
         right_layout = QVBoxLayout()
-        mask_group = QGroupBox("Channel Bitmask Calculator (DT5730S 8-Ch)")
+        mask_group = QGroupBox("Readout & Trigger Configuration (DT5730S 8-Ch)")
         mask_vbox = QVBoxLayout()
-        chk_layout = QGridLayout()
+
+        mask_vbox.addWidget(QLabel("Readout channels (stored on every accepted global trigger):"))
+        readout_chk_layout = QGridLayout()
         self.ch_checks = []
         for i in range(8):
             chk = QCheckBox(f"CH{i}")
             if i == 0: chk.setChecked(True)
-            chk.stateChanged.connect(self.update_mask_calc)
-            chk_layout.addWidget(chk, i//4, i%4)
+            chk.stateChanged.connect(self.on_readout_control_changed)
+            readout_chk_layout.addWidget(chk, i//4, i%4)
             self.ch_checks.append(chk)
-        mask_vbox.addLayout(chk_layout)
+        mask_vbox.addLayout(readout_chk_layout)
         res_mask_layout = QHBoxLayout()
-        res_mask_layout.addWidget(QLabel("Decimal Mask Value:"))
+        res_mask_layout.addWidget(QLabel("Readout mask (decimal):"))
         self.lbl_mask_res = QLabel("1")
-        self.btn_apply_mask = QPushButton("Apply Mask")
+        self.btn_apply_mask = QPushButton("Apply Readout Mask")
         self.btn_apply_mask.clicked.connect(self.apply_mask_to_table)
         res_mask_layout.addWidget(self.lbl_mask_res); res_mask_layout.addWidget(self.btn_apply_mask)
-        mask_vbox.addLayout(res_mask_layout); mask_group.setLayout(mask_vbox)
+        mask_vbox.addLayout(res_mask_layout)
+
+        mask_vbox.addWidget(QLabel("Self-trigger channels (do not select channels used only for readout):"))
+        trigger_chk_layout = QGridLayout()
+        self.trigger_ch_checks = []
+        for i in range(8):
+            chk = QCheckBox(f"CH{i}")
+            if i == 0: chk.setChecked(True)
+            chk.stateChanged.connect(self.on_trigger_control_changed)
+            trigger_chk_layout.addWidget(chk, i//4, i%4)
+            self.trigger_ch_checks.append(chk)
+        mask_vbox.addLayout(trigger_chk_layout)
+
+        trigger_mask_layout = QHBoxLayout()
+        trigger_mask_layout.addWidget(QLabel("Self-trigger mask (decimal):"))
+        self.lbl_trigger_mask_res = QLabel("1")
+        trigger_mask_layout.addWidget(self.lbl_trigger_mask_res)
+        mask_vbox.addLayout(trigger_mask_layout)
+
+        trigger_options = QGridLayout()
+        trigger_options.addWidget(QLabel("Adjacent-pair logic:"), 0, 0)
+        self.combo_pair_logic = QComboBox()
+        self.combo_pair_logic.addItems(["OR", "AND"])
+        self.combo_pair_logic.currentTextChanged.connect(self.on_trigger_control_changed)
+        trigger_options.addWidget(self.combo_pair_logic, 0, 1)
+        mask_vbox.addLayout(trigger_options)
+
+        self.lbl_trigger_hint = QLabel()
+        self.lbl_trigger_hint.setWordWrap(True)
+        mask_vbox.addWidget(self.lbl_trigger_hint)
+
+        self.btn_apply_trigger = QPushButton("Apply Trigger Settings")
+        self.btn_apply_trigger.clicked.connect(self.apply_trigger_to_table)
+        mask_vbox.addWidget(self.btn_apply_trigger)
+
+        mask_group.setLayout(mask_vbox)
         right_layout.addWidget(mask_group)
 
         time_group = QGroupBox("Time & DSP Calculator (500 MS/s = 2 ns/Sample)")
@@ -180,30 +226,255 @@ class ConfigTab(QWidget):
 
     def load_file(self, rel_path):
         full_path = os.path.abspath(os.path.join(self.proj_dir, rel_path))
-        if not os.path.exists(full_path): return
+        if not os.path.exists(full_path):
+            return
+
+        loaded_config = configparser.ConfigParser()
+        loaded_config.optionxform = str
+        try:
+            with open(full_path, "r", encoding="utf-8") as config_file:
+                loaded_config.read_file(config_file)
+            loaded_rows = [
+                (section, key, value)
+                for section in loaded_config.sections()
+                for key, value in loaded_config.items(section)
+            ]
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            QMessageBox.critical(
+                self, "Invalid Config File",
+                f"설정 파일을 열지 않았습니다.\n\n{exc}"
+            )
+            return
+
         self.current_config_path = full_path
         self.settings.setValue("last_loaded_config", full_path)
         self.lbl_current_file.setText(f"Current File: {os.path.basename(full_path)}")
-        self.config.read(full_path)
-        self.table.setRowCount(0)
-        for section in self.config.sections():
-            for key, val in self.config.items(section):
+        self.config = loaded_config
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            for section, key, value in loaded_rows:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
-                self.table.setItem(row, 0, QTableWidgetItem(section)); self.table.setItem(row, 1, QTableWidgetItem(key))
-                self.table.setItem(row, 2, QTableWidgetItem(val))
+                self.table.setItem(row, 0, QTableWidgetItem(section))
+                self.table.setItem(row, 1, QTableWidgetItem(key))
+                self.table.setItem(row, 2, QTableWidgetItem(value))
+                self.protect_controlled_row(row)
+        finally:
+            self.table.blockSignals(False)
+
         try:
-            mask_val = int(self.config.get("Digitizer", "ChannelMask", fallback="1"))
-            for i, chk in enumerate(self.ch_checks): chk.setChecked(bool((mask_val >> i) & 1))
-        except: pass
+            mask_val = int(self.config.get("Digitizer", "ChannelMask"), 10)
+            self_trigger_mode = int(
+                self.config.get("Digitizer", "SelfTriggerMode"), 10
+            )
+            ext_trigger_mode = int(
+                self.config.get("Digitizer", "ExtTriggerMode"), 10
+            )
+
+            trigger_keys = (
+                ("Digitizer", "SelfTriggerMask"),
+                ("HardwareCoincidence", "PairLogic"),
+            )
+            trigger_key_count = sum(
+                self.config.has_option(section, key)
+                for section, key in trigger_keys
+            )
+            if trigger_key_count not in (0, len(trigger_keys)):
+                raise ValueError(
+                    "SelfTriggerMask와 PairLogic은 모두 설정하거나 모두 "
+                    "생략해야 합니다."
+                )
+
+            if trigger_key_count == 0:
+                trigger_mask = mask_val if self_trigger_mode else 0
+                pair_logic = "OR"
+            else:
+                trigger_mask = int(
+                    self.config.get("Digitizer", "SelfTriggerMask"), 10
+                )
+                pair_logic = self.config.get(
+                    "HardwareCoincidence", "PairLogic"
+                ).strip()
+
+            self.validate_trigger_values(
+                mask_val, trigger_mask, pair_logic, ext_trigger_mode,
+                self_trigger_mode
+            )
+
+            self.set_mask_checks(self.ch_checks, mask_val)
+            self.set_mask_checks(self.trigger_ch_checks, trigger_mask)
+            self.combo_pair_logic.blockSignals(True)
+            self.combo_pair_logic.setCurrentText(pair_logic)
+            self.combo_pair_logic.blockSignals(False)
+            self.trigger_controls_load_error = None
+        except (TypeError, ValueError, OverflowError, configparser.Error) as exc:
+            # Never leave values from the previously loaded file in these
+            # controls. The table remains untouched so Save/DAQ validation can
+            # still report the original malformed setting.
+            self.set_mask_checks(self.ch_checks, 1)
+            self.set_mask_checks(self.trigger_ch_checks, 1)
+            self.combo_pair_logic.blockSignals(True)
+            self.combo_pair_logic.setCurrentText("OR")
+            self.combo_pair_logic.blockSignals(False)
+            self.trigger_controls_load_error = (
+                f"로드한 설정 오류: {exc} 값을 바꾼 뒤 전용 적용 버튼을 누르세요."
+            )
+
+        self.update_mask_calc()
+
+    def protect_controlled_row(self, row):
+        section_item = self.table.item(row, 0)
+        parameter_item = self.table.item(row, 1)
+        if not section_item or not parameter_item:
+            return
+
+        structure_tooltip = "Section과 Parameter 이름은 설정 스키마이므로 변경할 수 없습니다."
+        for column in (0, 1):
+            item = self.table.item(row, column)
+            if item:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(structure_tooltip)
+
+        key = (section_item.text(), parameter_item.text())
+        if key not in self.CONTROLLED_TABLE_KEYS:
+            return
+
+        tooltip = "오른쪽의 Readout & Trigger 전용 컨트롤에서 변경하세요."
+        value_item = self.table.item(row, 2)
+        if value_item:
+            value_item.setFlags(
+                value_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+            )
+            value_item.setToolTip(tooltip)
+
+    @staticmethod
+    def set_mask_checks(checks, mask):
+        for i, chk in enumerate(checks):
+            chk.blockSignals(True)
+            chk.setChecked(bool((mask >> i) & 1))
+            chk.blockSignals(False)
 
     def update_mask_calc(self):
         mask = sum((1 << i) for i, chk in enumerate(self.ch_checks) if chk.isChecked())
         self.lbl_mask_res.setText(str(mask))
+        if hasattr(self, "trigger_ch_checks"):
+            self.update_trigger_mask_calc()
+
+    def on_readout_control_changed(self, *_):
+        self.trigger_controls_load_error = None
+        self.update_mask_calc()
+
+    def on_trigger_control_changed(self, *_):
+        self.trigger_controls_load_error = None
+        self.update_trigger_mask_calc()
+
+    def on_table_cell_changed(self, row, _column):
+        section_item = self.table.item(row, 0)
+        parameter_item = self.table.item(row, 1)
+        if not section_item or not parameter_item:
+            return
+        if (section_item.text(), parameter_item.text()) in {
+            ("Digitizer", "ExtTriggerMode"),
+            ("Digitizer", "SelfTriggerMode"),
+        }:
+            self.trigger_controls_load_error = None
+            self.update_trigger_mask_calc()
+
+    def update_trigger_mask_calc(self):
+        if not hasattr(self, "trigger_ch_checks"):
+            return
+
+        readout_mask = sum(
+            (1 << i) for i, chk in enumerate(self.ch_checks) if chk.isChecked()
+        )
+        trigger_mask = sum(
+            (1 << i) for i, chk in enumerate(self.trigger_ch_checks) if chk.isChecked()
+        )
+        self.lbl_trigger_mask_res.setText(str(trigger_mask))
+
+        logic = self.combo_pair_logic.currentText().upper()
+        validation_error = None
+        if self.table.rowCount() > 0:
+            try:
+                table_channel_mask = self.table_int_value(
+                    "Digitizer", "ChannelMask"
+                )
+                if readout_mask != table_channel_mask:
+                    raise ValueError(
+                        "먼저 Apply Readout Mask를 눌러 readout 채널 변경을 "
+                        "적용하세요."
+                    )
+                ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
+                self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+                self.validate_trigger_values(
+                    readout_mask, trigger_mask, logic, ext_trigger,
+                    self_trigger
+                )
+            except ValueError as exc:
+                validation_error = str(exc)
+
+        display_error = self.trigger_controls_load_error or validation_error
+        if display_error:
+            hint = f"오류: {display_error}"
+            color = "#dc3545"
+        elif trigger_mask == 0:
+            hint = (
+                "외부 트리거 전용: SelfTriggerMode=0, ExtTriggerMode=1을 "
+                "사용하세요."
+            )
+            color = "#6c757d"
+        elif logic == "AND":
+            hint = (
+                "AND는 각 인접 pair의 threshold comparator 출력이 실제로 "
+                "겹칠 때 성립합니다. 여러 pair의 결과는 서로 OR로 결합됩니다."
+            )
+            color = "#0d6efd"
+        else:
+            hint = "OR에서는 선택한 self-trigger 채널 중 하나만 임계값을 넘어도 트리거됩니다."
+            color = "#0d6efd"
+
+        self.lbl_trigger_hint.setText(hint)
+        self.lbl_trigger_hint.setStyleSheet(f"color: {color};")
+        self.btn_apply_trigger.setEnabled(
+            self.table.rowCount() > 0 and validation_error is None
+        )
 
     def apply_mask_to_table(self):
         if self.table.rowCount() == 0: return
+        if self.lbl_mask_res.text() == "0":
+            QMessageBox.warning(self, "Invalid Readout Mask", "Readout mask는 0일 수 없습니다.")
+            return
         self.set_table_value("Digitizer", "ChannelMask", self.lbl_mask_res.text())
+        self.update_trigger_mask_calc()
+
+    def apply_trigger_to_table(self):
+        if self.table.rowCount() == 0:
+            return
+
+        try:
+            selected_channel_mask = int(self.lbl_mask_res.text())
+            channel_mask = self.table_int_value("Digitizer", "ChannelMask")
+            if selected_channel_mask != channel_mask:
+                raise ValueError(
+                    "먼저 Apply Readout Mask를 눌러 readout 채널 변경을 적용하세요."
+                )
+            trigger_mask = int(self.lbl_trigger_mask_res.text())
+            pair_logic = self.combo_pair_logic.currentText().upper()
+            ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
+            self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+            self.validate_trigger_values(
+                channel_mask, trigger_mask, pair_logic, ext_trigger,
+                self_trigger
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Trigger Configuration", str(exc))
+            return
+
+        self.set_table_value("Digitizer", "SelfTriggerMask", str(trigger_mask))
+        self.set_table_value("HardwareCoincidence", "PairLogic", pair_logic)
+        self.trigger_controls_load_error = None
+        self.update_trigger_mask_calc()
 
     def update_time_simulator(self):
         rec_len = self.spin_record.value()
@@ -278,13 +549,137 @@ class ConfigTab(QWidget):
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).text() == target_section and self.table.item(row, 1).text() == target_param:
                 self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
+                self.protect_controlled_row(row)
                 return
         row = self.table.rowCount(); self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(target_section)); self.table.setItem(row, 1, QTableWidgetItem(target_param))
         self.table.setItem(row, 2, QTableWidgetItem(value)); self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
+        self.protect_controlled_row(row)
+
+    def table_value(self, target_section, target_param):
+        value = self.optional_table_value(target_section, target_param)
+        if value is not None:
+            return value
+        raise ValueError(f"필수 설정이 없습니다: [{target_section}] {target_param}")
+
+    def optional_table_value(self, target_section, target_param):
+        for row in range(self.table.rowCount()):
+            section_item = self.table.item(row, 0)
+            parameter_item = self.table.item(row, 1)
+            value_item = self.table.item(row, 2)
+            if not section_item or not parameter_item or not value_item:
+                continue
+            if (
+                section_item.text() == target_section
+                and parameter_item.text() == target_param
+            ):
+                return value_item.text().strip()
+        return None
+
+    def table_int_value(self, target_section, target_param):
+        raw_value = self.table_value(target_section, target_param)
+        try:
+            return int(raw_value, 10)
+        except ValueError as exc:
+            raise ValueError(
+                f"정수가 아닌 설정값입니다: [{target_section}] "
+                f"{target_param}={raw_value}"
+            ) from exc
+
+    @staticmethod
+    def validate_trigger_values(
+        channel_mask, trigger_mask, pair_logic, ext_trigger, self_trigger
+    ):
+        if not 1 <= channel_mask <= 0xFF:
+            raise ValueError("[Digitizer] ChannelMask는 1..255여야 합니다.")
+        if not 0 <= trigger_mask <= 0xFF:
+            raise ValueError("[Digitizer] SelfTriggerMask는 0..255여야 합니다.")
+        if ext_trigger not in (0, 1) or self_trigger not in (0, 1):
+            raise ValueError("ExtTriggerMode와 SelfTriggerMode는 0 또는 1이어야 합니다.")
+        if ext_trigger == 0 and self_trigger == 0:
+            raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
+        if trigger_mask & ~channel_mask:
+            raise ValueError("SelfTriggerMask는 ChannelMask의 부분집합이어야 합니다.")
+        if pair_logic not in ("AND", "OR"):
+            raise ValueError("[HardwareCoincidence] PairLogic은 AND 또는 OR여야 합니다.")
+
+        if self_trigger:
+            if trigger_mask == 0:
+                raise ValueError(
+                    "SelfTriggerMode=1이면 SelfTriggerMask에 채널을 하나 이상 선택해야 합니다."
+                )
+        else:
+            if trigger_mask != 0:
+                raise ValueError("SelfTriggerMode=0이면 SelfTriggerMask는 0이어야 합니다.")
+
+        if pair_logic == "AND":
+            incomplete_pairs = [
+                f"CH{pair_start}/{pair_start + 1}"
+                for pair_start in range(0, 8, 2)
+                if ((trigger_mask >> pair_start) & 0x3) not in (0, 0x3)
+            ]
+            if incomplete_pairs:
+                raise ValueError(
+                    "AND는 완전한 인접 pair만 선택할 수 있습니다: "
+                    + ", ".join(incomplete_pairs)
+                )
+
+    def validate_trigger_table(self):
+        seen_keys = set()
+        for row in range(self.table.rowCount()):
+            items = [self.table.item(row, column) for column in range(3)]
+            if any(item is None or not item.text().strip() for item in items):
+                raise ValueError(f"비어 있는 설정 항목이 있습니다 (row {row + 1}).")
+            key = (items[0].text().strip(), items[1].text().strip())
+            if key in seen_keys:
+                raise ValueError(
+                    f"중복 설정 항목입니다: [{key[0]}] {key[1]}"
+                )
+            seen_keys.add(key)
+
+        trigger_keys = (
+            ("Digitizer", "SelfTriggerMask"),
+            ("HardwareCoincidence", "PairLogic"),
+        )
+        present_values = [
+            self.optional_table_value(section, parameter)
+            for section, parameter in trigger_keys
+        ]
+        trigger_key_count = sum(value is not None for value in present_values)
+        if trigger_key_count not in (0, len(trigger_keys)):
+            raise ValueError(
+                "[Digitizer] SelfTriggerMask와 [HardwareCoincidence] "
+                "PairLogic은 두 항목을 모두 설정하거나 모두 생략해야 합니다."
+            )
+
+        channel_mask = self.table_int_value("Digitizer", "ChannelMask")
+        ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
+        self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+        if trigger_key_count == 0:
+            trigger_mask = channel_mask if self_trigger else 0
+            pair_logic = "OR"
+        else:
+            trigger_mask = self.table_int_value("Digitizer", "SelfTriggerMask")
+            pair_logic = self.table_value(
+                "HardwareCoincidence", "PairLogic"
+            )
+
+        self.validate_trigger_values(
+            channel_mask, trigger_mask, pair_logic, ext_trigger,
+            self_trigger
+        )
 
     def save_config(self):
         if not self.current_config_path: return
+        try:
+            self.validate_trigger_table()
+        except ValueError as exc:
+            QMessageBox.critical(
+                self, "Invalid Configuration",
+                f"설정 파일을 저장하지 않았습니다.\n\n{exc}"
+            )
+            return
+
         self.config.clear()
         for row in range(self.table.rowCount()):
             sec = self.table.item(row, 0).text(); key = self.table.item(row, 1).text(); val = self.table.item(row, 2).text()

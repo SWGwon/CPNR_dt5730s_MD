@@ -113,10 +113,13 @@ int main() {
         "[Digitizer]\n"
         "RecordLength=1024\n"
         "ChannelMask=3\n"
+        "SelfTriggerMask=3\n"
         "PostTrigger=70\n"
         "TriggerPolarity=1\n"
         "ExtTriggerMode=0\n"
         "SelfTriggerMode=1\n"
+        "[HardwareCoincidence]\n"
+        "PairLogic=AND\n"
         "[Channel_0]\n"
         "DCOffset=32768\n"
         "TriggerThreshold=8050\n"
@@ -129,8 +132,153 @@ int main() {
     const DAQHardwareSettings settings = LoadDAQHardwareSettings(valid_daq_parser);
     Check(settings.record_length == 1024, "DAQ schema record length");
     Check(settings.channel_mask == 3, "DAQ schema channel mask");
+    Check(settings.self_trigger_mask == 3, "DAQ schema self-trigger mask");
+    Check(settings.explicit_trigger_routing,
+          "split-trigger schema enables explicit hardware routing");
+    Check(settings.pair_logic == DAQPairLogic::kAnd,
+          "DAQ schema adjacent-pair logic");
     Check(settings.channels[1].trigger_threshold == 14615,
           "DAQ schema active-channel settings");
+
+    const auto legacy_daq_path = test_dir / "legacy_daq.conf";
+    WriteFile(legacy_daq_path,
+              "[Digitizer]\n"
+              "RecordLength=1024\n"
+              "ChannelMask=1\n"
+              "PostTrigger=70\n"
+              "TriggerPolarity=1\n"
+              "ExtTriggerMode=0\n"
+              "SelfTriggerMode=1\n"
+              "[Channel_0]\n"
+              "DCOffset=32768\n"
+              "TriggerThreshold=8050\n");
+    ConfigParser legacy_daq_parser(legacy_daq_path.string());
+    const DAQHardwareSettings legacy_settings =
+        LoadDAQHardwareSettings(legacy_daq_parser);
+    Check(legacy_settings.self_trigger_mask == 1,
+          "legacy DAQ config uses readout mask for self-trigger");
+    Check(!legacy_settings.explicit_trigger_routing,
+          "legacy DAQ config preserves firmware pair routing");
+    Check(legacy_settings.pair_logic == DAQPairLogic::kOr,
+          "legacy DAQ config preserves OR behavior");
+
+    const auto valid_or_single_path = test_dir / "valid_or_single.conf";
+    WriteFile(valid_or_single_path,
+              "[Digitizer]\n"
+              "RecordLength=1024\n"
+              "ChannelMask=1\n"
+              "SelfTriggerMask=1\n"
+              "PostTrigger=70\n"
+              "TriggerPolarity=1\n"
+              "ExtTriggerMode=0\n"
+              "SelfTriggerMode=1\n"
+              "[HardwareCoincidence]\n"
+              "PairLogic=OR\n"
+              "[Channel_0]\n"
+              "DCOffset=32768\n"
+              "TriggerThreshold=8050\n");
+    ConfigParser valid_or_single(valid_or_single_path.string());
+    const DAQHardwareSettings single_or_settings =
+        LoadDAQHardwareSettings(valid_or_single);
+    Check(single_or_settings.self_trigger_mask == 1,
+          "OR logic accepts a single channel from a pair");
+
+    const auto valid_ext_only_path = test_dir / "valid_ext_only.conf";
+    WriteFile(valid_ext_only_path,
+              "[Digitizer]\n"
+              "RecordLength=1024\n"
+              "ChannelMask=1\n"
+              "SelfTriggerMask=0\n"
+              "PostTrigger=70\n"
+              "TriggerPolarity=1\n"
+              "ExtTriggerMode=1\n"
+              "SelfTriggerMode=0\n"
+              "[HardwareCoincidence]\n"
+              "PairLogic=OR\n"
+              "[Channel_0]\n"
+              "DCOffset=32768\n"
+              "TriggerThreshold=8050\n");
+    ConfigParser valid_ext_only(valid_ext_only_path.string());
+    const DAQHardwareSettings ext_only_settings =
+        LoadDAQHardwareSettings(valid_ext_only);
+    Check(ext_only_settings.self_trigger_mask == 0,
+          "external-only trigger has an empty self-trigger mask");
+
+    const auto partial_trigger_schema_path =
+        test_dir / "partial_trigger_schema.conf";
+    WriteFile(partial_trigger_schema_path,
+              "[Digitizer]\n"
+              "RecordLength=1024\n"
+              "ChannelMask=1\n"
+              "SelfTriggerMask=1\n"
+              "PostTrigger=70\n"
+              "TriggerPolarity=1\n"
+              "ExtTriggerMode=0\n"
+              "SelfTriggerMode=1\n"
+              "[Channel_0]\n"
+              "DCOffset=32768\n"
+              "TriggerThreshold=8050\n");
+    ConfigParser partial_trigger_schema(partial_trigger_schema_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(partial_trigger_schema); },
+                "must be specified together",
+                "partial split-trigger schema fails closed");
+
+    const auto trigger_not_subset_path = test_dir / "trigger_not_subset.conf";
+    std::string trigger_not_subset_config = valid_daq_config;
+    trigger_not_subset_config.replace(
+        trigger_not_subset_config.find("SelfTriggerMask=3"),
+        std::string("SelfTriggerMask=3").size(), "SelfTriggerMask=12");
+    WriteFile(trigger_not_subset_path, trigger_not_subset_config);
+    ConfigParser trigger_not_subset(trigger_not_subset_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(trigger_not_subset); },
+                "subset of ChannelMask",
+                "self-trigger mask outside readout mask fails closed");
+
+    const auto incomplete_and_pair_path = test_dir / "incomplete_and_pair.conf";
+    std::string incomplete_and_pair_config = valid_daq_config;
+    incomplete_and_pair_config.replace(
+        incomplete_and_pair_config.find("SelfTriggerMask=3"),
+        std::string("SelfTriggerMask=3").size(), "SelfTriggerMask=1");
+    WriteFile(incomplete_and_pair_path, incomplete_and_pair_config);
+    ConfigParser incomplete_and_pair(incomplete_and_pair_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(incomplete_and_pair); },
+                "complete adjacent channel pairs",
+                "AND with an incomplete x730 pair fails closed");
+
+    const auto invalid_pair_logic_path = test_dir / "invalid_pair_logic.conf";
+    std::string invalid_pair_logic_config = valid_daq_config;
+    invalid_pair_logic_config.replace(invalid_pair_logic_config.find("PairLogic=AND"),
+                                      std::string("PairLogic=AND").size(),
+                                      "PairLogic=XOR");
+    WriteFile(invalid_pair_logic_path, invalid_pair_logic_config);
+    ConfigParser invalid_pair_logic(invalid_pair_logic_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(invalid_pair_logic); },
+                "must be AND or OR", "unknown pair logic fails closed");
+
+    const auto disabled_self_mask_path = test_dir / "disabled_self_mask.conf";
+    std::string disabled_self_mask_config = valid_daq_config;
+    disabled_self_mask_config.replace(
+        disabled_self_mask_config.find("ExtTriggerMode=0"),
+        std::string("ExtTriggerMode=0").size(), "ExtTriggerMode=1");
+    disabled_self_mask_config.replace(
+        disabled_self_mask_config.find("SelfTriggerMode=1"),
+        std::string("SelfTriggerMode=1").size(), "SelfTriggerMode=0");
+    WriteFile(disabled_self_mask_path, disabled_self_mask_config);
+    ConfigParser disabled_self_mask(disabled_self_mask_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(disabled_self_mask); },
+                "SelfTriggerMask must be 0",
+                "disabled self-trigger with a nonzero mask fails closed");
+
+    const auto enabled_empty_mask_path = test_dir / "enabled_empty_mask.conf";
+    std::string enabled_empty_mask_config = valid_daq_config;
+    enabled_empty_mask_config.replace(
+        enabled_empty_mask_config.find("SelfTriggerMask=3"),
+        std::string("SelfTriggerMask=3").size(), "SelfTriggerMask=0");
+    WriteFile(enabled_empty_mask_path, enabled_empty_mask_config);
+    ConfigParser enabled_empty_mask(enabled_empty_mask_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(enabled_empty_mask); },
+                "must enable at least one channel",
+                "enabled self-trigger with an empty mask fails closed");
 
     const auto missing_channel_path = test_dir / "missing_channel.conf";
     WriteFile(missing_channel_path,

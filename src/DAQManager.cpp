@@ -6,8 +6,121 @@
 #include <cstring>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
+#include <stdexcept>
 #include <ctime>
 #include <zmq.h>
+
+namespace {
+
+constexpr uint32_t kGlobalTriggerMaskRegister = 0x810C;
+constexpr uint32_t kPairTriggerLogicBase = 0x1084;
+constexpr uint32_t kPairRegisterStride = 0x200;
+constexpr uint32_t kPairTriggerRequestMask = 0x0F;
+constexpr uint32_t kPairLogicFieldMask = 0x07;
+constexpr uint32_t kMajorityLevelMask = 0x07U << 24;
+constexpr uint32_t kExternalTriggerEnableMask = 1U << 30;
+constexpr uint32_t kSoftwareTriggerEnableMask = 1U << 31;
+constexpr int kDppFirmwareMajorBase = 128;
+
+// Self Trigger Logic register bits [1:0], for each adjacent x730 pair.
+constexpr uint32_t kPairAnd = 0;
+constexpr uint32_t kEvenChannelOnly = 1;
+constexpr uint32_t kOddChannelOnly = 2;
+constexpr uint32_t kPairOr = 3;
+constexpr uint32_t kUseOverThresholdSignal = 1U << 2;
+
+std::string Hex32(uint32_t value) {
+  std::ostringstream stream;
+  stream << "0x" << std::uppercase << std::hex << std::setw(8)
+         << std::setfill('0') << value;
+  return stream.str();
+}
+
+int ParseFirmwareMajor(const char* release) {
+  std::istringstream stream(release);
+  int major = -1;
+  stream >> major;
+  if (!stream || major < 0) {
+    throw std::runtime_error(
+        "Cannot identify AMC firmware revision '" + std::string(release) +
+        "'; explicit trigger-register routing was not applied");
+  }
+  return major;
+}
+
+uint32_t ReadRegister(int handle, uint32_t address) {
+  uint32_t value = 0;
+  CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, address, &value));
+  return value;
+}
+
+void WriteMaskedRegisterAndVerify(int handle, uint32_t address, uint32_t mask,
+                                  uint32_t requested_value,
+                                  const std::string& description) {
+  const uint32_t current_value = ReadRegister(handle, address);
+  const uint32_t updated_value =
+      (current_value & ~mask) | (requested_value & mask);
+  CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, address, updated_value));
+
+  const uint32_t readback = ReadRegister(handle, address);
+  if ((readback & mask) != (requested_value & mask)) {
+    throw std::runtime_error(
+        description + " register verification failed at " + Hex32(address) +
+        ": requested " + Hex32(requested_value & mask) + ", read " +
+        Hex32(readback & mask));
+  }
+}
+
+uint32_t PairSelector(uint32_t pair_bits, DAQPairLogic pair_logic) {
+  switch (pair_bits) {
+    case 0x1:
+      return kUseOverThresholdSignal | kEvenChannelOnly;
+    case 0x2:
+      return kUseOverThresholdSignal | kOddChannelOnly;
+    case 0x3:
+      return kUseOverThresholdSignal |
+             (pair_logic == DAQPairLogic::kAnd ? kPairAnd : kPairOr);
+    default:
+      throw std::logic_error("Cannot configure an empty trigger pair");
+  }
+}
+
+uint32_t PairRequestMask(uint32_t self_trigger_mask) {
+  uint32_t request_mask = 0;
+  for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+    if ((self_trigger_mask & (0x3U << (pair * 2))) != 0U) {
+      request_mask |= 1U << pair;
+    }
+  }
+  return request_mask;
+}
+
+std::string DescribeTriggerRouting(uint32_t self_trigger_mask,
+                                   DAQPairLogic pair_logic) {
+  std::ostringstream description;
+  bool first = true;
+  for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+    const int even_ch = pair * 2;
+    const uint32_t pair_bits = (self_trigger_mask >> even_ch) & 0x3U;
+    if (pair_bits == 0U) continue;
+
+    if (!first) description << " OR ";
+    first = false;
+    if (pair_bits == 0x1U) {
+      description << "CH" << even_ch;
+    } else if (pair_bits == 0x2U) {
+      description << "CH" << even_ch + 1;
+    } else {
+      description << "(CH" << even_ch
+                  << (pair_logic == DAQPairLogic::kAnd ? " AND CH" : " OR CH")
+                  << even_ch + 1 << ")";
+    }
+  }
+  return description.str();
+}
+
+}  // namespace
 
 DAQManager::DAQManager(const std::string &config_file,
                        const std::string &output_file, int max_events,
@@ -48,6 +161,25 @@ DAQManager::~DAQManager() {
 void DAQManager::SetupHardware() {
   std::cout << "\033[1;36m[DAQManager]\033[0m Configuring Hardware from Config...\n";
   int handle = digitizer_.GetHandle();
+
+  CAEN_DGTZ_BoardInfo_t board_info{};
+  CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &board_info));
+  if (hardware_settings_.explicit_trigger_routing &&
+      hardware_settings_.self_trigger_mode > 0) {
+    if (board_info.FamilyCode != CAEN_DGTZ_XX730_FAMILY_CODE) {
+      throw std::runtime_error(
+          "Explicit pair trigger routing requires an x730-family digitizer; "
+          "connected model is " +
+          std::string(board_info.ModelName));
+    }
+    if (ParseFirmwareMajor(board_info.AMC_FirmwareRel) >=
+        kDppFirmwareMajorBase) {
+      throw std::runtime_error(
+          "Explicit pair trigger routing requires standard waveform firmware; "
+          "connected AMC firmware is " +
+          std::string(board_info.AMC_FirmwareRel) + " (DPP family)");
+    }
+  }
   
   uint32_t acq_ctrl = 0;
   CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x8100, &acq_ctrl));
@@ -55,6 +187,7 @@ void DAQManager::SetupHardware() {
 
   uint32_t record_length = hardware_settings_.record_length;
   uint32_t channel_mask = hardware_settings_.channel_mask;
+  uint32_t self_trigger_mask = hardware_settings_.self_trigger_mask;
   uint32_t post_trigger = hardware_settings_.post_trigger;
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
@@ -80,13 +213,76 @@ void DAQManager::SetupHardware() {
   else CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, CAEN_DGTZ_TRGMODE_DISABLED));
   
   int self_trg = hardware_settings_.self_trigger_mode;
-  if (self_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, channel_mask));
+  if (self_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, self_trigger_mask));
   else CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
 
-  CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, trg_mode));
+  // New split-mask configurations expose only self/external trigger sources,
+  // so software triggers must not bypass the requested routing. Preserve the
+  // previous API behavior for legacy configurations that omit the new keys.
+  const bool software_trigger_enabled =
+      !hardware_settings_.explicit_trigger_routing;
+  CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(
+      handle, software_trigger_enabled ? trg_mode
+                                       : CAEN_DGTZ_TRGMODE_DISABLED));
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
 
-  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard OR Logic (Software Coincidence Ready).\n";
+  if (self_trg > 0 && hardware_settings_.explicit_trigger_routing) {
+    for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+      const uint32_t pair_bits = (self_trigger_mask >> (pair * 2)) & 0x3U;
+      if (pair_bits == 0U) continue;
+
+      const uint32_t pair_logic_register =
+          kPairTriggerLogicBase + kPairRegisterStride * pair;
+      // Bit 2 = 1 selects the actual over/under-threshold comparator signal.
+      // Bits [1:0] select AND, even-only, odd-only, or OR for the pair.
+      WriteMaskedRegisterAndVerify(
+          handle, pair_logic_register, kPairLogicFieldMask,
+          PairSelector(pair_bits, hardware_settings_.pair_logic),
+          "Adjacent-channel trigger logic");
+    }
+
+    // A level of zero combines enabled pair requests with OR. This is distinct
+    // from the AND/OR operation performed inside each adjacent channel pair.
+    WriteMaskedRegisterAndVerify(handle, kGlobalTriggerMaskRegister,
+                                 kMajorityLevelMask, 0,
+                                 "Global pair-request logic");
+  }
+
+  const uint32_t global_trigger_mask =
+      ReadRegister(handle, kGlobalTriggerMaskRegister);
+  const uint32_t expected_pair_requests =
+      self_trg > 0 ? PairRequestMask(self_trigger_mask) : 0U;
+  const uint32_t source_field_mask =
+      kPairTriggerRequestMask | kExternalTriggerEnableMask |
+      kSoftwareTriggerEnableMask;
+  const uint32_t expected_source_fields =
+      expected_pair_requests |
+      (ext_trg > 0 ? kExternalTriggerEnableMask : 0U) |
+      (software_trigger_enabled ? kSoftwareTriggerEnableMask : 0U);
+  if ((global_trigger_mask & source_field_mask) != expected_source_fields) {
+    throw std::runtime_error(
+        "Global trigger source verification failed at " +
+        Hex32(kGlobalTriggerMaskRegister) + ": requested " +
+        Hex32(expected_source_fields) + ", read " +
+        Hex32(global_trigger_mask & source_field_mask));
+  }
+
+  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Record mask="
+            << Hex32(channel_mask) << ", self-trigger mask="
+            << Hex32(self_trigger_mask);
+  if (self_trg > 0) {
+    std::cout << ", route="
+              << DescribeTriggerRouting(self_trigger_mask,
+                                        hardware_settings_.pair_logic);
+    if (hardware_settings_.explicit_trigger_routing) {
+      std::cout << ", comparator source=over-threshold";
+    } else {
+      std::cout << " (legacy pair-register behavior)";
+    }
+  } else {
+    std::cout << ", self-trigger disabled";
+  }
+  std::cout << ".\n";
 
   digitizer_.AllocateBuffers();
 

@@ -475,6 +475,17 @@ class DaqTab(QWidget):
                 )
             return value
 
+        def required_choice(section, key, choices):
+            if section not in config_data or key not in config_data[section]:
+                raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
+            value = config_data[section][key]
+            if value not in choices:
+                allowed = ", ".join(sorted(choices))
+                raise ValueError(
+                    f"설정값 오류: [{section}] {key}={value} (허용 {allowed})"
+                )
+            return value
+
         record_length = required_int("Digitizer", "RecordLength", 128, 102400)
         channel_mask = required_int("Digitizer", "ChannelMask", 1, (1 << 8) - 1)
         post_trigger = required_int("Digitizer", "PostTrigger", 0, 100)
@@ -482,12 +493,65 @@ class DaqTab(QWidget):
         ext_trigger = required_int("Digitizer", "ExtTriggerMode", 0, 1)
         self_trigger = required_int("Digitizer", "SelfTriggerMode", 0, 1)
 
+        trigger_keys = (
+            ("Digitizer", "SelfTriggerMask"),
+            ("HardwareCoincidence", "PairLogic"),
+        )
+        trigger_key_count = sum(
+            section in config_data and key in config_data[section]
+            for section, key in trigger_keys
+        )
+        if trigger_key_count not in (0, len(trigger_keys)):
+            raise ValueError(
+                "[Digitizer] SelfTriggerMask와 [HardwareCoincidence] "
+                "PairLogic은 두 항목을 모두 설정하거나 모두 생략해야 합니다."
+            )
+
+        if trigger_key_count == 0:
+            self_trigger_mask = channel_mask if self_trigger else 0
+            pair_logic = "OR"
+        else:
+            self_trigger_mask = required_int(
+                "Digitizer", "SelfTriggerMask", 0, (1 << 8) - 1
+            )
+            pair_logic = required_choice(
+                "HardwareCoincidence", "PairLogic", {"AND", "OR"}
+            )
+
         if record_length % 8 != 0:
             raise ValueError("[Digitizer] RecordLength는 8의 배수여야 합니다.")
         if record_length * (100 - post_trigger) < 8000:
             raise ValueError("[Digitizer] 트리거 이전 구간이 최소 160 ns보다 짧습니다.")
         if ext_trigger == 0 and self_trigger == 0:
             raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
+        if self_trigger_mask & ~channel_mask:
+            raise ValueError(
+                "[Digitizer] SelfTriggerMask는 ChannelMask의 부분집합이어야 합니다."
+            )
+        if self_trigger:
+            if self_trigger_mask == 0:
+                raise ValueError(
+                    "SelfTriggerMode=1이면 SelfTriggerMask에 채널을 하나 이상 "
+                    "선택해야 합니다."
+                )
+        else:
+            if self_trigger_mask != 0:
+                raise ValueError(
+                    "SelfTriggerMode=0이면 [Digitizer] SelfTriggerMask는 0이어야 합니다."
+                )
+
+        if pair_logic == "AND":
+            incomplete_pairs = [
+                f"CH{pair_start}/{pair_start + 1}"
+                for pair_start in range(0, 8, 2)
+                if ((self_trigger_mask >> pair_start) & 0x3) not in (0, 0x3)
+            ]
+            if incomplete_pairs:
+                raise ValueError(
+                    "AND는 완전한 인접 pair만 선택할 수 있습니다: "
+                    + ", ".join(incomplete_pairs)
+                    + ". 여러 pair를 선택하면 각 pair의 AND 결과는 서로 OR로 결합됩니다."
+                )
         for ch in range(8):
             if (channel_mask >> ch) & 1:
                 section = f"Channel_{ch}"
