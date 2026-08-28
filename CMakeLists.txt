@@ -72,6 +72,36 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME trigger_calibration_regression COMMAND trigger_calibration_tests)
 
+  add_executable(dt5730_timing_tests tests/dt5730_timing_tests.cpp)
+  target_include_directories(dt5730_timing_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(dt5730_timing_tests PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(dt5730_timing_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME dt5730_timing_contract_regression
+           COMMAND dt5730_timing_tests)
+
+  add_executable(dt5730_status_tests tests/dt5730_status_tests.cpp)
+  target_include_directories(dt5730_status_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/tests/mocks
+      ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(dt5730_status_tests PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(dt5730_status_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME dt5730_status_contract_regression
+           COMMAND dt5730_status_tests)
+
+  add_executable(data_quality_tests tests/data_quality_tests.cpp)
+  target_include_directories(data_quality_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(data_quality_tests PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(data_quality_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME data_quality_policy_regression COMMAND data_quality_tests)
+
   add_executable(daq_manager_mock_tests
       tests/daq_manager_mock_tests.cpp
       src/DAQManager.cpp
@@ -115,6 +145,31 @@ if(BUILD_TESTING)
   set_target_properties(sha256_tests PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME sha256_regression COMMAND sha256_tests)
+
+  add_executable(raw_root_fidelity_tests
+      tests/raw_root_fidelity_tests.cpp
+      src/RawRootFidelity.cpp
+      src/WaveformDsp.cpp
+      src/Sha256.cpp)
+  target_include_directories(raw_root_fidelity_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(raw_root_fidelity_tests PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(raw_root_fidelity_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME raw_root_fidelity_regression
+           COMMAND raw_root_fidelity_tests)
+
+  add_executable(waveform_dsp_tests
+      tests/waveform_dsp_tests.cpp
+      src/WaveformDsp.cpp)
+  target_include_directories(waveform_dsp_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(waveform_dsp_tests PRIVATE
+      -Wall -Wextra -Werror)
+  set_target_properties(waveform_dsp_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME waveform_dsp_regression COMMAND waveform_dsp_tests)
 
   if(BUILD_DAQ_APPLICATIONS)
     add_test(NAME raw_salvage_hardware_free_integration
@@ -177,8 +232,15 @@ if(BUILD_TESTING)
     add_test(NAME gui_process_lifecycle_regression
         COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
                 tests/test_process_manager_lifecycle.py)
+    add_test(NAME gui_root_validation_lifecycle_regression
+        COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
+                tests/test_root_validation_tab_lifecycle.py)
+    add_test(NAME gui_monitor_safety_regression
+        COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
+                tests/test_monitor_safety.py)
     set_tests_properties(
         gui_operator_safety_regression gui_process_lifecycle_regression
+        gui_root_validation_lifecycle_regression gui_monitor_safety_regression
         PROPERTIES
           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
           ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
@@ -368,6 +430,7 @@ if(BUILD_DAQ_APPLICATIONS)
         add_executable(production_dt5730
             src/production_dt5730.cpp
             src/DAQConfig.cpp
+            src/WaveformDsp.cpp
             src/Sha256.cpp)
         target_include_directories(production_dt5730 PRIVATE include)
         target_compile_definitions(production_dt5730 PRIVATE
@@ -392,6 +455,8 @@ if(BUILD_DAQ_APPLICATIONS)
         add_executable(root_validate_dt5730
             src/root_validate_dt5730.cpp
             src/RootValidator.cpp
+            src/RawRootFidelity.cpp
+            src/WaveformDsp.cpp
             src/DAQConfig.cpp
             src/Sha256.cpp)
         target_include_directories(root_validate_dt5730 PRIVATE include)

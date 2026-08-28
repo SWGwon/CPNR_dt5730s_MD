@@ -58,7 +58,13 @@ def check_signal_bridge(executable: str) -> None:
         raw = directory / "run.dat"
         metadata = directory / "run.dat.run.json"
         config.write_text(
-            """[Digitizer]
+            """[Connection]
+Type=USB
+Link=0
+Node=0
+BaseAddress=0
+ExpectedModel=MOCK-DT5730S
+[Digitizer]
 RecordLength=512
 ChannelMask=1
 SelfTriggerMask=1
@@ -131,7 +137,13 @@ def check_setup_cancellation(executable: str) -> None:
         raw = directory / "run.dat"
         metadata = directory / "run.dat.run.json"
         config.write_text(
-            """[Digitizer]
+            """[Connection]
+Type=USB
+Link=0
+Node=0
+BaseAddress=0
+ExpectedModel=MOCK-DT5730S
+[Digitizer]
 RecordLength=512
 ChannelMask=1
 SelfTriggerMask=1

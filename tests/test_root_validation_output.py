@@ -24,10 +24,18 @@ def sample_report():
         "overall_status": "PASS",
         "file": "/data/run021_prod.root",
         "summary": {"entries": 200000},
+        "analysis": {"completed": True, "cancelled": False},
+        "domain_status": {
+            "data_integrity": "PASS",
+            "provenance": "SKIP",
+            "trigger_and_quality": "SKIP",
+        },
         "checks": [
             {
                 "id": "tree.entries",
                 "status": "PASS",
+                "category": "integrity",
+                "name": "tree_entries",
                 "message": "Tree and metadata event counts agree",
             }
         ],
@@ -35,7 +43,7 @@ def sample_report():
             {"channel": 0, "status": "PASS"},
             {"channel": 1, "status": "PASS"},
         ],
-        "counts": {"pass": 1, "warn": 0, "fail": 0},
+        "counts": {"pass": 1, "warn": 0, "fail": 0, "skip": 0},
     }
 
 
@@ -51,12 +59,14 @@ INPUT_IDENTITY = {
 }
 
 
-def envelope_report(*, max_events=None):
+def envelope_report(*, max_events=None, raw_fidelity=False):
     report = sample_report()
     report["input"] = {
         "path": "/data/run021_prod.root",
         "max_events": max_events,
+        "raw_fidelity_requested": raw_fidelity,
         "identity_start": dict(INPUT_IDENTITY),
+        "identity_end": dict(INPUT_IDENTITY),
     }
     report["validator"] = {
         "executable_path": "/opt/cpnr/root_validate_dt5730",
@@ -150,6 +160,7 @@ class RootValidationOutputTests(unittest.TestCase):
             input_path="/data/run021_prod.root",
             max_events=0,
             input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
             validator_path="/opt/cpnr/root_validate_dt5730",
             validator_sha256="a" * 64,
         )
@@ -166,6 +177,7 @@ class RootValidationOutputTests(unittest.TestCase):
                         input_path="/data/run021_prod.root",
                         max_events=0,
                         input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
                         validator_path="/opt/cpnr/root_validate_dt5730",
                         validator_sha256="a" * 64,
                     )
@@ -177,6 +189,7 @@ class RootValidationOutputTests(unittest.TestCase):
             input_path="/data/run021_prod.root",
             max_events=25000,
             input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
             validator_path="/opt/cpnr/root_validate_dt5730",
             validator_sha256="a" * 64,
         )
@@ -191,6 +204,7 @@ class RootValidationOutputTests(unittest.TestCase):
                         input_path="/data/run021_prod.root",
                         max_events=25000,
                         input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
                         validator_path="/opt/cpnr/root_validate_dt5730",
                         validator_sha256="a" * 64,
                     )
@@ -203,9 +217,78 @@ class RootValidationOutputTests(unittest.TestCase):
                 input_path="/data/run021_prod.root",
                 max_events=25000,
                 input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
                 validator_path="/opt/cpnr/root_validate_dt5730",
                 validator_sha256="a" * 64,
             )
+
+    def test_report_envelope_binds_raw_fidelity_mode(self):
+        report = envelope_report(raw_fidelity=True)
+        validate_report_envelope(
+            report,
+            input_path="/data/run021_prod.root",
+            max_events=0,
+            input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
+            validator_path="/opt/cpnr/root_validate_dt5730",
+            validator_sha256="a" * 64,
+            raw_fidelity_requested=True,
+        )
+        report["input"]["raw_fidelity_requested"] = False
+        with self.assertRaisesRegex(ValueError, "RAW fidelity mode"):
+            validate_report_envelope(
+                report,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+                raw_fidelity_requested=True,
+            )
+
+    def test_report_envelope_rejects_terminal_truth_inconsistency(self):
+        base = envelope_report()
+        cases = (
+            (
+                "final_identity",
+                lambda value: value["input"]["identity_end"].__setitem__(
+                    "inode", INPUT_IDENTITY["inode"] + 1
+                ),
+                "end stat",
+            ),
+            (
+                "counts",
+                lambda value: value["counts"].__setitem__("pass", 2),
+                "count is inconsistent",
+            ),
+            (
+                "overall",
+                lambda value: value.__setitem__("overall_status", "WARN"),
+                "overall_status is inconsistent",
+            ),
+            (
+                "lifecycle",
+                lambda value: value["analysis"].__setitem__(
+                    "completed", False
+                ),
+                "lifecycle flags are inconsistent",
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                report = json.loads(json.dumps(base))
+                mutate(report)
+                with self.assertRaisesRegex(ValueError, expected):
+                    validate_report_envelope(
+                        report,
+                        input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
 
     def test_report_envelope_binds_every_input_start_identity_field(self):
         report = envelope_report()
@@ -219,6 +302,7 @@ class RootValidationOutputTests(unittest.TestCase):
                         input_path="/data/run021_prod.root",
                         max_events=0,
                         input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
                         validator_path="/opt/cpnr/root_validate_dt5730",
                         validator_sha256="a" * 64,
                     )
@@ -231,6 +315,7 @@ class RootValidationOutputTests(unittest.TestCase):
                 input_path="/data/run021_prod.root",
                 max_events=0,
                 input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
                 validator_path="/opt/cpnr/root_validate_dt5730",
                 validator_sha256="a" * 64,
             )

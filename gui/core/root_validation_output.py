@@ -211,8 +211,10 @@ def validate_report_envelope(
     input_path: str,
     max_events: int,
     input_identity_start: Mapping[str, int],
+    input_identity_end: Mapping[str, int],
     validator_path: str,
     validator_sha256: str,
+    raw_fidelity_requested: bool = False,
 ) -> None:
     """Authenticate a report against the exact launch request and identities."""
 
@@ -256,6 +258,18 @@ def validate_report_envelope(
             f"reported={reported_max_events!r}, "
             f"requested={expected_max_events!r}"
         )
+    if not isinstance(raw_fidelity_requested, bool):
+        raise ValueError("requested raw_fidelity flag must be boolean")
+    reported_raw_fidelity = input_info.get("raw_fidelity_requested")
+    if (
+        not isinstance(reported_raw_fidelity, bool)
+        or reported_raw_fidelity != raw_fidelity_requested
+    ):
+        raise ValueError(
+            "validator report RAW fidelity mode does not match the launch "
+            f"request: reported={reported_raw_fidelity!r}, "
+            f"requested={raw_fidelity_requested!r}"
+        )
 
     identity_fields = (
         "device",
@@ -267,32 +281,42 @@ def validate_report_envelope(
         "ctime_seconds",
         "ctime_nanoseconds",
     )
-    if not isinstance(input_identity_start, Mapping):
-        raise ValueError("input launch identity is unavailable")
-    reported_identity = input_info.get("identity_start")
-    if not isinstance(reported_identity, Mapping):
-        raise ValueError("validator report is missing input.identity_start")
-    for field in identity_fields:
-        expected_value = input_identity_start.get(field)
-        if (
-            isinstance(expected_value, bool)
-            or not isinstance(expected_value, int)
-        ):
+    def require_identity(label, reported_value, expected_value):
+        if not isinstance(expected_value, Mapping):
+            raise ValueError(f"input {label} identity is unavailable")
+        if not isinstance(reported_value, Mapping):
             raise ValueError(
-                f"input launch identity has invalid {field}: "
-                f"{expected_value!r}"
+                f"validator report is missing input.identity_{label}"
             )
-        reported_value = reported_identity.get(field)
-        if (
-            isinstance(reported_value, bool)
-            or not isinstance(reported_value, int)
-            or reported_value != expected_value
-        ):
-            raise ValueError(
-                "validator report input identity does not match launch stat: "
-                f"field={field}, reported={reported_value!r}, "
-                f"expected={expected_value!r}"
-            )
+        for field in identity_fields:
+            expected_field = expected_value.get(field)
+            if (
+                isinstance(expected_field, bool)
+                or not isinstance(expected_field, int)
+            ):
+                raise ValueError(
+                    f"input {label} identity has invalid {field}: "
+                    f"{expected_field!r}"
+                )
+            reported_field = reported_value.get(field)
+            if (
+                isinstance(reported_field, bool)
+                or not isinstance(reported_field, int)
+                or reported_field != expected_field
+            ):
+                raise ValueError(
+                    "validator report input identity does not match "
+                    f"{label} stat: field={field}, "
+                    f"reported={reported_field!r}, "
+                    f"expected={expected_field!r}"
+                )
+
+    require_identity(
+        "start", input_info.get("identity_start"), input_identity_start
+    )
+    require_identity(
+        "end", input_info.get("identity_end"), input_identity_end
+    )
     validator = report.get("validator")
     if not isinstance(validator, Mapping):
         raise ValueError("validator report is missing validator identity")
@@ -311,3 +335,90 @@ def validate_report_envelope(
         raise ValueError("validator report is missing checks[]")
     if not isinstance(report.get("channels"), list):
         raise ValueError("validator report is missing channels[]")
+
+    checks = report["checks"]
+    derived_counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
+    for index, check in enumerate(checks):
+        if not isinstance(check, Mapping):
+            raise ValueError(f"validator check {index} is not an object")
+        status = normalize_status(check.get("status"))
+        key = status.lower()
+        if key not in derived_counts:
+            raise ValueError(
+                f"validator check {index} has unsupported status {status!r}"
+            )
+        derived_counts[key] += 1
+
+    supplied_counts = report.get("counts")
+    if not isinstance(supplied_counts, Mapping):
+        raise ValueError("validator report is missing counts")
+    for key, expected_count in derived_counts.items():
+        supplied_count = supplied_counts.get(key)
+        if (
+            isinstance(supplied_count, bool)
+            or not isinstance(supplied_count, int)
+            or supplied_count != expected_count
+        ):
+            raise ValueError(
+                "validator report count is inconsistent with checks[]: "
+                f"{key}={supplied_count!r}, expected={expected_count}"
+            )
+
+    analysis = report.get("analysis")
+    if not isinstance(analysis, Mapping):
+        raise ValueError("validator report is missing analysis")
+    completed = analysis.get("completed")
+    cancelled = analysis.get("cancelled")
+    if not isinstance(completed, bool) or not isinstance(cancelled, bool):
+        raise ValueError(
+            "validator analysis completed/cancelled flags must be boolean"
+        )
+    if completed == cancelled:
+        raise ValueError(
+            "validator analysis lifecycle flags are inconsistent"
+        )
+    expected_overall = (
+        "CANCELLED"
+        if cancelled
+        else "FAIL"
+        if derived_counts["fail"]
+        else "WARN"
+        if derived_counts["warn"]
+        else "PASS"
+    )
+    actual_overall = normalize_status(report.get("overall_status"))
+    if actual_overall != expected_overall:
+        raise ValueError(
+            "validator overall_status is inconsistent with lifecycle/checks: "
+            f"reported={actual_overall}, expected={expected_overall}"
+        )
+
+    category_sets = {
+        "data_integrity": {
+            "integrity", "schema", "physics_sanity", "summary", "operation"
+        },
+        "provenance": {"provenance"},
+        "trigger_and_quality": {"trigger", "data_quality", "operation"},
+    }
+    supplied_domains = report.get("domain_status")
+    if not isinstance(supplied_domains, Mapping):
+        raise ValueError("validator report is missing domain_status")
+    severity = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    for domain, categories in category_sets.items():
+        worst = -1
+        for check in checks:
+            if check.get("category") not in categories:
+                continue
+            status = normalize_status(check.get("status"))
+            if status in severity:
+                worst = max(worst, severity[status])
+        expected_domain = (
+            "FAIL" if worst == 2 else "WARN" if worst == 1
+            else "PASS" if worst == 0 else "SKIP"
+        )
+        actual_domain = normalize_status(supplied_domains.get(domain))
+        if actual_domain != expected_domain:
+            raise ValueError(
+                f"validator domain_status.{domain} is inconsistent: "
+                f"reported={actual_domain}, expected={expected_domain}"
+            )

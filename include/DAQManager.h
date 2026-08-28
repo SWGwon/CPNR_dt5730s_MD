@@ -67,6 +67,7 @@ private:
   void ConfigureAndVerifyTriggerRouting(int handle);
   void VerifyRuntimeConfiguration(int handle);
   void VerifyAcquisitionStartCapacity();
+  void WaitForBoardReady(int handle);
   void CheckRuntimeHealthAndStorage(int handle, bool strict_readback,
                                     bool require_running);
   void WaitForAcquisitionRunning(int handle);
@@ -109,6 +110,15 @@ private:
   std::string raw_finalization_error_;
   uint64_t recorded_events_ = 0;
   uint64_t lost_events_ = 0;
+  bool loss_policy_evaluation_observed_ = false;
+  bool loss_policy_exceeded_ = false;
+  bool loss_policy_rejected_post_gap_event_ = false;
+  uint64_t loss_policy_observed_events_ = 0;
+  uint64_t loss_policy_observed_lost_events_ = 0;
+  double loss_policy_observed_lost_fraction_ = 0.0;
+  bool trigger_time_tag_observed_ = false;
+  uint64_t first_extended_ttt_ = 0;
+  uint64_t last_extended_ttt_ = 0;
   uint64_t complete_raw_bytes_ = 0;
   uint64_t expected_raw_bytes_ = 0;
   uint64_t output_free_bytes_at_start_ = 0;
@@ -123,10 +133,14 @@ private:
   uint64_t health_read_error_count_ = 0;
   uint32_t consecutive_health_read_errors_ = 0;
   uint32_t latest_status_register_ = 0;
+  uint32_t latest_board_failure_register_ = 0;
   float latest_max_temperature_c_ = 0.0F;
   bool health_readback_available_ = false;
   uint64_t runtime_configuration_checks_ = 0;
-  uint64_t zmq_drop_count_ = 0;
+  // Counts only failures returned by zmq_send(DONTWAIT).  A PUB socket can
+  // silently discard per-subscriber messages at HWM, so this is deliberately
+  // not called a delivery/drop counter.
+  uint64_t zmq_send_failure_count_ = 0;
   uint64_t zmq_send_error_count_ = 0;
   uint32_t zmq_send_hwm_messages_ = 0;
   uint64_t zmq_send_hwm_approx_bytes_ = 0;

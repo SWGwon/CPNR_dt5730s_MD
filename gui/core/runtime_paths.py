@@ -10,6 +10,7 @@ import hashlib
 import os
 import shutil
 import stat as stat_module
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -235,6 +236,135 @@ def file_identity(path: os.PathLike[str] | str) -> dict[str, object]:
     }
 
 
+def _sha256_descriptor(descriptor: int) -> str:
+    """Hash an already-open file without changing its shared file offset."""
+
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(descriptor, 1024 * 1024, offset)
+        if not block:
+            return digest.hexdigest()
+        digest.update(block)
+        offset += len(block)
+
+
+def pin_verified_executable(
+    executable: os.PathLike[str] | str,
+    source_paths: Iterable[os.PathLike[str] | str],
+) -> tuple[dict[str, object], int, str]:
+    """Open, authenticate, and pin the exact Linux executable inode.
+
+    The returned tuple is ``(identity, descriptor, launch_path)``.  The caller
+    owns ``descriptor`` and must keep it open until the child has finished (or
+    failed to start), then close it.  Retaining it for the whole child lifetime
+    also supports executable scripts whose interpreter opens ``argv[0]`` after
+    QProcess has emitted ``started``.  ``launch_path`` deliberately names the
+    GUI process' descriptor through procfs so a pathname replacement after
+    this check cannot select a different executable.
+    """
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeValidationError(
+            "검증된 실행 파일 inode 고정은 Linux procfs가 필요합니다."
+        )
+
+    binary = require_file(executable, executable=True, description="실행 파일")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(binary, flags)
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise RuntimeValidationError(
+                f"실행 파일이 regular file이 아닙니다: {binary}"
+            )
+        if before.st_mode & 0o111 == 0:
+            raise RuntimeValidationError(
+                f"실행 파일에 실행 권한이 없습니다: {binary}"
+            )
+
+        newer_sources: list[Path] = []
+        for source_value in source_paths:
+            source = Path(source_value).resolve()
+            if source.is_file() and source.stat().st_mtime_ns > before.st_mtime_ns:
+                newer_sources.append(source)
+        if newer_sources:
+            newest = max(newer_sources, key=lambda item: item.stat().st_mtime_ns)
+            raise RuntimeValidationError(
+                "실행 파일보다 새 소스가 있어 stale binary 실행을 차단했습니다: "
+                f"binary={binary}, newer_source={newest}"
+            )
+
+        executable_hash = _sha256_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(getattr(before, field) != getattr(after, field)
+               for field in stable_fields):
+            raise RuntimeValidationError(
+                f"검증 중 실행 파일 inode 또는 내용이 변경되었습니다: {binary}"
+            )
+
+        try:
+            path_status = os.stat(binary, follow_symlinks=False)
+        except OSError as error:
+            raise RuntimeValidationError(
+                f"검증 후 실행 파일 경로를 다시 확인할 수 없습니다: "
+                f"{binary} ({error})"
+            ) from error
+        if (path_status.st_dev, path_status.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise RuntimeValidationError(
+                "검증 중 실행 파일 경로가 다른 inode로 변경되어 실행을 "
+                f"차단했습니다: {binary}"
+            )
+
+        launch_path = f"/proc/{os.getpid()}/fd/{descriptor}"
+        try:
+            pinned_status = os.stat(launch_path)
+        except OSError as error:
+            raise RuntimeValidationError(
+                "검증된 실행 파일을 고정할 Linux procfs 경로를 사용할 수 "
+                f"없습니다: {launch_path} ({error})"
+            ) from error
+        if (pinned_status.st_dev, pinned_status.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise RuntimeValidationError(
+                f"procfs 실행 파일 inode 검증에 실패했습니다: {launch_path}"
+            )
+
+        identity = {
+            "path": str(binary),
+            "sha256": executable_hash,
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "mtime": datetime.fromtimestamp(after.st_mtime).astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "device": int(after.st_dev),
+            "inode": int(after.st_ino),
+        }
+        owned_descriptor = descriptor
+        descriptor = -1
+        return identity, owned_descriptor, launch_path
+    except OSError as error:
+        raise RuntimeValidationError(
+            f"실행 파일 inode를 열거나 검증할 수 없습니다: {binary} ({error})"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def atomic_write_bytes_no_clobber(
     destination: os.PathLike[str] | str,
     payload: bytes,
@@ -344,6 +474,7 @@ def production_sources(project_root: os.PathLike[str] | str) -> list[Path]:
         root / "CMakeLists.txt",
         root / "src" / "production_dt5730.cpp",
         root / "src" / "DAQConfig.cpp",
+        root / "src" / "WaveformDsp.cpp",
         root / "src" / "Sha256.cpp",
     ]
     sources.extend(sorted((root / "include").glob("*.h")))
@@ -358,18 +489,16 @@ def root_validator_sources(project_root: os.PathLike[str] | str) -> list[Path]:
         root / "CMakeLists.txt",
         root / "src" / "root_validate_dt5730.cpp",
         root / "src" / "RootValidator.cpp",
+        root / "src" / "RawRootFidelity.cpp",
+        root / "src" / "WaveformDsp.cpp",
         root / "src" / "DAQConfig.cpp",
         root / "src" / "Sha256.cpp",
-        root / "include" / "RootValidator.h",
-        root / "include" / "DAQConfig.h",
-        root / "include" / "ConfigParser.h",
-        root / "include" / "EventHeader.h",
-        root / "include" / "Sha256.h",
         root / ".git" / "HEAD",
         root / ".git" / "index",
         root / ".git" / "refs" / "heads" / "main",
         root / ".git" / "packed-refs",
     ]
+    sources.extend(sorted((root / "include").glob("*.h")))
     return sources
 
 
@@ -655,14 +784,23 @@ def build_root_validation_arguments(
     root_input: os.PathLike[str] | str,
     *,
     max_events: int = 0,
+    raw_fidelity: bool = False,
 ) -> list[str]:
     """Build the argument vector for the read-only validation worker."""
 
     if max_events < 0:
         raise RuntimeValidationError("검증 event 수는 0 이상이어야 합니다.")
+    if not isinstance(raw_fidelity, bool):
+        raise RuntimeValidationError("RAW 충실도 옵션은 boolean이어야 합니다.")
+    if raw_fidelity and max_events != 0:
+        raise RuntimeValidationError(
+            "RAW↔ROOT 충실도 검증은 전체 event scan에서만 사용할 수 있습니다."
+        )
     arguments = ["-i", str(Path(root_input).expanduser().resolve())]
     if max_events > 0:
         arguments.extend(["--max-events", str(max_events)])
+    if raw_fidelity:
+        arguments.append("--raw-fidelity")
     return arguments
 
 

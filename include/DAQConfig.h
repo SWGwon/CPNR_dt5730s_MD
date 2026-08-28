@@ -2,10 +2,23 @@
 #define DAQ_CONFIG_H
 
 #include "ConfigParser.h"
+#include "DataQuality.h"
 #include "EventHeader.h"
+#include "WaveformDsp.h"
 
 #include <array>
 #include <cstdint>
+#include <string>
+
+struct DAQConnectionSettings {
+  std::string type = "USB";
+  int link = 0;
+  int node = 0;
+  uint32_t base_address = 0;
+  std::string expected_model = "DT5730";
+  bool has_expected_serial = false;
+  uint32_t expected_serial = 0;
+};
 
 struct DAQChannelSettings {
   uint32_t dc_offset = 0;
@@ -35,12 +48,18 @@ struct DAQStorageSettings {
   uint64_t stop_free_bytes = uint64_t{512} * 1024U * 1024U;
 };
 
+struct DAQSoftwareDspSettings {
+  uint32_t coincidence_window_ns = 20;
+  cpnr::WaveformDspSettings waveform{};
+};
+
 enum class DAQPairLogic : uint32_t {
   kAnd = 0,
   kOr = 3,
 };
 
 struct DAQHardwareSettings {
+  DAQConnectionSettings connection{};
   uint32_t record_length = 0;
   uint32_t channel_mask = 0;
   uint32_t self_trigger_mask = 0;
@@ -56,6 +75,8 @@ struct DAQHardwareSettings {
   DAQPairLogic pair_logic = DAQPairLogic::kOr;
   DAQTriggerCalibrationSettings trigger_calibration{};
   DAQStorageSettings storage{};
+  DAQSoftwareDspSettings software_dsp{};
+  cpnr::LostEventPolicy lost_event_policy{};
   std::array<DAQChannelSettings, MAX_CH> channels{};
 };
 

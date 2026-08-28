@@ -7,6 +7,7 @@ from widgets.ProductionTab import ProductionTab
 from widgets.RootValidationTab import RootValidationTab
 from widgets.DatabaseTab import DatabaseTab
 from widgets.EnvTab import EnvTab
+from core.monitor_stream import RuntimeConfigReference
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -24,7 +25,9 @@ class MainWindow(QMainWindow):
         self.env_tab = EnvTab()
         self.daq_tab = DaqTab(env_data_provider=self.env_tab.get_env_data)
         self.config_tab = ConfigTab()
-        self.monitor_tab = MonitorTab()
+        self.monitor_tab = MonitorTab(
+            config_path_provider=self._monitor_runtime_config_path
+        )
         self.production_tab = ProductionTab()
         self.root_validation_tab = RootValidationTab()
         self.database_tab = DatabaseTab()
@@ -78,12 +81,40 @@ class MainWindow(QMainWindow):
         self.daq_tab.emit_scan_range()
         # =========================================================================
 
+    def _monitor_runtime_config_path(self):
+        """Return the exact run snapshot while DAQ is active, if available."""
+
+        process = getattr(self.daq_tab, "daq_process", None)
+        process_active = bool(
+            process
+            and (
+                process.isRunning()
+                or (
+                    hasattr(process, "has_pending_work")
+                    and process.has_pending_work()
+                )
+            )
+        )
+        if process_active:
+            context = getattr(self.daq_tab, "current_run_context", None) or {}
+            # Do not silently fall back to a mutable UI selection during an
+            # active acquisition. The monitor will pause spectrum DSP if the
+            # immutable run snapshot cannot be identified.
+            config_path = context.get("config_path")
+            config_sha256 = context.get("config_sha256")
+            if not config_path or not config_sha256:
+                return None
+            return RuntimeConfigReference(config_path, config_sha256)
+        return self.config_tab.current_config_path or None
+
     def init_statusbar(self):
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
 
         self.led_widgets = {}
-        led_names = ['PLL LOCK', 'PLL BYPS', 'RUN', 'TRG', 'DRDY', 'BUSY']
+        led_names = [
+            'PLL LOCK', 'CLK EXT', 'BOARD READY', 'RUN', 'TRG', 'DRDY', 'FULL'
+        ]
         
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -104,11 +135,12 @@ class MainWindow(QMainWindow):
     def update_led_dashboard(self, status: dict):
         color_map = {
             'PLL LOCK': "#198754" if status.get('PLL LOCK', 0) else "#555555",
-            'PLL BYPS': "#ffc107" if status.get('PLL BYPS', 0) else "#555555", 
+            'CLK EXT':  "#ffc107" if status.get('CLK EXT', 0) else "#555555",
+            'BOARD READY': "#198754" if status.get('BOARD READY', 0) else "#dc3545",
             'RUN':      "#198754" if status.get('RUN', 0)      else "#555555",
             'TRG':      "#198754" if status.get('TRG', 0)      else "#555555",
             'DRDY':     "#0dcaf0" if status.get('DRDY', 0)     else "#555555",
-            'BUSY':     "#dc3545" if status.get('BUSY', 0)     else "#555555"
+            'FULL':     "#dc3545" if status.get('FULL', 0)     else "#555555"
         }
 
         for key, color in color_map.items():
@@ -138,10 +170,7 @@ class MainWindow(QMainWindow):
             self.production_tab.process.state()
             != QProcess.ProcessState.NotRunning
         )
-        validation_active = (
-            self.root_validation_tab.process.state()
-            != QProcess.ProcessState.NotRunning
-        )
+        validation_active = self.root_validation_tab.has_pending_work()
         return daq_active or production_active or validation_active
 
     def _cleanup_monitor_once(self):
@@ -180,9 +209,10 @@ class MainWindow(QMainWindow):
         self._close_pending = True
         self.tabs.setEnabled(False)
         self.statusBar.showMessage(
-            "Stopping active jobs and waiting for provenance finalization…"
+            "Stopping active jobs; unresponsive children will be force-stopped "
+            "after their bounded provenance-finalization grace period…"
         )
-        self.daq_tab.stop_all()
-        self.production_tab.stop_all()
+        self.daq_tab.stop_all(auto_force=True)
+        self.production_tab.stop_all(auto_force=True)
         self.root_validation_tab.stop_all(wait=False)
         self._schedule_close_check()

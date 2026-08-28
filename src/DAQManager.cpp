@@ -1,4 +1,7 @@
 #include "DAQManager.h"
+#include "DataQuality.h"
+#include "DT5730Status.h"
+#include "DT5730Timing.h"
 #include "Sha256.h"
 #include "EventHeader.h"
 #include "TriggerCalibration.h"
@@ -40,8 +43,6 @@ constexpr uint32_t kMajorityLevelMask = 0x07U << 24;
 constexpr uint32_t kExternalTriggerEnableMask = 1U << 30;
 constexpr uint32_t kSoftwareTriggerEnableMask = 1U << 31;
 constexpr uint32_t kExternalClockSelectMask = 1U << 6;
-constexpr uint32_t kAcquisitionStatusRegister = 0x8104;
-constexpr uint32_t kAcquisitionRunMask = 1U << 0;
 constexpr int kDppFirmwareMajorBase = 128;
 constexpr uint64_t kZmqQueueByteBudget = 64U * 1024U * 1024U;
 constexpr uint32_t kZmqMaximumHwmMessages = 5000U;
@@ -61,6 +62,40 @@ std::string Hex32(uint32_t value) {
   stream << "0x" << std::uppercase << std::hex << std::setw(8)
          << std::setfill('0') << value;
   return stream.str();
+}
+
+void VerifyCaenStandardEventHeader(const char* event_pointer,
+                                   uint32_t event_size,
+                                   uint32_t readout_block_size,
+                                   const std::string& context) {
+  if (event_pointer == nullptr) {
+    throw FatalAcquisitionError(
+        context + " event lookup returned a null event pointer");
+  }
+  if (event_size > readout_block_size) {
+    throw FatalAcquisitionError(
+        context + " event metadata reports a size larger than its readout "
+                  "block");
+  }
+  uint32_t raw_second_word = 0U;
+  const auto quality = cpnr::InspectCaenEventHeader(
+      event_pointer, event_size, &raw_second_word);
+  if (quality == cpnr::CaenEventHeaderQuality::kTruncated) {
+    throw FatalAcquisitionError(
+        context + " event is truncated before the complete four-word "
+                  "standard header");
+  }
+  if (quality == cpnr::CaenEventHeaderQuality::kMalformed) {
+    throw FatalAcquisitionError(
+        context + " event header tag/size does not match standard waveform "
+                  "framing");
+  }
+  if (quality == cpnr::CaenEventHeaderQuality::kBoardFailure) {
+    throw FatalAcquisitionError(
+        context + " raw event header asserted Board Fail in word 1 " +
+        Hex32(raw_second_word) +
+        "; refusing data from a hardware-fault event");
+  }
 }
 
 std::string AbsolutePath(const std::string& path) {
@@ -801,8 +836,10 @@ DAQManager::DAQManager(const std::string &config_file,
               << zmq_send_hwm_messages_ << " messages, approximate_queue="
               << zmq_send_hwm_approx_bytes_ << "/" << kZmqQueueByteBudget
               << " bytes\n";
-    digitizer_ =
-        std::make_unique<CaenDigitizer>(CAEN_DGTZ_USB, 0, 0, 0);
+    digitizer_ = std::make_unique<CaenDigitizer>(
+        CAEN_DGTZ_USB, hardware_settings_.connection.link,
+        hardware_settings_.connection.node,
+        hardware_settings_.connection.base_address);
     SetupHardware();
     hardware_verified_unix_time_ = std::time(nullptr);
     const auto reservation = ReserveOutputFile(working_output_file_);
@@ -872,31 +909,77 @@ void DAQManager::SetupHardware() {
   }
   const int handle = digitizer_->GetHandle();
 
+  const auto validate_identity = [&](const CAEN_DGTZ_BoardInfo_t& info,
+                                     const char* phase) {
+    const std::string model = info.ModelName;
+    const std::string expected_model =
+        hardware_settings_.connection.expected_model;
+    if (model.rfind(expected_model, 0U) != 0U) {
+      throw std::runtime_error(
+          std::string("Connected-board model mismatch ") + phase +
+          ": expected prefix '" + expected_model + "', observed '" + model +
+          "'");
+    }
+    if (hardware_settings_.connection.has_expected_serial &&
+        info.SerialNumber != hardware_settings_.connection.expected_serial) {
+      throw std::runtime_error(
+          std::string("Connected-board serial mismatch ") + phase +
+          ": expected " +
+          std::to_string(hardware_settings_.connection.expected_serial) +
+          ", observed " + std::to_string(info.SerialNumber));
+    }
+    if (info.FamilyCode != CAEN_DGTZ_XX730_FAMILY_CODE) {
+      throw std::runtime_error(
+          std::string("Input-range and trigger calibration require an x730-family digitizer ") +
+          phase + "; connected model is " + model);
+    }
+    if (ParseFirmwareMajor(info.AMC_FirmwareRel) >=
+        kDppFirmwareMajorBase) {
+      throw std::runtime_error(
+          std::string("This acquisition path requires standard waveform firmware ") +
+          phase + "; connected AMC firmware is " +
+          std::string(info.AMC_FirmwareRel) + " (DPP family)");
+    }
+    if (info.ADC_NBits != hardware_settings_.adc_bits) {
+      throw std::runtime_error(
+          std::string("Board ADC resolution does not match config ") + phase +
+          ": board reports " + std::to_string(info.ADC_NBits) +
+          " bits, config requests " +
+          std::to_string(hardware_settings_.adc_bits));
+    }
+  };
+
+  // Opening a handle is read-only with respect to board state.  Verify the
+  // exact intended board class/serial/firmware before issuing Reset, so USB
+  // enumeration changes cannot make us reset an unrelated digitizer.
+  CAEN_DGTZ_BoardInfo_t pre_reset_info{};
+  CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &pre_reset_info));
+  validate_identity(pre_reset_info, "before reset");
+  std::cout << "\033[1;36m[Board Identity Pre-Reset]\033[0m model="
+            << pre_reset_info.ModelName << ", serial="
+            << pre_reset_info.SerialNumber << ", ROC="
+            << pre_reset_info.ROC_FirmwareRel << ", AMC="
+            << pre_reset_info.AMC_FirmwareRel << "\n";
+
+  digitizer_->Reset();
+
   CAEN_DGTZ_BoardInfo_t board_info{};
   CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &board_info));
+  validate_identity(board_info, "after reset");
+  if (std::string(board_info.ModelName) !=
+          std::string(pre_reset_info.ModelName) ||
+      board_info.SerialNumber != pre_reset_info.SerialNumber ||
+      board_info.FamilyCode != pre_reset_info.FamilyCode ||
+      board_info.ADC_NBits != pre_reset_info.ADC_NBits) {
+    throw std::runtime_error(
+        "Connected-board identity changed across reset; refusing further "
+        "register writes");
+  }
   board_model_ = board_info.ModelName;
   board_roc_firmware_ = board_info.ROC_FirmwareRel;
   board_amc_firmware_ = board_info.AMC_FirmwareRel;
   board_serial_number_ = board_info.SerialNumber;
   board_adc_bits_ = board_info.ADC_NBits;
-  if (board_info.FamilyCode != CAEN_DGTZ_XX730_FAMILY_CODE) {
-    throw std::runtime_error(
-        "Input-range and trigger calibration require an x730-family digitizer; "
-        "connected model is " + std::string(board_info.ModelName));
-  }
-  if (ParseFirmwareMajor(board_info.AMC_FirmwareRel) >=
-      kDppFirmwareMajorBase) {
-    throw std::runtime_error(
-        "This acquisition path requires standard waveform firmware; connected "
-        "AMC firmware is " + std::string(board_info.AMC_FirmwareRel) +
-        " (DPP family)");
-  }
-  if (board_adc_bits_ != hardware_settings_.adc_bits) {
-    throw std::runtime_error(
-        "Board ADC resolution does not match config: board reports " +
-        std::to_string(board_adc_bits_) + " bits, config requests " +
-        std::to_string(hardware_settings_.adc_bits));
-  }
 
   // The board was reset by CaenDigitizer.  Apply and verify the complete
   // analog setup before enabling any trigger source.
@@ -973,6 +1056,7 @@ void DAQManager::SetupHardware() {
   std::cout << "\033[1;36m[Synchronization Readback]\033[0m clock_source="
             << clock_source_readback_ << " (0=internal, 1=external), mode="
             << run_sync_mode_readback_ << "\n";
+  WaitForBoardReady(handle);
   CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(
       handle, CAEN_DGTZ_TRGMODE_DISABLED));
   CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(
@@ -1167,10 +1251,8 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
         CAEN_CHECK(CAEN_DGTZ_GetEventInfo(
             handle, readout_buffer, bytes_read, event_index, &event_info,
             &event_pointer));
-        if (event_pointer == nullptr) {
-          throw std::runtime_error(
-              "Baseline event lookup returned a null event pointer");
-        }
+        VerifyCaenStandardEventHeader(event_pointer, event_info.EventSize,
+                                      bytes_read, "Baseline calibration");
         CAEN_CHECK(CAEN_DGTZ_DecodeEvent(
             handle, event_pointer, reinterpret_cast<void**>(&decoded_event)));
         if (decoded_event == nullptr) {
@@ -1600,6 +1682,73 @@ void DAQManager::VerifyAcquisitionStartCapacity() {
             << " bytes, reserve=" << reserve << " bytes\n";
 }
 
+void DAQManager::WaitForBoardReady(int handle) {
+  // Reading 0xEF04 clears the x730 PLL-unlock latch.  Inspect the live status
+  // only after clearing stale reset history, then require three consecutive
+  // healthy samples so a transient lock/ready indication cannot start a run.
+  (void)ReadRegister(handle, dt5730_status::kPllUnlockResetRegister);
+
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+  unsigned consecutive_healthy = 0U;
+  uint32_t last_status_raw = 0U;
+  uint32_t last_failure_raw = 0U;
+  do {
+    CheckSetupCancellation();
+    last_status_raw =
+        ReadRegister(handle, dt5730_status::kAcquisitionStatusRegister);
+    last_failure_raw =
+        ReadRegister(handle, dt5730_status::kBoardFailureStatusRegister);
+    const auto status =
+        dt5730_status::DecodeAcquisitionStatus(last_status_raw);
+    const auto failure =
+        dt5730_status::DecodeBoardFailureStatus(last_failure_raw);
+    const bool expected_external = hardware_settings_.clock_source != 0;
+    const bool observed_external =
+        status.clock_source == dt5730_status::ClockSource::kExternal;
+
+    latest_status_register_ = last_status_raw;
+    latest_board_failure_register_ = last_failure_raw;
+
+    // These conditions are not settling states and must never be retried as
+    // though they could become a valid acquisition configuration.
+    if (status.event_full || status.channel_shutdown ||
+        status.HasTemperatureAlarm() || failure.temperature_failure ||
+        failure.adc_power_down) {
+      throw std::runtime_error(
+          "Digitizer reported a fatal board condition during setup: "
+          "acquisition_status=" + Hex32(last_status_raw) +
+          ", board_failure_status=" + Hex32(last_failure_raw));
+    }
+
+    const bool healthy = status.board_ready && status.pll_no_unlock &&
+                         !failure.Any() &&
+                         observed_external == expected_external;
+    if (healthy) {
+      ++consecutive_healthy;
+      if (consecutive_healthy >= 3U) {
+        health_readback_available_ = true;
+        std::cout << "\033[1;36m[Board Health Readback]\033[0m status="
+                  << Hex32(last_status_raw) << ", failure="
+                  << Hex32(last_failure_raw) << ", board_ready=1, pll_lock=1"
+                  << ", clock_source=" << (observed_external ? 1 : 0)
+                  << "\n";
+        return;
+      }
+    } else {
+      consecutive_healthy = 0U;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  throw std::runtime_error(
+      "Digitizer board/PLL did not become stably ready within 2 seconds: "
+      "acquisition_status=" + Hex32(last_status_raw) +
+      ", board_failure_status=" + Hex32(last_failure_raw) +
+      ", expected_clock_source=" +
+      std::to_string(hardware_settings_.clock_source));
+}
+
 void DAQManager::CheckRuntimeHealthAndStorage(int handle,
                                               bool strict_readback,
                                               bool require_running) {
@@ -1630,19 +1779,50 @@ void DAQManager::CheckRuntimeHealthAndStorage(int handle,
   }
 
   uint32_t status_register = 0U;
+  uint32_t board_failure_register = 0U;
   if (health_read_ok &&
-      CAEN_DGTZ_ReadRegister(handle, kAcquisitionStatusRegister,
+      CAEN_DGTZ_ReadRegister(handle,
+                             dt5730_status::kAcquisitionStatusRegister,
                              &status_register) !=
           CAEN_DGTZ_Success) {
     health_read_ok = false;
   }
+  if (health_read_ok &&
+      CAEN_DGTZ_ReadRegister(handle,
+                             dt5730_status::kBoardFailureStatusRegister,
+                             &board_failure_register) !=
+          CAEN_DGTZ_Success) {
+    health_read_ok = false;
+  }
   if (health_read_ok) {
+    const auto status =
+        dt5730_status::DecodeAcquisitionStatus(status_register);
+    const auto board_failure =
+        dt5730_status::DecodeBoardFailureStatus(board_failure_register);
+    const bool expected_external = hardware_settings_.clock_source != 0;
+    const bool observed_external =
+        status.clock_source == dt5730_status::ClockSource::kExternal;
     consecutive_health_read_errors_ = 0U;
     latest_status_register_ = status_register;
+    latest_board_failure_register_ = board_failure_register;
     latest_max_temperature_c_ = max_temperature;
     health_readback_available_ = true;
-    if (require_running &&
-        (status_register & kAcquisitionRunMask) == 0U) {
+    if (status.event_full) {
+      throw FatalAcquisitionError(
+          "Digitizer event memory reported FULL; stopping because data-loss "
+          "integrity can no longer be guaranteed (status=" +
+          Hex32(status_register) + ")");
+    }
+    if (!status.pll_no_unlock || !status.board_ready ||
+        status.channel_shutdown || status.HasTemperatureAlarm() ||
+        board_failure.Any() || observed_external != expected_external) {
+      throw FatalAcquisitionError(
+          "Digitizer runtime board-health fault: acquisition_status=" +
+          Hex32(status_register) + ", board_failure_status=" +
+          Hex32(board_failure_register) + ", expected_clock_source=" +
+          std::to_string(hardware_settings_.clock_source));
+    }
+    if (require_running && !status.run) {
       throw FatalAcquisitionError(
           "Digitizer acquisition RUN status dropped while software still "
           "expected the board to be recording");
@@ -1677,9 +1857,10 @@ void DAQManager::WaitForAcquisitionRunning(int handle) {
                         std::chrono::milliseconds(500);
   uint32_t status_register = 0U;
   do {
-    CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, kAcquisitionStatusRegister,
-                                      &status_register));
-    if ((status_register & kAcquisitionRunMask) != 0U) return;
+    CAEN_CHECK(CAEN_DGTZ_ReadRegister(
+        handle, dt5730_status::kAcquisitionStatusRegister,
+        &status_register));
+    if (dt5730_status::DecodeAcquisitionStatus(status_register).run) return;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   } while (std::chrono::steady_clock::now() < deadline);
 
@@ -1717,8 +1898,16 @@ void DAQManager::WriteRuntimeArtifacts() {
   metadata << std::setprecision(12);
 
   const auto timestamp = std::time(nullptr);
+  const double elapsed_time_sec =
+      trigger_time_tag_observed_
+          ? dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                          last_extended_ttt_)
+          : 0.0;
+  const double recorded_window_sum_sec =
+      dt5730_timing::RecordedWindowSumSeconds(
+          recorded_events_, hardware_settings_.record_length);
   metadata << "{\n"
-           << "  \"schema_version\": 1,\n"
+           << "  \"schema_version\": 2,\n"
            << "  \"run_number\": " << run_number_ << ",\n"
            << "  \"acquisition_status\": \""
            << JsonEscape(acquisition_status_) << "\",\n"
@@ -1738,6 +1927,33 @@ void DAQManager::WriteRuntimeArtifacts() {
   metadata << ",\n"
            << "  \"recorded_events\": " << recorded_events_ << ",\n"
            << "  \"lost_events\": " << lost_events_ << ",\n"
+           << "  \"lost_events_scope\": "
+              "\"accepted_trigger_counter_gaps_through_last_observed_event\",\n"
+           << "  \"data_quality\": {\"loss_policy_evaluated\": "
+           << (loss_policy_evaluation_observed_ ? "true" : "false")
+           << ", \"observed_event_count\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_events_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"inferred_lost_event_count\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_lost_events_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"lost_fraction\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_lost_fraction_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"policy_exceeded\": "
+           << (loss_policy_exceeded_ ? "true" : "false")
+           << ", \"rejected_post_gap_event_persisted\": "
+           << (loss_policy_rejected_post_gap_event_ ? "false" : "null")
+           << "},\n"
            << "  \"failure_reason\": ";
   if (failure_reason_.empty()) metadata << "null";
   else metadata << "\"" << JsonEscape(failure_reason_) << "\"";
@@ -1797,14 +2013,17 @@ void DAQManager::WriteRuntimeArtifacts() {
            << "  \"runtime_counters\": {\"readout_errors\": "
            << readout_error_count_ << ", \"health_checks\": "
            << health_check_count_ << ", \"health_read_errors\": "
-           << health_read_error_count_ << ", \"zmq_drops\": "
-           << zmq_drop_count_
+           << health_read_error_count_
+           << ", \"zmq_nonblocking_send_failures\": "
+           << zmq_send_failure_count_
            << ", \"zmq_send_errors\": " << zmq_send_error_count_
            << ", \"zmq_send_hwm_messages\": " << zmq_send_hwm_messages_
            << ", \"zmq_send_hwm_approx_bytes\": "
            << zmq_send_hwm_approx_bytes_
            << ", \"runtime_configuration_checks\": "
            << runtime_configuration_checks_
+           << ", \"subscriber_delivery_evidence\": "
+              "\"unavailable_pub_socket_may_drop_silently\""
            << ", \"max_temperature_c\": [";
   for (int ch = 0; ch < MAX_CH; ++ch) {
     if (ch != 0) metadata << ", ";
@@ -1815,6 +2034,32 @@ void DAQManager::WriteRuntimeArtifacts() {
     }
   }
   metadata << "]},\n"
+           << "  \"timing_summary\": {\"first_extended_ttt\": ";
+  if (trigger_time_tag_observed_) metadata << first_extended_ttt_;
+  else metadata << "null";
+  metadata << ", \"last_extended_ttt\": ";
+  if (trigger_time_tag_observed_) metadata << last_extended_ttt_;
+  else metadata << "null";
+  metadata << ", \"elapsed_time_sec\": ";
+  if (trigger_time_tag_observed_) metadata << elapsed_time_sec;
+  else metadata << "null";
+  metadata << ", \"recorded_window_sum_sec\": "
+           << recorded_window_sum_sec
+           << ", \"recorded_window_to_elapsed_pct\": ";
+  if (elapsed_time_sec > 0.0) {
+    metadata << dt5730_timing::RecordedWindowToElapsedPercent(
+        recorded_window_sum_sec, elapsed_time_sec);
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"average_recorded_event_rate_hz\": ";
+  if (elapsed_time_sec > 0.0) {
+    metadata << dt5730_timing::AverageRecordedEventRateHz(
+        recorded_events_, elapsed_time_sec);
+  } else {
+    metadata << "null";
+  }
+  metadata << "},\n"
            << "  \"metadata_path\": \""
            << JsonEscape(published_metadata_path)
            << "\",\n"
@@ -1831,6 +2076,24 @@ void DAQManager::WriteRuntimeArtifacts() {
            << "  \"build_timestamp\": \"" << JsonEscape(build_timestamp_)
            << "\",\n"
            << "  \"hardware\": {\n"
+           << "    \"connection_type\": \""
+           << JsonEscape(hardware_settings_.connection.type) << "\",\n"
+           << "    \"connection_link\": "
+           << hardware_settings_.connection.link << ",\n"
+           << "    \"connection_node\": "
+           << hardware_settings_.connection.node << ",\n"
+           << "    \"connection_base_address\": "
+           << hardware_settings_.connection.base_address << ",\n"
+           << "    \"expected_model\": \""
+           << JsonEscape(hardware_settings_.connection.expected_model)
+           << "\",\n"
+           << "    \"expected_serial\": ";
+  if (hardware_settings_.connection.has_expected_serial) {
+    metadata << hardware_settings_.connection.expected_serial;
+  } else {
+    metadata << "null";
+  }
+  metadata << ",\n"
            << "    \"model\": \"" << JsonEscape(board_model_) << "\",\n"
            << "    \"serial_number\": " << board_serial_number_ << ",\n"
            << "    \"roc_firmware\": \""
@@ -1841,6 +2104,39 @@ void DAQManager::WriteRuntimeArtifacts() {
            << hardware_settings_.input_range_mv << ",\n"
            << "    \"adc_bits\": " << board_adc_bits_ << ",\n"
            << "    \"dc_offset_dac_bits\": 16,\n"
+           << "    \"trigger_time_tag_raw_lsb_ns\": "
+           << dt5730_timing::kTriggerTimeTagRawLsbNs << ",\n"
+           << "    \"trigger_time_tag_observable_resolution_ns\": "
+           << dt5730_timing::kTriggerTimeTagObservableResolutionNs << ",\n"
+           << "    \"adc_sample_period_ns\": "
+           << dt5730_timing::kAdcSamplePeriodNs << ",\n"
+           << "    \"dead_time_measurement_available\": false,\n"
+           << "    \"dead_time_method\": "
+              "\"unavailable_no_hardware_busy_or_livetime_scaler\",\n"
+           << "    \"latest_acquisition_status_register\": "
+           << latest_status_register_ << ",\n"
+           << "    \"latest_board_failure_status_register\": "
+           << latest_board_failure_register_ << ",\n"
+           << "    \"waveform_dsp_schema\": 1,\n"
+           << "    \"dsp_baseline_samples\": "
+           << hardware_settings_.software_dsp.waveform.baseline_samples
+           << ",\n"
+           << "    \"dsp_short_gate_samples\": "
+           << hardware_settings_.software_dsp.waveform.short_gate_samples
+           << ",\n"
+           << "    \"dsp_long_gate_samples\": "
+           << hardware_settings_.software_dsp.waveform.long_gate_samples
+           << ",\n"
+           << "    \"dsp_pulse_start_threshold_adc\": "
+           << hardware_settings_.software_dsp.waveform
+                  .pulse_start_threshold_adc
+           << ",\n"
+           << "    \"software_coincidence_window_ns\": "
+           << hardware_settings_.software_dsp.coincidence_window_ns << ",\n"
+           << "    \"max_lost_events\": "
+           << hardware_settings_.lost_event_policy.max_lost_events << ",\n"
+           << "    \"max_lost_fraction\": "
+           << hardware_settings_.lost_event_policy.max_lost_fraction << ",\n"
            << "    \"clock_source\": " << hardware_settings_.clock_source
            << ",\n"
            << "    \"clock_source_readback\": "
@@ -2267,17 +2563,22 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   char *caen_buffer = digitizer_->GetReadoutBuffer();
   CAEN_DGTZ_UINT16_EVENT_t *caen_event = digitizer_->GetDecodedEvent();
   
-  const uint32_t TTT_MASK = 0x7FFFFFFF;
-  
   bool is_first_event = true;
-  uint32_t first_ttt = 0, current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
+  uint32_t current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
   uint64_t ttt_rollovers = 0;
 
   auto start_time = std::chrono::steady_clock::now();
   auto last_log_time = start_time;
   auto last_health_check = start_time;
   auto last_configuration_check = start_time;
-  uint32_t log_events = 0, zmq_drops = 0, loop_counter = 0;
+  // ReadData drains the events available at that read boundary.  Retain the
+  // earliest possible occurrence time for the last accepted event (the
+  // preceding drain boundary), rather than assuming that two host decode
+  // timestamps upper-bound their hardware-event separation.  The latter is
+  // false when multiple events were buffered during a host stall.
+  auto previous_read_completed_time = start_time;
+  auto last_event_earliest_time = start_time;
+  uint32_t log_events = 0, zmq_send_failures = 0, loop_counter = 0;
   uint32_t consecutive_readout_errors = 0;
   size_t total_bytes_written = 0, last_bytes_written = 0; 
 
@@ -2314,6 +2615,10 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
       }
       continue;
     }
+
+    const auto read_completed_time = std::chrono::steady_clock::now();
+    const auto current_batch_earliest_time = previous_read_completed_time;
+    previous_read_completed_time = read_completed_time;
 
     if (bsize == 0U) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2353,11 +2658,8 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
           CAEN_DGTZ_EventInfo_t evt_info;
           char *evt_ptr = nullptr;
           CAEN_CHECK(CAEN_DGTZ_GetEventInfo(handle, caen_buffer, bsize, i, &evt_info, &evt_ptr));
-          if (evt_ptr == nullptr) {
-            throw FatalAcquisitionError(
-                "CAEN event lookup reported success but returned a null "
-                "event pointer");
-          }
+          VerifyCaenStandardEventHeader(evt_ptr, evt_info.EventSize, bsize,
+                                        "Digitizer");
           CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
           if (caen_event == nullptr) {
             throw FatalAcquisitionError(
@@ -2365,7 +2667,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
           }
 
           const uint32_t candidate_ttt =
-              evt_info.TriggerTimeTag & TTT_MASK;
+              evt_info.TriggerTimeTag & dt5730_timing::kTriggerTimeTagMask;
           const uint32_t current_event_counter =
               evt_info.EventCounter & 0xFFFFFFU;
 
@@ -2400,9 +2702,36 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                 "run before continuing acquisition");
           }
           uint64_t candidate_rollovers = ttt_rollovers;
-          uint64_t newly_lost_events = 0U;
+          uint64_t candidate_extended_ttt = candidate_ttt;
+          uint64_t prospective_lost_events = lost_events_;
           if (!is_first_event) {
-            if (candidate_ttt < prev_ttt) ++candidate_rollovers;
+            const double event_gap_upper_bound_seconds =
+                std::chrono::duration<double>(read_completed_time -
+                                              last_event_earliest_time)
+                    .count();
+            const auto ttt_extension = dt5730_timing::ExtendTriggerTimeTag(
+                prev_ttt, candidate_ttt, ttt_rollovers,
+                event_gap_upper_bound_seconds);
+            switch (ttt_extension.status) {
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kOk:
+                candidate_rollovers = ttt_extension.rollover_count;
+                candidate_extended_ttt = ttt_extension.extended_value;
+                break;
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kRepeated:
+                throw FatalAcquisitionError(
+                    "Digitizer TriggerTimeTag repeated; refusing ambiguous or "
+                    "duplicate timing data");
+              case dt5730_timing::TriggerTimeTagExtensionStatus::
+                  kWrapCountAmbiguous:
+                throw FatalAcquisitionError(
+                    "TriggerTimeTag extension is ambiguous because the "
+                    "conservative event-time upper bound reached the 31-bit "
+                    "counter full scale; use 48-bit Extended TTT for this run "
+                    "mode");
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kOverflow:
+                throw FatalAcquisitionError(
+                    "Extended TriggerTimeTag overflowed uint64_t");
+            }
             const uint32_t counter_difference =
                 (current_event_counter - prev_event_counter) & 0xFFFFFFU;
             if (counter_difference == 0U) {
@@ -2410,24 +2739,55 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                   "Digitizer event counter repeated; refusing to record a "
                   "duplicate or stale event");
             }
-            if (counter_difference > 0x800000U) {
+            if (counter_difference >= 0x800000U) {
               throw FatalAcquisitionError(
-                  "Digitizer event counter moved backwards or reset during "
-                  "acquisition");
+                  "Digitizer event counter moved backwards or reset, or made "
+                  "an ambiguous half-range jump during acquisition");
             }
             if (counter_difference > 1U) {
-              newly_lost_events = counter_difference - 1U;
+              const uint64_t newly_lost_events = counter_difference - 1U;
               if (newly_lost_events >
                   std::numeric_limits<uint64_t>::max() - lost_events_) {
                 throw FatalAcquisitionError(
                     "Lost-event counter overflowed uint64_t");
               }
+              prospective_lost_events += newly_lost_events;
             }
           }
 
+          const auto loss_policy_evaluation = cpnr::EvaluateLostEventPolicy(
+              recorded_events_ + 1U, prospective_lost_events,
+              hardware_settings_.lost_event_policy);
+          loss_policy_evaluation_observed_ = true;
+          loss_policy_observed_events_ =
+              loss_policy_evaluation.observed_events;
+          loss_policy_observed_lost_events_ =
+              loss_policy_evaluation.inferred_lost_events;
+          loss_policy_observed_lost_fraction_ =
+              loss_policy_evaluation.lost_fraction;
+          loss_policy_exceeded_ = loss_policy_evaluation.Exceeded();
+          loss_policy_rejected_post_gap_event_ = false;
+          // A counter gap is known as soon as the post-gap event is observed.
+          // Preserve that fact even if policy rejection or a later raw write
+          // failure prevents this event from entering the durable prefix.
+          lost_events_ = prospective_lost_events;
+          if (loss_policy_exceeded_) {
+            loss_policy_rejected_post_gap_event_ = true;
+            throw FatalAcquisitionError(
+                "Accepted-trigger loss exceeded [DataQuality] limits: "
+                "lost=" + std::to_string(prospective_lost_events) +
+                ", fraction=" +
+                std::to_string(loss_policy_evaluation.lost_fraction) +
+                ", max_lost=" +
+                std::to_string(
+                    hardware_settings_.lost_event_policy.max_lost_events) +
+                ", max_fraction=" +
+                std::to_string(hardware_settings_.lost_event_policy
+                                   .max_lost_fraction));
+          }
+
           header = {};
-          header.ExtendedTTT =
-              (candidate_rollovers << 31) | candidate_ttt;
+          header.ExtendedTTT = candidate_extended_ttt;
           header.EventID = static_cast<uint32_t>(recorded_events_);
           header.RecordLength = actual_trace_size;
           header.ChannelMask = evt_info.ChannelMask;
@@ -2467,14 +2827,16 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
           complete_raw_bytes_ += static_cast<uint64_t>(payload_size);
           ++recorded_events_;
           if (is_first_event) {
-            first_ttt = candidate_ttt;
+            first_extended_ttt_ = header.ExtendedTTT;
+            trigger_time_tag_observed_ = true;
             is_first_event = false;
           }
+          last_extended_ttt_ = header.ExtendedTTT;
           current_ttt = candidate_ttt;
           prev_ttt = candidate_ttt;
           prev_event_counter = current_event_counter;
+          last_event_earliest_time = current_batch_earliest_time;
           ttt_rollovers = candidate_rollovers;
-          lost_events_ += newly_lost_events;
           total_bytes_written += payload_size;
           if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size,
                        ZMQ_DONTWAIT) < 0) {
@@ -2491,8 +2853,8 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                     << zmq_strerror(publish_error) << ")\033[0m\n";
               }
             }
-            ++zmq_drops;
-            ++zmq_drop_count_;
+            ++zmq_send_failures;
+            ++zmq_send_failure_count_;
           }
           log_events++;
         }
@@ -2542,44 +2904,63 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             last_bytes_written = total_bytes_written;
 
             if (health_readback_available_) {
-                const uint32_t status_reg = latest_status_register_;
-                int run      = (status_reg >> 0) & 0x1;
-                int drdy     = (status_reg >> 2) & 0x1;
-                int busy     = (status_reg >> 3) & 0x1;
-                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0;
+                const auto status = dt5730_status::DecodeAcquisitionStatus(
+                    latest_status_register_);
+                const auto board_failure =
+                    dt5730_status::DecodeBoardFailureStatus(
+                        latest_board_failure_register_);
+                const int pll_lock =
+                    status.pll_no_unlock && status.board_ready &&
+                            !board_failure.pll_failure
+                        ? 1
+                        : 0;
                 int trg      = (rate > 0.0) ? 1 : 0; 
-                int pll_byps = 0; 
 
                 std::cout << "[STATUS] TEMP: "
                           << std::fixed << std::setprecision(1)
                           << latest_max_temperature_c_ << std::endl;
-                std::cout << "[STATUS] LED: LOCK=" << pll_lock << ", BYPS=" << pll_byps
-                          << ", RUN=" << run << ", TRG=" << trg << ", DRDY=" << drdy
-                          << ", BUSY=" << busy << std::endl;
+                std::cout << "[STATUS] LED: LOCK=" << pll_lock
+                          << ", CLKEXT="
+                          << (status.clock_source ==
+                                      dt5730_status::ClockSource::kExternal
+                                  ? 1
+                                  : 0)
+                          << ", READY=" << (status.board_ready ? 1 : 0)
+                          << ", RUN=" << (status.run ? 1 : 0)
+                          << ", TRG=" << trg
+                          << ", DRDY=" << (status.event_ready ? 1 : 0)
+                          << ", FULL=" << (status.event_full ? 1 : 0)
+                          << std::endl;
             }
 
             uint32_t record_length = hardware_settings_.record_length;
-            uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
-            
-            double hw_real_time_sec = total_ticks * 8e-9; 
-            double dead_time_sec = recorded_events_ * (record_length * 2e-9);
-            double live_time_sec = hw_real_time_sec - dead_time_sec;
-            if (live_time_sec < 0) live_time_sec = 0.0;
-            
-            double dead_time_pct = (hw_real_time_sec > 0) ? (dead_time_sec / hw_real_time_sec * 100.0) : 0.0;
+            const uint64_t current_extended_ttt =
+                (ttt_rollovers <<
+                 dt5730_timing::kTriggerTimeTagBits) |
+                current_ttt;
+            const double hw_real_time_sec =
+                is_first_event
+                    ? 0.0
+                    : dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                                    current_extended_ttt);
+            const double recorded_window_sum_sec =
+                dt5730_timing::RecordedWindowSumSeconds(recorded_events_,
+                                                        record_length);
+            const double recorded_window_pct =
+                dt5730_timing::RecordedWindowToElapsedPercent(
+                    recorded_window_sum_sec, hw_real_time_sec);
 
             std::cout << "\r\033[K\033[1;36m[LIVE DAQ]\033[0m "
                       << "Time: \033[1m" << std::setfill('0') << std::setw(2) << mins << ":" << std::setw(2) << secs << "\033[0m | "
                       << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << hw_real_time_sec << " s\033[0m | "
-                      << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
-                      << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
+                      << "Window: \033[1m" << std::fixed << std::setprecision(4) << recorded_window_pct << " %\033[0m | "
                       << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " 
                       << "Events: \033[1;33m" << recorded_events_ << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
-                      << "Drops: " << zmq_drops
+                      << "PubSendFail: " << zmq_send_failures
                       << std::flush;
               
-            log_events = 0; zmq_drops = 0; last_log_time = now;
+            log_events = 0; zmq_send_failures = 0; last_log_time = now;
         }
     }
   }
@@ -2599,27 +2980,32 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   auto tm = *std::localtime(&t);
   
   uint32_t record_length = hardware_settings_.record_length;
-  uint64_t final_total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
-  
-  double final_real_time_sec = final_total_ticks * 8e-9;
-  double final_dead_time_sec = recorded_events_ * (record_length * 2e-9);
-  double final_live_time_sec = final_real_time_sec - final_dead_time_sec;
-  if (final_live_time_sec < 0) final_live_time_sec = 0.0;
-  
-  double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
+  const double final_real_time_sec =
+      trigger_time_tag_observed_
+          ? dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                          last_extended_ttt_)
+          : 0.0;
+  const double final_recorded_window_sum_sec =
+      dt5730_timing::RecordedWindowSumSeconds(recorded_events_,
+                                              record_length);
+  const double final_recorded_window_pct =
+      dt5730_timing::RecordedWindowToElapsedPercent(
+          final_recorded_window_sum_sec, final_real_time_sec);
   auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
-  double avg_rate = (final_real_time_sec > 0) ? (recorded_events_ / final_real_time_sec) : 0.0;
+  const double avg_rate = dt5730_timing::AverageRecordedEventRateHz(
+      recorded_events_, final_real_time_sec);
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
             << " - Wall Clock Time : " << wall_clock_duration << " seconds\n"
             << " - HW Real Time    : " << std::fixed << std::setprecision(2) << final_real_time_sec << " seconds\n"
-            << " - HW Live Time    : " << std::fixed << std::setprecision(2) << final_live_time_sec << " seconds\n"
-            << " - True Dead Time  : " << std::fixed << std::setprecision(5) << final_dead_time_pct << " %\n"
+            << " - Record Windows : " << std::fixed << std::setprecision(6) << final_recorded_window_sum_sec << " seconds (sum; overlaps possible)\n"
+            << " - Window / Time  : " << std::fixed << std::setprecision(5) << final_recorded_window_pct << " % (not dead time)\n"
+            << " - HW Dead Time   : N/A (no hardware busy/live-time scaler)\n"
             << " - Total Events    : " << recorded_events_ << " events\n"
             << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n" 
-            << " - Lost Events     : " << lost_events_ << " events (Buffer Full)\n"
+            << " - Lost Events     : " << lost_events_ << " events (24-bit board-counter gaps)\n"
             << " - Data Size Saved : " << std::fixed << std::setprecision(2) << (total_bytes_written / (1024.0 * 1024.0)) << " MB\n"
             << "\033[1;36m=========================================\033[0m\n\n";
 }

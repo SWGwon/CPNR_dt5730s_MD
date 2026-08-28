@@ -18,6 +18,9 @@ struct RootValidationOptions {
   // Zero means scan every event.  A non-zero value scans the leading prefix
   // while still reporting the full TTree entry count.
   std::uint64_t max_events = 0U;
+  // Expensive, definitive RAW-to-ROOT byte/content cross-check. This is
+  // deliberately opt-in and is only executed for a full event scan.
+  bool verify_raw_fidelity = false;
   const std::atomic_bool* cancelled = nullptr;
   RootValidationProgress progress;
 };

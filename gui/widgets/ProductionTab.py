@@ -4,7 +4,7 @@ import html
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess, QTimer
 from core.DatabaseManager import DatabaseManager
 from core.runtime_paths import (
     RuntimeValidationError,
@@ -22,6 +22,8 @@ from core.runtime_paths import (
 )
 
 class ProductionTab(QWidget):
+    STOP_GRACE_MSEC = 5000
+
     rootOutputReady = pyqtSignal(str)
 
     def __init__(self):
@@ -45,6 +47,9 @@ class ProductionTab(QWidget):
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.handle_finished)
         self.process.errorOccurred.connect(self.handle_process_error)
+        self._stop_grace_timer = QTimer(self)
+        self._stop_grace_timer.setSingleShot(True)
+        self._stop_grace_timer.timeout.connect(self._handle_stop_timeout)
         
         self.last_stats = {}; self.current_raw_file = ""
         self.current_root_output = ""
@@ -56,6 +61,9 @@ class ProductionTab(QWidget):
         self._active_run_uuid = None
         self._db_production_begun = False
         self._db_terminal_recorded = False
+        self._active_debug_mode = False
+        self._auto_force_on_timeout = False
+        self._force_stop_offered = False
         self.init_ui()
         self.load_settings()
         self.log_pattern = re.compile(r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)")
@@ -120,6 +128,7 @@ class ProductionTab(QWidget):
         self.btn_stop = QPushButton("Stop Conversion")
         self.btn_stop.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 8px;")
         self.btn_stop.clicked.connect(self.stop_all)
+        self.btn_stop.setEnabled(False)
         
         self.btn_prev = QPushButton("Prev (p)"); self.btn_next = QPushButton("Next (n)"); self.btn_jump = QPushButton("Jump (j)")
         self.spin_jump = QSpinBox(); self.spin_jump.setRange(0, 9999999)
@@ -310,12 +319,20 @@ class ProductionTab(QWidget):
             if output_path:
                 os.makedirs(output_path.parent, exist_ok=True)
             is_debug_mode = self.chk_debug_mode.isChecked()
+            resolved_root_output = (
+                output_path or default_production_output(raw_path)
+            )
+            if not is_debug_mode and os.path.lexists(resolved_root_output):
+                raise RuntimeValidationError(
+                    "production ROOT output already exists; refusing to "
+                    f"overwrite or trust a stale file: {resolved_root_output}"
+                )
             args = build_production_arguments(
                 raw_path,
                 config_path,
                 self.spin_run_number.value(),
                 metadata_path,
-                root_output=output_path,
+                root_output=(None if is_debug_mode else output_path),
                 save_waveforms=self.chk_save_waveforms.isChecked(),
                 debug_event_id=(
                     self.spin_debug_start.value() if is_debug_mode else None
@@ -335,9 +352,7 @@ class ProductionTab(QWidget):
 
         self.current_raw_file = str(raw_path)
         self.current_root_output = (
-            "" if is_debug_mode else str(
-                output_path or default_production_output(raw_path)
-            )
+            "" if is_debug_mode else str(resolved_root_output)
         )
         self.progress_bar.setValue(0); self.progress_bar.setFormat("%p%")
         self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
@@ -345,6 +360,10 @@ class ProductionTab(QWidget):
         self._stderr_buffer = ""
         self._run_active = True
         self._cancel_requested = False
+        self._active_debug_mode = is_debug_mode
+        self._auto_force_on_timeout = False
+        self._force_stop_offered = False
+        self._stop_grace_timer.stop()
         self._db_terminal_recorded = False
         self._active_db_run_id = None
         self._active_run_uuid = None
@@ -389,7 +408,10 @@ class ProductionTab(QWidget):
                     f"failed: {html.escape(str(db_exc))}</span>"
                 )
         self.lbl_production_identity.setText(identity_summary(executable_identity))
-        self.btn_run.setEnabled(False); self.set_debug_controls_enabled(is_debug_mode)
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("Stop Debug" if is_debug_mode else "Stop Conversion")
+        self.set_debug_controls_enabled(is_debug_mode)
         self.log_console.append(
             f"<b>[Runtime] Production:</b> {identity_summary(executable_identity)}"
         )
@@ -400,7 +422,7 @@ class ProductionTab(QWidget):
             f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
         )
         self.log_console.append(f"<b>[System] Starting:</b> {executable} {' '.join(args)}")
-        if self._active_db_run_id is not None:
+        if self._active_db_run_id is not None and not is_debug_mode:
             try:
                 self.db.begin_production(
                     self._active_db_run_id,
@@ -413,16 +435,32 @@ class ProductionTab(QWidget):
                     "<span style='color:red;'>[DB Error] Production launch "
                     f"status was not recorded: {html.escape(str(db_exc))}</span>"
                 )
+        elif is_debug_mode:
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[Lifecycle]</b> Debug mode "
+                "is read-only and will not change production DB status.</span>"
+            )
         self.process.setWorkingDirectory(self.proj_dir)
         self.process.start(str(executable), args)
 
-    def stop_all(self):
+    def stop_all(self, auto_force=False):
         if self.process.state() != QProcess.ProcessState.NotRunning:
+            if self._force_stop_offered and not auto_force:
+                self.force_stop()
+                return
             self._cancel_requested = True
+            self._auto_force_on_timeout = (
+                self._auto_force_on_timeout or bool(auto_force)
+            )
             self.process.terminate()
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stopping…")
+            if not self._stop_grace_timer.isActive():
+                self._stop_grace_timer.start(self.STOP_GRACE_MSEC)
             self.log_console.append(
                 "<span style='color:#b45309;'>[System] Graceful conversion "
-                "stop requested; waiting for finalization.</span>"
+                f"stop requested; waiting up to {self.STOP_GRACE_MSEC / 1000:g} "
+                "s for finalization.</span>"
             )
 
     def force_stop(self):
@@ -430,10 +468,35 @@ class ProductionTab(QWidget):
 
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self._cancel_requested = True
+            self._stop_grace_timer.stop()
+            self._force_stop_offered = False
+            self.btn_stop.setEnabled(False)
             self.process.kill()
             self.log_console.append(
                 "<span style='color:red;'>[System] Explicit force stop "
-                "requested.</span>"
+                "requested. Without terminal output truth this run remains "
+                "interrupted/unknown.</span>"
+            )
+
+    @pyqtSlot()
+    def _handle_stop_timeout(self):
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._force_stop_offered = True
+        if self._auto_force_on_timeout:
+            self.log_console.append(
+                "<span style='color:red;'>[System] Graceful conversion stop "
+                "deadline expired during application shutdown; automatically "
+                "force-stopping the child.</span>"
+            )
+            self.force_stop()
+        else:
+            self.btn_stop.setText("Force Stop Conversion")
+            self.btn_stop.setEnabled(True)
+            self.log_console.append(
+                "<span style='color:#b45309;'>[Warning] Conversion child did "
+                "not stop within the grace period. Force Stop Conversion is "
+                "now available.</span>"
             )
 
     def send_debug_command(self, cmd_str):
@@ -489,20 +552,31 @@ class ProductionTab(QWidget):
             f"{error_text} ({process_error.name})</span>"
         )
         if process_error == QProcess.ProcessError.FailedToStart:
+            self._stop_grace_timer.stop()
             self._run_active = False
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("Failed to start")
             self.btn_run.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stop Conversion")
             self.set_debug_controls_enabled(False)
             self._record_production_terminal(
                 "production_launch_failed", -1,
                 error_message=self.process.errorString(),
             )
+            self._active_debug_mode = False
 
     def _record_production_terminal(
         self, status, exit_code, *, root_file=None, error_message=None
     ):
         if self._db_terminal_recorded:
+            return
+        if self._active_debug_mode:
+            self._db_terminal_recorded = True
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[Lifecycle]</b> Debug session "
+                "ended without changing production lifecycle state.</span>"
+            )
             return
         if self._active_db_run_id is None:
             self._db_terminal_recorded = True
@@ -540,58 +614,120 @@ class ProductionTab(QWidget):
 
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
+        self._stop_grace_timer.stop()
         self.handle_stdout()
         self.handle_stderr()
         self._consume_stderr(final=True)
         self._run_active = False
-        self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop Conversion")
+        self.set_debug_controls_enabled(False)
         process_succeeded = (
             exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0
         )
-        expected_root_exists = bool(
-            self.current_root_output
-            and os.path.isfile(self.current_root_output)
+        debug_mode = self._active_debug_mode
+        root_identity = None
+        root_identity_error = None
+        if not debug_mode and self.current_root_output:
+            try:
+                root_identity = file_identity(self.current_root_output)
+            except OSError as exc:
+                root_identity_error = str(exc)
+
+        completed_output_truth = bool(
+            not debug_mode and process_succeeded and root_identity is not None
         )
-        if self._cancel_requested:
-            db_status = "production_cancelled"
-        elif process_succeeded and (
-            not self.current_root_output or expected_root_exists
-        ):
+        if debug_mode:
+            # Interactive inspection is not a production conversion and must
+            # never advance the durable production lifecycle.
+            self._record_production_terminal(
+                "production_cancelled" if self._cancel_requested
+                else "production_failed",
+                exitCode,
+                error_message="interactive debug session only",
+            )
+            if process_succeeded and not self._cancel_requested:
+                self.progress_bar.setFormat("Debug session ended")
+                self.log_console.append(
+                    "<span style='color:#6f42c1;'><b>[System]</b> Interactive "
+                    "debug session ended; no production ROOT completion was "
+                    "recorded.</span>"
+                )
+            elif self._cancel_requested:
+                self.progress_bar.setFormat("Debug cancelled")
+                self.log_console.append(
+                    "<span style='color:#b45309;'><b>[System]</b> Interactive "
+                    "debug session cancelled.</span>"
+                )
+            else:
+                self.progress_bar.setFormat(f"Debug failed (exit {exitCode})")
+                self.log_console.append(
+                    "<span style='color:red;'><b>[System]</b> Interactive "
+                    f"debug exited with code {exitCode}.</span>"
+                )
+            self._active_debug_mode = False
+            return
+
+        # A validated, newly-created ROOT output is stronger completion truth
+        # than a Stop click racing with natural converter completion.
+        if completed_output_truth:
             db_status = "production_completed"
+        elif self._cancel_requested:
+            db_status = "production_cancelled"
         else:
             db_status = "production_failed"
+        if completed_output_truth:
+            self.last_stats.update({
+                "root_sha256": root_identity["sha256"],
+                "root_size_bytes": root_identity["size"],
+            })
+        terminal_error = None
+        if db_status != "production_completed":
+            if root_identity_error:
+                terminal_error = (
+                    "production output is missing/unreadable: "
+                    + root_identity_error
+                )
+            elif self._cancel_requested:
+                terminal_error = (
+                    "conversion interrupted by operator; no validated "
+                    "completed ROOT output"
+                )
+            else:
+                terminal_error = f"production exit code {exitCode}"
         self._record_production_terminal(
             db_status,
             exitCode,
-            root_file=(self.current_root_output if expected_root_exists else None),
-            error_message=(
-                None if db_status == "production_completed"
-                else f"production exit code {exitCode}"
-            ),
+            root_file=(self.current_root_output if completed_output_truth else None),
+            error_message=terminal_error,
         )
 
-        conversion_succeeded = process_succeeded and (
-            not self.current_root_output or expected_root_exists
-        )
-        if conversion_succeeded:
+        if completed_output_truth:
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("Completed")
-            self.log_console.append(f"<span style='color:#5cb85c;'><b>[System] Conversion Successfully Finished!</b></span>")
-            if self.current_root_output:
-                if os.path.isfile(self.current_root_output):
-                    self.rootOutputReady.emit(
-                        os.path.abspath(self.current_root_output)
-                    )
-                    self.log_console.append(
-                        "<span style='color:#17a2b8;'><b>[Validation]</b> "
-                        "완성된 ROOT 파일을 검증 탭에 전달했습니다.</span>"
-                    )
-                else:
-                    self.log_console.append(
-                        "<span style='color:red;'><b>[Error]</b> Conversion은 "
-                        "성공했지만 예상 ROOT 출력을 찾지 못했습니다: "
-                        f"{self.current_root_output}</span>"
-                    )
+            self.log_console.append(
+                "<span style='color:#5cb85c;'><b>[System] Conversion "
+                "Successfully Finished with identity-validated ROOT output!"
+                "</b></span>"
+            )
+            if self._cancel_requested:
+                self.log_console.append(
+                    "<span style='color:#17a2b8;'>[Lifecycle] Stop intent raced "
+                    "with completion; validated output truth takes "
+                    "precedence.</span>"
+                )
+            self.rootOutputReady.emit(os.path.abspath(self.current_root_output))
+            self.log_console.append(
+                "<span style='color:#17a2b8;'><b>[Validation]</b> "
+                "완성된 ROOT 파일을 검증 탭에 전달했습니다.</span>"
+            )
         else:
-            self.progress_bar.setFormat(f"Failed (exit {exitCode})")
-            self.log_console.append(f"<span style='color:red;'><b>[System] Conversion Exited with Code: {exitCode}</b></span>")
+            status_text = "Cancelled" if self._cancel_requested else "Failed"
+            self.progress_bar.setFormat(f"{status_text} (exit {exitCode})")
+            self.log_console.append(
+                "<span style='color:red;'><b>[System] Conversion Exited with "
+                f"Code: {exitCode}; no validated completed ROOT output was "
+                "published.</b></span>"
+            )
+        self._active_debug_mode = False

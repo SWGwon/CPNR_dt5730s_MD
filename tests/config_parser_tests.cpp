@@ -78,6 +78,11 @@ int main() {
     CheckThrows([&]() { ConfigParser empty(empty_path.string()); },
                 "no settings", "empty config fails closed");
 
+    const auto empty_section_path = test_dir / "empty_section.conf";
+    WriteFile(empty_section_path, "[Digitizer]\n");
+    CheckThrows([&]() { ConfigParser empty(empty_section_path.string()); },
+                "no settings", "a section declaration alone is not a setting");
+
     CheckThrows(
         [&]() { valid.GetRequiredInt("Digitizer", "PostTrigger", 0, 100); },
         "PostTrigger", "missing required key fails closed");
@@ -153,6 +158,122 @@ int main() {
           "DAQ schema active-channel settings");
     Check(!settings.channels[1].threshold_is_relative_mv,
           "legacy absolute threshold mode");
+
+    std::string complete_schema_config = valid_daq_config;
+    complete_schema_config.insert(
+        complete_schema_config.find("[Channel_0]"),
+        "[Connection]\nType=USB\nLink=0\nNode=0\nBaseAddress=0\n"
+        "ExpectedModel=DT5730\nExpectedSerial=5730\n"
+        "[Synchronization]\nClockSource=0\nRunSyncMode=0\n"
+        "[TriggerCalibration]\nSettlingTimeMs=100\n"
+        "SettlingTimeoutMs=200\nMeasurementEvents=8\n"
+        "StabilityToleranceAdc=2.5\nStableMeasurements=3\n"
+        "[Storage]\nMinimumFreeMiB=1024\nStopFreeMiB=512\n"
+        "[DataQuality]\nMaxLostEvents=4\nMaxLostFraction=0.01\n"
+        "[SoftwareDSP]\nCoincidenceWindow=24\nBaselineSamples=200\n"
+        "ShortGate=50\nLongGate=700\nPulseStartThresholdAdc=12.5\n");
+    const auto complete_schema_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(complete_schema_config,
+                               "complete-schema-test"));
+    Check(complete_schema_settings.connection.has_expected_serial &&
+              complete_schema_settings.connection.expected_serial == 5730U &&
+              complete_schema_settings.lost_event_policy.max_lost_events ==
+                  4U &&
+              complete_schema_settings.software_dsp.waveform
+                      .pulse_start_threshold_adc == 12.5,
+          "all official Connection/DataQuality/SoftwareDSP keys are accepted");
+
+    std::string typo_section_config = valid_daq_config;
+    typo_section_config.append("[Digtizer]\nMystery=1\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              typo_section_config, "typo-section-test"));
+        },
+        "did you mean [Digitizer]?",
+        "a misspelled DAQ section is rejected with a useful suggestion");
+
+    std::string unknown_section_config = valid_daq_config;
+    unknown_section_config.append("[Diagnostics]\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              unknown_section_config, "unknown-section-test"));
+        },
+        "Unknown DAQ config section [Diagnostics]",
+        "an unsupported DAQ section fails closed");
+
+    std::string typo_key_config = valid_daq_config;
+    typo_key_config.insert(typo_key_config.find("PostTrigger=70"),
+                           "PostTriger=70\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              typo_key_config, "typo-key-test"));
+        },
+        "did you mean PostTrigger?",
+        "a misspelled DAQ key is rejected with a scoped suggestion");
+
+    std::string unknown_key_config = valid_daq_config;
+    unknown_key_config.insert(unknown_key_config.find("PostTrigger=70"),
+                              "MysteryKnob=1\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              unknown_key_config, "unknown-key-test"));
+        },
+        "Unknown DAQ config key [Digitizer] MysteryKnob",
+        "an unsupported key cannot be silently ignored");
+
+    std::string bad_channel_section_config = valid_daq_config;
+    bad_channel_section_config.append("[Channel_8]\nDCOffset=32768\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              bad_channel_section_config, "bad-channel-section-test"));
+        },
+        "expected Channel_0..Channel_7",
+        "an out-of-range channel section fails closed");
+
+    std::string inactive_channel_typo_config = valid_daq_config;
+    inactive_channel_typo_config.append("[Channel_7]\nDCOfset=32768\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              inactive_channel_typo_config, "inactive-channel-key-test"));
+        },
+        "did you mean DCOffset?",
+        "unknown keys in inactive channel sections are still rejected");
+
+    const auto dsp_path = test_dir / "dsp.conf";
+    std::string dsp_config = valid_daq_config;
+    dsp_config.insert(
+        dsp_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nCoincidenceWindow=24\nBaselineSamples=200\n"
+        "ShortGate=50\nLongGate=700\nPulseStartThresholdAdc=12.5\n");
+    WriteFile(dsp_path, dsp_config);
+    const auto dsp_settings =
+        LoadDAQHardwareSettings(ConfigParser(dsp_path.string()));
+    Check(dsp_settings.software_dsp.coincidence_window_ns == 24U &&
+              dsp_settings.software_dsp.waveform.baseline_samples == 200U &&
+              dsp_settings.software_dsp.waveform.short_gate_samples == 50U &&
+              dsp_settings.software_dsp.waveform.long_gate_samples == 700U &&
+              dsp_settings.software_dsp.waveform.pulse_start_threshold_adc ==
+                  12.5,
+          "all SoftwareDSP settings are parsed into the production contract");
+
+    const auto bad_dsp_path = test_dir / "bad_dsp.conf";
+    std::string bad_dsp_config = valid_daq_config;
+    bad_dsp_config.insert(
+        bad_dsp_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nBaselineSamples=308\nShortGate=40\n"
+        "LongGate=200\n");
+    WriteFile(bad_dsp_path, bad_dsp_config);
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser(bad_dsp_path.string()));
+        },
+        "BaselineSamples exceeds", "DSP baseline cannot leave pre-trigger bounds");
 
     const auto relative_threshold_path = test_dir / "relative_threshold.conf";
     WriteFile(relative_threshold_path,

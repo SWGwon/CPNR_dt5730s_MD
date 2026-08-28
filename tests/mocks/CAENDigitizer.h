@@ -1,6 +1,9 @@
 #ifndef TESTS_MOCKS_CAEN_DIGITIZER_H
 #define TESTS_MOCKS_CAEN_DIGITIZER_H
 
+#include "DT5730Status.h"
+#include "DataQuality.h"
+
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +74,8 @@ struct CAEN_DGTZ_UINT16_EVENT_t {
 namespace caen_mock {
 
 constexpr uint32_t kGlobalTriggerMaskRegister = 0x810C;
+constexpr uint32_t kAcquisitionControlRegister = 0x8100;
+constexpr uint32_t kExternalClockControlMask = 1U << 6U;
 
 struct State {
   bool unstable_baseline = false;
@@ -87,6 +92,16 @@ struct State {
   bool null_active_waveform = false;
   bool stop_acquisition_failure = false;
   bool run_status_stuck_low = false;
+  bool board_not_ready_fault = false;
+  bool pll_unlock_fault = false;
+  bool event_full_fault = false;
+  bool channel_shutdown_fault = false;
+  bool dt_temperature_fault = false;
+  bool nim_temperature_fault = false;
+  bool board_failure_pll_fault = false;
+  bool board_failure_temperature_fault = false;
+  bool board_failure_adc_power_down_fault = false;
+  int event_header_board_failure_index = -1;
   bool force_zero_event_count = false;
   bool acquisition_running = false;
   uint32_t channel_mask = 0;
@@ -100,12 +115,52 @@ struct State {
   std::array<uint32_t, 8> dc_offsets{};
   std::array<uint32_t, 8> thresholds{};
   std::array<CAEN_DGTZ_TriggerPolarity_t, 8> polarities{};
-  std::map<uint32_t, uint32_t> registers;
+  std::map<uint32_t, uint32_t> registers{
+      {dt5730_status::kAcquisitionStatusRegister,
+       dt5730_status::kPllNoUnlockMask |
+           dt5730_status::kBoardReadyMask},
+      {dt5730_status::kBoardFailureStatusRegister, 0U},
+  };
   std::array<std::vector<uint16_t>, 8> traces;
   CAEN_DGTZ_UINT16_EVENT_t decoded_event{};
   std::array<uint32_t, 4> event_words{};
   std::array<char, 4096> readout_buffer{};
   std::vector<uint32_t> event_counter_sequence;
+  std::vector<uint32_t> trigger_time_tag_sequence;
+
+  void ApplyStatusFaults() {
+    auto& acquisition_status =
+        registers[dt5730_status::kAcquisitionStatusRegister];
+    const auto assign_bit = [](uint32_t& target, uint32_t mask,
+                               bool enabled) {
+      if (enabled) target |= mask;
+      else target &= ~mask;
+    };
+
+    assign_bit(acquisition_status, dt5730_status::kBoardReadyMask,
+               !board_not_ready_fault);
+    assign_bit(acquisition_status, dt5730_status::kPllNoUnlockMask,
+               !pll_unlock_fault);
+    assign_bit(acquisition_status, dt5730_status::kEventFullMask,
+               event_full_fault);
+    assign_bit(acquisition_status, dt5730_status::kChannelShutdownMask,
+               channel_shutdown_fault);
+    assign_bit(acquisition_status, dt5730_status::kDtTemperatureAlarmMask,
+               dt_temperature_fault);
+    assign_bit(acquisition_status, dt5730_status::kNimTemperatureAlarmMask,
+               nim_temperature_fault);
+
+    auto& board_failure =
+        registers[dt5730_status::kBoardFailureStatusRegister];
+    assign_bit(board_failure, dt5730_status::kBoardFailurePllMask,
+               pll_unlock_fault || board_failure_pll_fault);
+    assign_bit(board_failure, dt5730_status::kBoardFailureTemperatureMask,
+               dt_temperature_fault || nim_temperature_fault ||
+                   board_failure_temperature_fault);
+    assign_bit(board_failure,
+               dt5730_status::kBoardFailureAdcPowerDownMask,
+               board_failure_adc_power_down_fault);
+  }
 
   void ResetHardware() {
     const bool preserve_unstable = unstable_baseline;
@@ -113,12 +168,40 @@ struct State {
     const bool preserve_pair_fault = corrupt_pair_logic_readback;
     const bool preserve_channel_mask_fault = corrupt_channel_mask_readback;
     const bool preserve_adc_bits_fault = corrupt_adc_bits;
+    const bool preserve_board_not_ready_fault = board_not_ready_fault;
+    const bool preserve_pll_unlock_fault = pll_unlock_fault;
+    const bool preserve_event_full_fault = event_full_fault;
+    const bool preserve_channel_shutdown_fault = channel_shutdown_fault;
+    const bool preserve_dt_temperature_fault = dt_temperature_fault;
+    const bool preserve_nim_temperature_fault = nim_temperature_fault;
+    const bool preserve_board_failure_pll_fault =
+        board_failure_pll_fault;
+    const bool preserve_board_failure_temperature_fault =
+        board_failure_temperature_fault;
+    const bool preserve_board_failure_adc_power_down_fault =
+        board_failure_adc_power_down_fault;
+    const int preserve_event_header_board_failure_index =
+        event_header_board_failure_index;
     *this = State{};
     unstable_baseline = preserve_unstable;
     corrupt_threshold_readback = preserve_threshold_fault;
     corrupt_pair_logic_readback = preserve_pair_fault;
     corrupt_channel_mask_readback = preserve_channel_mask_fault;
     corrupt_adc_bits = preserve_adc_bits_fault;
+    board_not_ready_fault = preserve_board_not_ready_fault;
+    pll_unlock_fault = preserve_pll_unlock_fault;
+    event_full_fault = preserve_event_full_fault;
+    channel_shutdown_fault = preserve_channel_shutdown_fault;
+    dt_temperature_fault = preserve_dt_temperature_fault;
+    nim_temperature_fault = preserve_nim_temperature_fault;
+    board_failure_pll_fault = preserve_board_failure_pll_fault;
+    board_failure_temperature_fault =
+        preserve_board_failure_temperature_fault;
+    board_failure_adc_power_down_fault =
+        preserve_board_failure_adc_power_down_fault;
+    event_header_board_failure_index =
+        preserve_event_header_board_failure_index;
+    ApplyStatusFaults();
   }
 
   void BuildTraceBatch() {
@@ -152,11 +235,19 @@ inline State state;
 inline bool reset_should_fail = false;
 inline uint32_t open_calls = 0;
 inline uint32_t close_calls = 0;
+inline uint32_t reset_calls = 0;
+inline uint32_t last_open_link = 0;
+inline int last_open_node = 0;
+inline uint32_t last_open_base_address = 0;
 
 inline void ResetLifecycleInstrumentation() {
   reset_should_fail = false;
   open_calls = 0;
   close_calls = 0;
+  reset_calls = 0;
+  last_open_link = 0;
+  last_open_node = 0;
+  last_open_base_address = 0;
 }
 
 inline void SetResetFailure(bool enabled) {
@@ -213,6 +304,58 @@ inline void SetStopAcquisitionFailure(bool enabled) {
 
 inline void SetRunStatusStuckLow(bool enabled) {
   state.run_status_stuck_low = enabled;
+  auto& status =
+      state.registers[dt5730_status::kAcquisitionStatusRegister];
+  if (enabled || !state.acquisition_running) {
+    status &= ~dt5730_status::kRunMask;
+  } else {
+    status |= dt5730_status::kRunMask;
+  }
+}
+
+inline void SetBoardNotReadyFault(bool enabled) {
+  state.board_not_ready_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetPllUnlockFault(bool enabled) {
+  state.pll_unlock_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetEventFullFault(bool enabled) {
+  state.event_full_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetChannelShutdownFault(bool enabled) {
+  state.channel_shutdown_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetDtTemperatureFault(bool enabled) {
+  state.dt_temperature_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetNimTemperatureFault(bool enabled) {
+  state.nim_temperature_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetBoardFailurePllFault(bool enabled) {
+  state.board_failure_pll_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetBoardFailureTemperatureFault(bool enabled) {
+  state.board_failure_temperature_fault = enabled;
+  state.ApplyStatusFaults();
+}
+
+inline void SetBoardFailureAdcPowerDownFault(bool enabled) {
+  state.board_failure_adc_power_down_fault = enabled;
+  state.ApplyStatusFaults();
 }
 
 inline void SetForceZeroEventCount(bool enabled) {
@@ -223,11 +366,24 @@ inline void SetEventCounterSequence(std::vector<uint32_t> counters) {
   state.event_counter_sequence = std::move(counters);
 }
 
+inline void SetTriggerTimeTagSequence(std::vector<uint32_t> tags) {
+  state.trigger_time_tag_sequence = std::move(tags);
+}
+
+inline void SetEventHeaderBoardFailureIndex(int event_index) {
+  state.event_header_board_failure_index = event_index;
+}
+
 }  // namespace caen_mock
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_OpenDigitizer2(
-    CAEN_DGTZ_ConnectionType, void*, int, uint32_t, int* handle) {
+    CAEN_DGTZ_ConnectionType, void* link, int node, uint32_t base_address,
+    int* handle) {
   ++caen_mock::open_calls;
+  caen_mock::last_open_link =
+      link == nullptr ? 0U : *static_cast<uint32_t*>(link);
+  caen_mock::last_open_node = node;
+  caen_mock::last_open_base_address = base_address;
   *handle = 1;
   return CAEN_DGTZ_Success;
 }
@@ -238,6 +394,7 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_CloseDigitizer(int) {
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_Reset(int) {
+  ++caen_mock::reset_calls;
   if (caen_mock::reset_should_fail) return CAEN_DGTZ_GenericError;
   caen_mock::state.ResetHardware();
   return CAEN_DGTZ_Success;
@@ -261,7 +418,9 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadRegister(
       address >= 0x10A8U && address <= 0x17A8U &&
       ((address - 0x10A8U) % 0x100U) == 0U;
   if (caen_mock::state.runtime_health_read_failure &&
-      (temperature_register || address == 0x8104U)) {
+      (temperature_register ||
+       address == dt5730_status::kAcquisitionStatusRegister ||
+       address == dt5730_status::kBoardFailureStatusRegister)) {
     return CAEN_DGTZ_GenericError;
   }
   if (temperature_register) {
@@ -279,6 +438,15 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadRegister(
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_WriteRegister(
     int, uint32_t address, uint32_t value) {
   caen_mock::state.registers[address] = value;
+  if (address == caen_mock::kAcquisitionControlRegister) {
+    auto& status = caen_mock::state.registers[
+        dt5730_status::kAcquisitionStatusRegister];
+    if ((value & caen_mock::kExternalClockControlMask) != 0U) {
+      status |= dt5730_status::kClockSourceMask;
+    } else {
+      status &= ~dt5730_status::kClockSourceMask;
+    }
+  }
   return CAEN_DGTZ_Success;
 }
 
@@ -429,13 +597,17 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_FreeEvent(int, void** event) {
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ClearData(int) {
   caen_mock::state.pending_events = 0;
   caen_mock::state.current_read_events = 0;
+  caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] &=
+      ~dt5730_status::kEventReadyMask;
+  caen_mock::state.ApplyStatusFaults();
   return CAEN_DGTZ_Success;
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SWStartAcquisition(int) {
   caen_mock::state.acquisition_running = true;
   if (!caen_mock::state.run_status_stuck_low) {
-    caen_mock::state.registers[0x8104U] |= 1U;
+    caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] |=
+        dt5730_status::kRunMask;
   }
   return CAEN_DGTZ_Success;
 }
@@ -445,7 +617,8 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SWStopAcquisition(int) {
     return CAEN_DGTZ_GenericError;
   }
   caen_mock::state.acquisition_running = false;
-  caen_mock::state.registers[0x8104U] &= ~1U;
+  caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] &=
+      ~dt5730_status::kRunMask;
   return CAEN_DGTZ_Success;
 }
 
@@ -453,6 +626,8 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SendSWtrigger(int) {
   if (!caen_mock::state.acquisition_running) return CAEN_DGTZ_GenericError;
   ++caen_mock::state.pending_events;
   ++caen_mock::state.software_triggers_sent;
+  caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] |=
+      dt5730_status::kEventReadyMask;
   return CAEN_DGTZ_Success;
 }
 
@@ -461,12 +636,18 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadData(
   if (caen_mock::state.readout_failure) return CAEN_DGTZ_GenericError;
   if (caen_mock::state.pending_events == 0U) {
     *bytes_read = 0;
+    caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] &=
+        ~dt5730_status::kEventReadyMask;
+    caen_mock::state.ApplyStatusFaults();
     return CAEN_DGTZ_Success;
   }
   caen_mock::state.current_read_events = caen_mock::state.pending_events;
   caen_mock::state.pending_events = 0;
   caen_mock::state.BuildTraceBatch();
   *bytes_read = caen_mock::state.current_read_events * 16U;
+  caen_mock::state.registers[dt5730_status::kAcquisitionStatusRegister] &=
+      ~dt5730_status::kEventReadyMask;
+  caen_mock::state.ApplyStatusFaults();
   return CAEN_DGTZ_Success;
 }
 
@@ -482,14 +663,34 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetEventInfo(
     int, char*, uint32_t, uint32_t event_index,
     CAEN_DGTZ_EventInfo_t* info, char** event_pointer) {
   *info = CAEN_DGTZ_EventInfo_t{};
+  info->EventSize =
+      static_cast<uint32_t>(caen_mock::state.event_words.size() *
+                            sizeof(uint32_t));
+  info->Pattern = 0xA55AU;
   info->ChannelMask = caen_mock::state.channel_mask;
   info->EventCounter =
       event_index < caen_mock::state.event_counter_sequence.size()
           ? caen_mock::state.event_counter_sequence[event_index]
           : event_index;
-  info->TriggerTimeTag = event_index * 2U;
+  info->TriggerTimeTag =
+      event_index < caen_mock::state.trigger_time_tag_sequence.size()
+          ? caen_mock::state.trigger_time_tag_sequence[event_index]
+          : event_index * 2U;
   caen_mock::state.current_event_index = event_index;
-  caen_mock::state.event_words[2] = info->EventCounter;
+  caen_mock::state.event_words = {};
+  caen_mock::state.event_words[0] =
+      0xA0000000U |
+      static_cast<uint32_t>(caen_mock::state.event_words.size());
+  caen_mock::state.event_words[1] =
+      ((info->Pattern & 0xFFFFU) << 8U) | (info->ChannelMask & 0xFFU);
+  if (caen_mock::state.event_header_board_failure_index >= 0 &&
+      event_index == static_cast<uint32_t>(
+                         caen_mock::state.event_header_board_failure_index)) {
+    caen_mock::state.event_words[1] |=
+        cpnr::kCaenEventHeaderBoardFailureMask;
+  }
+  caen_mock::state.event_words[2] = info->EventCounter & 0xFFFFFFU;
+  caen_mock::state.event_words[3] = info->TriggerTimeTag;
   *event_pointer = reinterpret_cast<char*>(caen_mock::state.event_words.data());
   return CAEN_DGTZ_Success;
 }

@@ -8,14 +8,21 @@ int main() {
   caen_mock::SetResetFailure(true);
 
   bool reset_failure_propagated = false;
-  try {
+  {
     CaenDigitizer digitizer(CAEN_DGTZ_USB, 0, 0, 0);
-  } catch (const std::runtime_error&) {
-    reset_failure_propagated = true;
+    if (caen_mock::reset_calls != 0U) {
+      std::cerr << "Opening a digitizer reset it before identity validation\n";
+      return 1;
+    }
+    try {
+      digitizer.Reset();
+    } catch (const std::runtime_error&) {
+      reset_failure_propagated = true;
+    }
   }
 
   if (!reset_failure_propagated) {
-    std::cerr << "Reset failure was not propagated from CaenDigitizer\n";
+    std::cerr << "Explicit reset failure was not propagated\n";
     return 1;
   }
   if (caen_mock::open_calls != 1U || caen_mock::close_calls != 1U) {
@@ -25,9 +32,14 @@ int main() {
 
   caen_mock::SetResetFailure(false);
   {
-    CaenDigitizer digitizer(CAEN_DGTZ_USB, 0, 0, 0);
+    CaenDigitizer digitizer(CAEN_DGTZ_USB, 7, 0, 0);
     if (digitizer.GetHandle() < 0) {
       std::cerr << "Successful construction returned an invalid handle\n";
+      return 1;
+    }
+    digitizer.Reset();
+    if (caen_mock::last_open_link != 7U || caen_mock::reset_calls != 2U) {
+      std::cerr << "Configured USB link or explicit reset was not preserved\n";
       return 1;
     }
   }

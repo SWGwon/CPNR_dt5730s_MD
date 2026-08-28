@@ -1,12 +1,15 @@
 import os
 import configparser
+import io
 import math
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
                              QFileDialog, QCheckBox, QMessageBox, QComboBox)
-from PyQt6.QtCore import Qt, QSettings, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    Qt, QIODevice, QSaveFile, QSettings, pyqtSignal, pyqtSlot,
+)
 
 from core.trigger_settings import (
     calculate_threshold_preview,
@@ -1015,13 +1018,32 @@ class ConfigTab(QWidget):
             sec = self.table.item(row, 0).text(); key = self.table.item(row, 1).text(); val = self.table.item(row, 2).text()
             if not self.config.has_section(sec): self.config.add_section(sec)
             self.config.set(sec, key, val)
-            self.table.item(row, 2).setBackground(Qt.GlobalColor.white) 
+
+        serialized = io.StringIO()
+        self.config.write(serialized)
+        payload = serialized.getvalue().encode("utf-8")
+        save_file = QSaveFile(self.current_config_path)
+        # Never permit QSaveFile to fall back to truncating the destination in
+        # place.  A failed write/commit must leave the last valid config intact.
+        save_file.setDirectWriteFallback(False)
         try:
-            with open(
-                self.current_config_path, 'w', encoding='utf-8'
-            ) as configfile:
-                self.config.write(configfile)
-        except OSError as exc:
+            if not save_file.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(
+                    save_file.errorString() or "cannot open atomic save file"
+                )
+            written = save_file.write(payload)
+            if written != len(payload):
+                raise OSError(
+                    save_file.errorString()
+                    or f"short write ({written}/{len(payload)} bytes)"
+                )
+            if not save_file.commit():
+                raise OSError(
+                    save_file.errorString() or "atomic commit failed"
+                )
+        except (OSError, RuntimeError) as exc:
+            if save_file.isOpen():
+                save_file.cancelWriting()
             QMessageBox.critical(
                 self, "Save Failed",
                 "설정 파일을 저장하지 못했습니다. 변경사항은 저장되지 않은 "
@@ -1029,5 +1051,7 @@ class ConfigTab(QWidget):
             )
             self._set_config_dirty(True)
             return
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 2).setBackground(Qt.GlobalColor.white)
         self._set_config_dirty(False)
         self.configPathChanged.emit(os.path.abspath(self.current_config_path))

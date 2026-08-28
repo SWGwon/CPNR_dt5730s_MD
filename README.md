@@ -45,7 +45,7 @@ CPNR_dt5730s/
 │   │   └── ProcessManager.py   # C++ 백엔드 QThread 워커 구동 및 터미널 출력 가로채기
 │   ├── windows/                # 창 레이아웃 관리
 │   │   └── MainWindow.py       # 메인 윈도우 프레임 
-│   └── widgets/                # 5개의 핵심 사용자 경험(UX) 탭
+│   └── widgets/                # 6개의 핵심 사용자 경험(UX) 탭
 │       ├── DaqTab.py           # 🚀 DAQ Control (실시간 대시보드, 연속/스캔 배치 모드)
 │       ├── ConfigTab.py        # ⚙️ Hardware Config (마스터 아키텍트 파라미터 계산기)
 │       ├── MonitorTab.py       # 📈 Live Monitor (다중 채널 자동 감지 오버레이 스펙트럼)
@@ -191,6 +191,11 @@ DAQ 시작 전 설정 검증은 `RecordLength` 128–102400(8의 배수), 1개 �
 최소 160 ns의 pre-trigger 구간 및 활성 채널별 DAC/threshold 범위를 요구합니다.
 검증에 실패하면 디지타이저를 열지 않고 실행을 중단합니다.
 
+`[Connection]`의 `Link`, `Node`, `BaseAddress`, `ExpectedModel`로 연결 대상을 고정하며,
+같은 모델이 여러 대 있거나 장비 교체를 엄격히 추적해야 할 때는 `ExpectedSerial`도
+지정하십시오. Frontend는 장비를 연 뒤 model/serial/firmware/ADC family를 먼저
+확인하고, 기대한 장비임이 입증된 경우에만 reset과 register write를 수행합니다.
+
 ### 기록 채널과 트리거 채널 설정
 
 `ChannelMask`와 `SelfTriggerMask`는 8비트 값을 10진수로 적습니다. 비트 0부터 비트 7까지가 각각 CH0부터 CH7에 대응합니다.
@@ -242,6 +247,12 @@ TriggerThresholdMv=1.0
 
 2 Vpp/14-bit에서는 1 LSB가 `2000/16384 = 0.1220703125 mV`이므로 1 mV는 반올림해 8 ADC입니다. Falling edge라면 frontend가 `round(measured_baseline[ch]) - 8`, rising edge라면 `+ 8`을 채널별로 기록합니다. 범위·DCOffset·polarity·threshold 및 pair/global trigger register readback이 하나라도 요청값과 다르면 physics acquisition을 시작하지 않습니다. 기존 `TriggerThreshold=<absolute ADC>` 설정도 호환되지만 이 모드에서는 실측 baseline-relative 보정이 적용되지 않습니다.
 
+`[SoftwareDSP]`의 `BaselineSamples`, `ShortGate`, `LongGate`와
+`PulseStartThresholdAdc`는 production 변환기가 실제로 사용하는 값입니다. ROOT에는
+적용한 DSP schema와 설정을 기록하고 `ShortCharge_CH*`, `Charge_CH*`, baseline,
+pulse height, T0를 같은 공통 알고리즘으로 생성합니다. 설정한 gate가 pre/post-trigger
+범위를 벗어나거나 `ShortGate > LongGate`이면 변환 전에 거부합니다.
+
 전면 패널 `TRG-IN`만 사용하는 외부 트리거 전용 구성은 다음처럼 self-trigger 참여 마스크를 0으로 둡니다. 이 모드에서는 `PairLogic`을 하드웨어에 적용하지 않으며, 외부 트리거가 들어올 때 `ChannelMask`에 포함된 채널이 기록됩니다.
 
 ```ini
@@ -278,6 +289,22 @@ StopFreeMiB=512
 
 이 검사는 quota, 네트워크 파일시스템 장애 또는 장치 분리 자체를 없애지는 못합니다. 따라서 중요한 run은 로컬의 신뢰할 수 있는 파일시스템에 먼저 기록하고, terminal metadata가 `completed`인지 확인한 뒤 이동하십시오.
 
+### Event loss 정책
+
+accepted-trigger counter에서 누락이 관측되면 원인을 추정해 숨기지 않고
+`lost_events`로 기록합니다. 기본 설정은 한 event도 허용하지 않는 fail-closed 정책입니다.
+
+```ini
+[DataQuality]
+MaxLostEvents=0
+MaxLostFraction=0.0
+```
+
+두 한도를 모두 만족하는 경우에만 run을 계속합니다. 연구 목적상 손실을 허용해야 한다면
+절대 개수와 `lost / (recorded + lost)` 비율을 명시적으로 함께 설정하십시오. Production과
+ROOT validator도 terminal metadata의 손실량이 frozen config 정책을 만족하는지 다시
+검사합니다.
+
 ---
 
 ## 🖥️ Usage
@@ -310,7 +337,7 @@ GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui
 
 쓰기, flush, 크기 또는 장비 오류가 발생하면 성공한 것처럼 final 이름으로 바꾸지 않습니다. 가능한 경우 마지막 완전 이벤트까지의 prefix를 `.partial`에 보존하고 descriptor SHA-256을 기록하며, terminal metadata는 `failed`와 실패 원인을 남깁니다. 갑작스러운 전원 차단은 이 절차를 완료할 수 없으므로 `.partial`과 status snapshot을 함께 보존하십시오.
 
-ZMQ는 모니터링용 보조 경로입니다. subscriber 지연이나 non-blocking publish 실패는 raw 기록을 중단시키지 않으며 `zmq_drops`/`zmq_send_errors`로 metadata와 GUI에 누적됩니다. 반대로 raw 파일 쓰기 실패는 데이터 유실을 숨기지 않도록 즉시 acquisition 실패로 처리됩니다.
+ZMQ는 모니터링용 보조 경로입니다. subscriber 지연은 PUB socket에서 직접 증명할 수 없으므로 GUI subscriber가 EventID gap을 별도로 표시합니다. Frontend에서 관측 가능한 publish API 실패만 `zmq_nonblocking_send_failures`/`zmq_send_errors`로 metadata와 GUI에 누적합니다. 반대로 raw 파일 쓰기 실패는 데이터 유실을 숨기지 않도록 즉시 acquisition 실패로 처리됩니다.
 
 ### 실패한 `.partial`의 읽기 전용 복구
 
@@ -353,12 +380,15 @@ run bundle을 다른 디스크나 호스트로 옮길 때는 raw, `<raw>.config.
 
 GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-events`를 생략하면 전체 tree를 검사하며, JSON 보고서는 stdout, 진행률/진단은 stderr로 분리됩니다. `--max-events`로 제한하면 tree의 선두 event prefix만 검사해 빠른 이상 탐지를 제공합니다. 이 prefix 모드는 큰 ROOT/raw를 전부 읽지 않도록 전체 ROOT 및 외부 artifact SHA-256을 의도적으로 생략하고 identity/size만 확인하므로, 보고서는 `WARN`이며 전체 파일에 대한 양성 판정은 `SKIP`으로 남습니다. 특히 metadata가 없는 구형 파일의 cutoff/상대 threshold 추론은 전수 검사에서만 제공합니다.
 
+가장 강한 변환 검증이 필요하면 전체 검사에 `--raw-fidelity`를 추가합니다. GUI에서는 **Full RAW→ROOT conversion fidelity**를 선택하면 scan limit가 자동으로 `All events`로 고정됩니다. 검증기는 ROOT에 기록된 `ResolvedRawInputPath`만 `O_NOFOLLOW` 읽기 전용 descriptor로 고정하고 metadata의 size/SHA-256으로 전부 인증합니다. 실제 비교 패스가 소비한 바이트도 독립 SHA-256으로 다시 결박합니다. 이어서 모든 RAW `EventHeader`를 ROOT의 EventID/TTT/shape/pattern/board counter와 비교하고, 파형이 저장된 ROOT는 모든 ADC sample을 정확히 대조합니다. 파형을 저장하지 않은 ROOT는 RAW payload에서 production과 같은 DSP를 다시 계산해 baseline/QShort/QLong/pulse height/T0를 대조하되 ROOT waveform sample 일치를 주장하지 않습니다. malformed/truncated/검사 중 변경된 RAW는 FAIL입니다.
+
 ```bash
 ./bin/root_validate_dt5730 -i /absolute/run021_prod.root \
-  > run021_prod.root.validation.json
+  --raw-fidelity \
+  --report /absolute/run021_prod.root.validation.json
 ```
 
-메타데이터와 GUI에서 내보내는 ROOT validation JSON은 게시 시점에 경로가 없을 때만 원자적으로 생성되며, 사전 검사 이후 race로 생긴 경로도 덮어쓰지 않습니다. 새 경로에 저장하거나 기존 결과를 명시적으로 보관한 뒤 다시 검증하십시오. 위 CLI 예시의 `>`는 shell redirection이므로 별도로 `noclobber`를 설정하지 않으면 기존 파일을 덮어쓸 수 있습니다.
+`--report`는 같은 디렉터리의 임시 파일을 먼저 fsync한 뒤 새 경로에만 원자적으로 게시합니다. 입력 ROOT 자체·그 hard link·기존 파일·검사 도중 생긴 경로는 절대 덮어쓰지 않습니다. `--report`를 생략하면 JSON은 stdout으로 출력되지만, `> 파일` shell redirection은 validator가 시작되기 전에 대상을 truncate할 수 있으므로 보관용 보고서에는 사용하지 마십시오. CLI 종료 코드는 `PASS=0`, `WARN=1`, `FAIL=2`, `CANCELLED=3`이며 JSON 판정과 일치합니다. GUI에서 내보내는 JSON도 동일하게 기존 경로를 덮어쓰지 않습니다.
 
 **가벼운 CLI 모니터링 단독 실행 (X-Server 불필요):**
 메인 프로그램을 띄우지 않고 터미널 환경에서 가볍게 다중 채널 파형과 스펙트럼만 모니터링할 경우 아래 스크립트를 실행합니다.
@@ -368,11 +398,11 @@ GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-
 ```
 
 ### GUI 탭(Tab)별 기능 명세서
-* **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, ZMQ Drops 등) 및 컬러 파싱 터미널 창 제공.
+* **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, publish API failure 등) 및 컬러 파싱 터미널 창 제공.
 * **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
 * **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, Micro-Time(T0) 추출, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
-* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event를 검사하거나 제한 event 수의 선두 prefix를 검사합니다. PASS/WARN/FAIL과 채널별 baseline/threshold/routing 지표를 표로 보여 주고, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
+* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event 또는 제한 prefix를 검사합니다. file identity/SHA-256, ROOT recovery/schema/branch, EventID/TTT/counter/shape, summary, finite/range/saturation, baseline settling, threshold 실효값, routing, embedded config/metadata/binary provenance를 영역별 PASS/WARN/FAIL로 표시합니다. 선택적으로 모든 RAW header·sample·DSP 결과와 ROOT를 정확히 대조하며, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 
 ---

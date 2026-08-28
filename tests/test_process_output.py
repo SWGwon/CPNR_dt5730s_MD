@@ -19,22 +19,23 @@ from core.process_output import (  # noqa: E402
 class ProcessOutputTests(unittest.TestCase):
     def test_mixed_live_temperature_and_led_line_is_fully_parsed(self):
         line = (
-            "[LIVE DAQ] Time: 00:03 | RealTime: 2.50 s | Live: 2.25 s | "
-            "DT: 10.0000 % | Rate: 42.5 Hz | Events: 123 | "
-            "Speed: 1.50 MB/s | Drops: 0"
+            "[LIVE DAQ] Time: 00:03 | RealTime: 2.50 s | "
+            "Window: 10.0000 % | Rate: 42.5 Hz | Events: 123 | "
+            "Speed: 1.50 MB/s | PubSendFail: 0"
             "[STATUS] TEMP: 31.0"
-            "[STATUS] LED: LOCK=1, BYPS=0, RUN=1, TRG=1, DRDY=1, BUSY=0"
+            "[STATUS] LED: LOCK=1, CLKEXT=0, READY=1, RUN=1, TRG=1, "
+            "DRDY=1, FULL=0"
         )
 
         self.assertEqual(
             parse_live_daq_stats(line),
             {
-                "live_time": "2.25 s",
-                "dead_time": "10.0000 %",
+                "real_time": "2.50 s",
+                "window_load": "10.0000 %",
                 "events": "123",
                 "rate": "42.5 Hz",
                 "speed": "1.50 MB/s",
-                "drops": "0",
+                "publisher_send_failures": "0",
             },
         )
         self.assertEqual(parse_temperature(line), 31.0)
@@ -42,18 +43,19 @@ class ProcessOutputTests(unittest.TestCase):
             parse_led_status(line),
             {
                 "PLL LOCK": 1,
-                "PLL BYPS": 0,
+                "CLK EXT": 0,
+                "BOARD READY": 1,
                 "RUN": 1,
                 "TRG": 1,
                 "DRDY": 1,
-                "BUSY": 0,
+                "FULL": 0,
             },
         )
 
     def test_live_parser_ignores_malformed_or_unrelated_fields(self):
-        self.assertEqual(parse_live_daq_stats("Live: 1.0 s"), {})
+        self.assertEqual(parse_live_daq_stats("RealTime: 1.0 s"), {})
         self.assertEqual(
-            parse_live_daq_stats("[LIVE DAQ] Live: broken | Events: 7"),
+            parse_live_daq_stats("[LIVE DAQ] RealTime: broken | Events: 7"),
             {"events": "7"},
         )
         self.assertEqual(parse_live_daq_stats("[LIVE DAQ] unavailable"), {})

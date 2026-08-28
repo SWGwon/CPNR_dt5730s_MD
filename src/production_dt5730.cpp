@@ -1,8 +1,11 @@
 #include "EventHeader.h"
+#include "DT5730Timing.h"
+#include "DT5730Status.h"
 #include "ConfigParser.h"
 #include "DAQConfig.h"
 #include "RaceSafeCleanup.h"
 #include "Sha256.h"
+#include "WaveformDsp.h"
 #include <TApplication.h>
 #include <TCanvas.h>
 #include <TFile.h>
@@ -451,7 +454,10 @@ void ValidateRuntimeMetadataAgainstConfig(
                 std::string("Runtime metadata hardware field is empty: ") + key);
         }
     }
-    RequireMetadataUnsigned(hardware, "serial_number", 0U, UINT32_MAX);
+    const std::string board_model =
+        RequireMetadataString(hardware, "model");
+    const uint64_t board_serial =
+        RequireMetadataUnsigned(hardware, "serial_number", 0U, UINT32_MAX);
     const uint64_t input_range =
         RequireMetadataUnsigned(hardware, "input_range_mvpp", 500U, 2000U);
     const uint64_t adc_bits =
@@ -459,6 +465,37 @@ void ValidateRuntimeMetadataAgainstConfig(
     const uint64_t dc_offset_bits =
         RequireMetadataUnsigned(hardware, "dc_offset_dac_bits", 16U, 16U);
     (void)dc_offset_bits;
+    const uint64_t schema = RequireMetadataUnsigned(
+        metadata, "schema_version", 1U, 2U);
+    std::optional<uint32_t> latest_status_register;
+    std::optional<uint32_t> latest_failure_register;
+    if (schema >= 2U) {
+        if (RequireMetadataNumber(hardware, "trigger_time_tag_raw_lsb_ns",
+                                  0.0, 1000.0) !=
+                dt5730_timing::kTriggerTimeTagRawLsbNs ||
+            RequireMetadataNumber(
+                hardware, "trigger_time_tag_observable_resolution_ns", 0.0,
+                1000.0) !=
+                dt5730_timing::kTriggerTimeTagObservableResolutionNs ||
+            RequireMetadataNumber(hardware, "adc_sample_period_ns", 0.0,
+                                  1000.0) !=
+                dt5730_timing::kAdcSamplePeriodNs ||
+            RequireMetadataBool(hardware,
+                                "dead_time_measurement_available") ||
+            RequireMetadataString(hardware, "dead_time_method") !=
+                "unavailable_no_hardware_busy_or_livetime_scaler") {
+            throw std::runtime_error(
+                "Runtime metadata v2 timing/dead-time semantics are invalid");
+        }
+        latest_status_register = static_cast<uint32_t>(
+            RequireMetadataUnsigned(
+                hardware, "latest_acquisition_status_register", 0U,
+                UINT32_MAX));
+        latest_failure_register = static_cast<uint32_t>(
+            RequireMetadataUnsigned(
+                hardware, "latest_board_failure_status_register", 0U,
+                UINT32_MAX));
+    }
     const uint64_t clock_source =
         RequireMetadataUnsigned(hardware, "clock_source", 0U, 1U);
     const uint64_t clock_readback =
@@ -467,6 +504,22 @@ void ValidateRuntimeMetadataAgainstConfig(
         RequireMetadataUnsigned(hardware, "run_sync_mode", 0U, 4U);
     const uint64_t run_sync_readback =
         RequireMetadataUnsigned(hardware, "run_sync_mode_readback", 0U, 4U);
+    if (schema >= 2U) {
+        const auto status = dt5730_status::DecodeAcquisitionStatus(
+            *latest_status_register);
+        const auto failure = dt5730_status::DecodeBoardFailureStatus(
+            *latest_failure_register);
+        const bool observed_external =
+            status.clock_source == dt5730_status::ClockSource::kExternal;
+        const bool expected_external = clock_source != 0U;
+        if (status.run || status.event_full ||
+            status.HasFatalHealthFault() || failure.Any() ||
+            observed_external != expected_external) {
+            throw std::runtime_error(
+                "Runtime metadata v2 latest board-health registers are "
+                "incompatible with a verified stopped/completed acquisition");
+        }
+    }
     const std::string polarity =
         RequireMetadataString(hardware, "trigger_polarity");
     if (polarity != "falling" && polarity != "rising") {
@@ -482,6 +535,16 @@ void ValidateRuntimeMetadataAgainstConfig(
         RequireMetadataUnsigned(hardware, "record_length", 128U, 102400U));
     const uint32_t post_trigger = static_cast<uint32_t>(
         RequireMetadataUnsigned(hardware, "post_trigger_percent", 0U, 100U));
+    if (schema >= 2U) {
+        const uint32_t post_trigger_readback = static_cast<uint32_t>(
+            RequireMetadataUnsigned(hardware,
+                                    "post_trigger_readback_percent", 0U,
+                                    100U));
+        if (post_trigger_readback != post_trigger) {
+            throw std::runtime_error(
+                "Runtime post-trigger readback differs from the request");
+        }
+    }
     const uint32_t external_mode = static_cast<uint32_t>(
         RequireMetadataUnsigned(hardware, "external_trigger_mode", 0U, 1U));
     const uint32_t self_mode = static_cast<uint32_t>(
@@ -524,6 +587,92 @@ void ValidateRuntimeMetadataAgainstConfig(
         explicit_routing != settings.explicit_trigger_routing) {
         throw std::runtime_error(
             "Runtime hardware metadata does not match the frozen config/readback");
+    }
+    if (schema >= 2U) {
+        if (RequireMetadataString(hardware, "connection_type") !=
+                settings.connection.type ||
+            RequireMetadataUnsigned(hardware, "connection_link", 0U, 127U) !=
+                static_cast<uint64_t>(settings.connection.link) ||
+            RequireMetadataUnsigned(hardware, "connection_node", 0U,
+                                    UINT32_MAX) !=
+                static_cast<uint64_t>(settings.connection.node) ||
+            RequireMetadataUnsigned(hardware, "connection_base_address", 0U,
+                                    UINT32_MAX) !=
+                settings.connection.base_address ||
+            RequireMetadataString(hardware, "expected_model") !=
+                settings.connection.expected_model ||
+            board_model.rfind(settings.connection.expected_model, 0U) != 0U) {
+            throw std::runtime_error(
+                "Runtime board connection/identity metadata does not match "
+                "the frozen config");
+        }
+        const Json expected_serial_field =
+            RequireMetadataField(hardware, "expected_serial");
+        if (settings.connection.has_expected_serial) {
+            const uint64_t expected_serial = RequireMetadataUnsigned(
+                hardware, "expected_serial", 1U, UINT32_MAX);
+            if (expected_serial != settings.connection.expected_serial ||
+                board_serial != expected_serial) {
+                throw std::runtime_error(
+                    "Runtime board serial identity does not match the frozen "
+                    "config");
+            }
+        } else if (!expected_serial_field.is_null()) {
+            throw std::runtime_error(
+                "Runtime metadata unexpectedly claims an ExpectedSerial");
+        }
+        const auto& dsp = settings.software_dsp.waveform;
+        if (RequireMetadataUnsigned(hardware, "waveform_dsp_schema", 1U,
+                                    1U) != 1U ||
+            RequireMetadataUnsigned(hardware, "dsp_baseline_samples", 1U,
+                                    UINT32_MAX) != dsp.baseline_samples ||
+            RequireMetadataUnsigned(hardware, "dsp_short_gate_samples", 1U,
+                                    UINT32_MAX) != dsp.short_gate_samples ||
+            RequireMetadataUnsigned(hardware, "dsp_long_gate_samples", 1U,
+                                    UINT32_MAX) != dsp.long_gate_samples ||
+            std::abs(RequireMetadataNumber(
+                         hardware, "dsp_pulse_start_threshold_adc", 0.0,
+                         16383.0) -
+                     dsp.pulse_start_threshold_adc) > 1e-12 ||
+            RequireMetadataUnsigned(
+                hardware, "software_coincidence_window_ns", 1U,
+                UINT32_MAX) != settings.software_dsp.coincidence_window_ns) {
+            throw std::runtime_error(
+                "Runtime SoftwareDSP metadata does not match the frozen config");
+        }
+    }
+    if (schema >= 2U) {
+        const uint64_t expected_event_bytes =
+            sizeof(EventHeader) +
+            2U * static_cast<uint64_t>(record_length) *
+                static_cast<uint64_t>(__builtin_popcount(record_mask));
+        if (RequireMetadataUnsigned(metadata, "raw_event_bytes", 1U,
+                                    UINT64_MAX) != expected_event_bytes) {
+            throw std::runtime_error(
+                "Runtime metadata v2 raw_event_bytes differs from config");
+        }
+        const Json storage = RequireMetadataField(metadata, "storage");
+        if (!storage.is_object() ||
+            RequireMetadataUnsigned(storage, "minimum_free_bytes", 0U,
+                                    UINT64_MAX) !=
+                settings.storage.minimum_free_bytes ||
+            RequireMetadataUnsigned(storage, "stop_free_bytes", 0U,
+                                    UINT64_MAX) !=
+                settings.storage.stop_free_bytes) {
+            throw std::runtime_error(
+                "Runtime metadata v2 storage watermarks differ from config");
+        }
+        const uint64_t recorded_events = RequireMetadataUnsigned(
+            metadata, "recorded_events", 0U, UINT64_MAX);
+        const uint64_t lost_events = RequireMetadataUnsigned(
+            metadata, "lost_events", 0U, UINT64_MAX);
+        if (cpnr::LostEventPolicyExceeded(
+                recorded_events, lost_events,
+                settings.lost_event_policy)) {
+            throw std::runtime_error(
+                "Runtime metadata completed a run that exceeds the "
+                "configured accepted-trigger loss policy");
+        }
     }
 
     uint32_t expected_pair_requests = 0U;
@@ -681,6 +830,277 @@ void ValidateRuntimeMetadataAgainstConfig(
     }
 }
 
+void ValidateCompletedRuntimeMetadataV2(const Json& metadata) {
+    if (RequireMetadataString(metadata, "acquisition_status") !=
+        "completed") {
+        throw std::runtime_error(
+            "Runtime metadata v2 must report acquisition_status=completed");
+    }
+    const std::string termination_reason =
+        RequireMetadataString(metadata, "termination_reason");
+    const std::set<std::string> completed_reasons = {
+        "event_limit", "time_limit", "operator_stop", "completed"};
+    if (completed_reasons.count(termination_reason) == 0U) {
+        throw std::runtime_error(
+            "Runtime metadata v2 has an invalid completed termination_reason");
+    }
+    RequireMetadataNull(metadata, "failure_reason");
+    RequireMetadataNull(metadata, "raw_finalization_error");
+
+    const uint64_t requested_max_events = RequireMetadataUnsigned(
+        metadata, "requested_max_events", 0U, UINT64_MAX);
+    const uint64_t requested_run_time = RequireMetadataUnsigned(
+        metadata, "requested_run_time_sec", 0U, UINT64_MAX);
+    const uint64_t hardware_verified = RequireMetadataUnsigned(
+        metadata, "hardware_verified_unix_time", 1U, UINT64_MAX);
+    const uint64_t acquisition_start = RequireMetadataUnsigned(
+        metadata, "acquisition_start_unix_time", 1U, UINT64_MAX);
+    const uint64_t acquisition_end = RequireMetadataUnsigned(
+        metadata, "acquisition_end_unix_time", 1U, UINT64_MAX);
+    const uint64_t created = RequireMetadataUnsigned(
+        metadata, "created_unix_time", 1U, UINT64_MAX);
+    if (hardware_verified > acquisition_start ||
+        acquisition_start > acquisition_end || acquisition_end > created) {
+        throw std::runtime_error(
+            "Runtime metadata v2 timestamps are not ordered");
+    }
+
+    const uint64_t recorded_events = RequireMetadataUnsigned(
+        metadata, "recorded_events", 0U, UINT64_MAX);
+    RequireMetadataUnsigned(metadata, "lost_events", 0U, UINT64_MAX);
+    if (termination_reason == "event_limit" &&
+        (requested_max_events == 0U ||
+         recorded_events != requested_max_events)) {
+        throw std::runtime_error(
+            "Runtime metadata v2 event-limit termination/count mismatch");
+    }
+    if (termination_reason == "time_limit" && requested_run_time == 0U) {
+        throw std::runtime_error(
+            "Runtime metadata v2 time-limit termination lacks a time limit");
+    }
+    if (requested_max_events != 0U &&
+        recorded_events > requested_max_events) {
+        throw std::runtime_error(
+            "Runtime metadata v2 recorded_events exceeds its request");
+    }
+
+    const std::string raw_path =
+        RequireMetadataString(metadata, "raw_output_path");
+    const std::string requested_raw_path =
+        RequireMetadataString(metadata, "requested_raw_output_path");
+    if (!fs::path(raw_path).is_absolute() ||
+        !fs::path(requested_raw_path).is_absolute() ||
+        raw_path != requested_raw_path) {
+        throw std::runtime_error(
+            "Runtime metadata v2 completed raw paths are not identical absolute paths");
+    }
+    if (!RequireMetadataBool(metadata, "raw_output_published") ||
+        !RequireMetadataBool(metadata, "raw_output_finalized")) {
+        throw std::runtime_error(
+            "Runtime metadata v2 completed run is not finalized and published");
+    }
+    const std::string digest_method =
+        RequireMetadataString(metadata, "raw_digest_method");
+    if (digest_method !=
+        "streaming_sha256_verified_by_descriptor_sha256") {
+        throw std::runtime_error(
+            "Runtime metadata v2 completed run lacks dual raw-digest verification");
+    }
+    if (RequireMetadataBool(metadata, "raw_recovery_performed")) {
+        throw std::runtime_error(
+            "Runtime metadata v2 cannot publish a recovered prefix as completed");
+    }
+    RequireMetadataNull(metadata, "raw_events_before_recovery");
+    if (!RequireMetadataBool(metadata, "lost_events_exact")) {
+        throw std::runtime_error(
+            "Runtime metadata v2 completed lost-event count is not exact");
+    }
+    RequireMetadataUnsigned(metadata, "raw_format_version", 1U, 1U);
+    RequireMetadataUnsigned(metadata, "raw_event_header_bytes",
+                            sizeof(EventHeader), sizeof(EventHeader));
+    const uint64_t raw_event_bytes = RequireMetadataUnsigned(
+        metadata, "raw_event_bytes", sizeof(EventHeader) + sizeof(uint16_t),
+        UINT64_MAX);
+    const uint64_t raw_size = RequireMetadataUnsigned(
+        metadata, "raw_output_size_bytes", 0U, UINT64_MAX);
+    const uint64_t complete_offset = RequireMetadataUnsigned(
+        metadata, "last_complete_offset", 0U, UINT64_MAX);
+    if (raw_size != complete_offset || raw_size % raw_event_bytes != 0U ||
+        recorded_events != raw_size / raw_event_bytes) {
+        throw std::runtime_error(
+            "Runtime metadata v2 raw size/event-boundary accounting is inconsistent");
+    }
+
+    const Json storage = RequireMetadataField(metadata, "storage");
+    if (!storage.is_object()) {
+        throw std::runtime_error(
+            "Runtime metadata v2 storage must be an object");
+    }
+    const uint64_t free_at_start = RequireMetadataUnsigned(
+        storage, "free_bytes_at_start", 0U, UINT64_MAX);
+    RequireMetadataUnsigned(storage, "free_bytes_at_end", 0U, UINT64_MAX);
+    const uint64_t expected_raw = RequireMetadataUnsigned(
+        storage, "expected_raw_bytes", 0U, UINT64_MAX);
+    const uint64_t minimum_free = RequireMetadataUnsigned(
+        storage, "minimum_free_bytes", 0U, UINT64_MAX);
+    const uint64_t stop_free = RequireMetadataUnsigned(
+        storage, "stop_free_bytes", 0U, UINT64_MAX);
+    if (minimum_free < stop_free ||
+        expected_raw > UINT64_MAX - minimum_free ||
+        free_at_start < expected_raw + minimum_free) {
+        throw std::runtime_error(
+            "Runtime metadata v2 storage preflight accounting is inconsistent");
+    }
+    const uint64_t expected_from_request =
+        requested_max_events == 0U
+            ? 0U
+            : requested_max_events <= UINT64_MAX / raw_event_bytes
+                  ? requested_max_events * raw_event_bytes
+                  : throw std::runtime_error(
+                        "Runtime metadata v2 requested raw size overflows");
+    if (expected_raw != expected_from_request) {
+        throw std::runtime_error(
+            "Runtime metadata v2 expected raw size differs from the request");
+    }
+
+    const Json counters = RequireMetadataField(metadata, "runtime_counters");
+    if (!counters.is_object()) {
+        throw std::runtime_error(
+            "Runtime metadata v2 runtime_counters must be an object");
+    }
+    RequireMetadataUnsigned(counters, "readout_errors", 0U, UINT64_MAX);
+    const uint64_t health_checks = RequireMetadataUnsigned(
+        counters, "health_checks", 1U, UINT64_MAX);
+    RequireMetadataUnsigned(counters, "health_read_errors", 0U,
+                            health_checks);
+    RequireMetadataUnsigned(counters, "zmq_nonblocking_send_failures", 0U,
+                            UINT64_MAX);
+    RequireMetadataUnsigned(counters, "zmq_send_errors", 0U, UINT64_MAX);
+    const uint64_t hwm_messages = RequireMetadataUnsigned(
+        counters, "zmq_send_hwm_messages", 1U, UINT64_MAX);
+    const uint64_t hwm_bytes = RequireMetadataUnsigned(
+        counters, "zmq_send_hwm_approx_bytes", raw_event_bytes, UINT64_MAX);
+    if (hwm_messages > UINT64_MAX / raw_event_bytes ||
+        hwm_bytes != hwm_messages * raw_event_bytes ||
+        hwm_bytes > 64U * 1024U * 1024U) {
+        throw std::runtime_error(
+            "Runtime metadata v2 ZeroMQ watermark accounting is inconsistent");
+    }
+    RequireMetadataUnsigned(counters, "runtime_configuration_checks", 1U,
+                            UINT64_MAX);
+    if (RequireMetadataString(counters, "subscriber_delivery_evidence") !=
+        "unavailable_pub_socket_may_drop_silently") {
+        throw std::runtime_error(
+            "Runtime metadata v2 overstates ZeroMQ subscriber-delivery evidence");
+    }
+    const Json temperatures =
+        RequireMetadataField(counters, "max_temperature_c");
+    if (!temperatures.is_array() || temperatures.size() != MAX_CH) {
+        throw std::runtime_error(
+            "Runtime metadata v2 max_temperature_c must have eight entries");
+    }
+    const Json hardware = RequireMetadataField(metadata, "hardware");
+    const uint32_t record_mask = static_cast<uint32_t>(
+        RequireMetadataUnsigned(hardware, "record_mask", 1U, 0xFFU));
+    for (std::size_t channel = 0U; channel < temperatures.size(); ++channel) {
+        const Json& value = temperatures.at(channel);
+        const bool active = ((record_mask >> channel) & 1U) != 0U;
+        if (value.is_null()) {
+            if (active) {
+                throw std::runtime_error(
+                    "Runtime metadata v2 lacks a temperature observation for "
+                    "an active channel");
+            }
+            continue;
+        }
+        const Json wrapper = {{"temperature", value}};
+        const double temperature = RequireMetadataNumber(
+            wrapper, "temperature", 0.0, 150.0);
+        if (active && temperature >= 82.0) {
+            throw std::runtime_error(
+                "Runtime metadata v2 completed run reached the 82 C software "
+                "shutdown limit");
+        }
+    }
+
+    const uint32_t record_length = static_cast<uint32_t>(
+        RequireMetadataUnsigned(hardware, "record_length", 1U,
+                                UINT32_MAX));
+    const Json timing = RequireMetadataField(metadata, "timing_summary");
+    if (!timing.is_object()) {
+        throw std::runtime_error(
+            "Runtime metadata v2 timing_summary must be an object");
+    }
+    const double expected_window =
+        dt5730_timing::RecordedWindowSumSeconds(recorded_events,
+                                                record_length);
+    const double observed_window = RequireMetadataNumber(
+        timing, "recorded_window_sum_sec", 0.0,
+        std::numeric_limits<double>::max());
+    const auto approximately_equal = [](double left, double right) {
+        return std::abs(left - right) <=
+               std::max(1.0e-12,
+                        1.0e-9 * std::max(std::abs(left), std::abs(right)));
+    };
+    if (!approximately_equal(observed_window, expected_window)) {
+        throw std::runtime_error(
+            "Runtime metadata v2 recorded-window sum is inconsistent");
+    }
+    const Json first_field = RequireMetadataField(timing,
+                                                  "first_extended_ttt");
+    const Json last_field = RequireMetadataField(timing,
+                                                 "last_extended_ttt");
+    const Json elapsed_field = RequireMetadataField(timing,
+                                                    "elapsed_time_sec");
+    const Json ratio_field = RequireMetadataField(
+        timing, "recorded_window_to_elapsed_pct");
+    const Json rate_field = RequireMetadataField(
+        timing, "average_recorded_event_rate_hz");
+    if (recorded_events == 0U) {
+        if (!first_field.is_null() || !last_field.is_null() ||
+            !elapsed_field.is_null() || !ratio_field.is_null() ||
+            !rate_field.is_null()) {
+            throw std::runtime_error(
+                "Runtime metadata v2 empty run has non-null TTT timing");
+        }
+    } else {
+        const uint64_t first = RequireMetadataUnsigned(
+            timing, "first_extended_ttt", 0U, UINT64_MAX);
+        const uint64_t last = RequireMetadataUnsigned(
+            timing, "last_extended_ttt", first, UINT64_MAX);
+        const double elapsed = RequireMetadataNumber(
+            timing, "elapsed_time_sec", 0.0,
+            std::numeric_limits<double>::max());
+        const double expected_elapsed =
+            dt5730_timing::ElapsedSeconds(first, last);
+        if (!approximately_equal(elapsed, expected_elapsed)) {
+            throw std::runtime_error(
+                "Runtime metadata v2 TTT elapsed time is inconsistent");
+        }
+        if (elapsed > 0.0) {
+            const double ratio = RequireMetadataNumber(
+                timing, "recorded_window_to_elapsed_pct", 0.0,
+                std::numeric_limits<double>::max());
+            const double rate = RequireMetadataNumber(
+                timing, "average_recorded_event_rate_hz", 0.0,
+                std::numeric_limits<double>::max());
+            if (!approximately_equal(
+                    ratio,
+                    dt5730_timing::RecordedWindowToElapsedPercent(
+                        expected_window, elapsed)) ||
+                !approximately_equal(
+                    rate, dt5730_timing::AverageRecordedEventRateHz(
+                              recorded_events, elapsed))) {
+                throw std::runtime_error(
+                    "Runtime metadata v2 timing ratios are inconsistent");
+            }
+        } else if (!ratio_field.is_null() || !rate_field.is_null()) {
+            throw std::runtime_error(
+                "Runtime metadata v2 zero elapsed interval must not claim a rate");
+        }
+    }
+}
+
 Json ParseRuntimeMetadata(const std::string& contents) {
     std::vector<std::set<std::string>> object_keys;
     std::string duplicate_key;
@@ -724,7 +1144,8 @@ Json ParseRuntimeMetadata(const std::string& contents) {
     }
 
     const Json schema = RequireMetadataField(metadata, "schema_version");
-    if (!schema.is_number_integer() || schema.get<int>() != 1) {
+    if (!schema.is_number_integer() || schema.get<int>() < 1 ||
+        schema.get<int>() > 2) {
         throw std::runtime_error("Unsupported runtime metadata schema_version");
     }
     const Json run = RequireMetadataField(metadata, "run_number");
@@ -763,6 +1184,9 @@ Json ParseRuntimeMetadata(const std::string& contents) {
     if (!std::regex_match(raw_sha256, sha256_pattern)) {
         throw std::runtime_error(
             "Runtime metadata raw_output_sha256 must be 64 lowercase hex digits");
+    }
+    if (schema.get<int>() >= 2) {
+        ValidateCompletedRuntimeMetadataV2(metadata);
     }
     return metadata;
 }
@@ -889,6 +1313,10 @@ int main(int argc, char **argv) {
     std::string recorded_raw_sha256;
     uint32_t expected_record_length = 0U;
     uint32_t expected_channel_mask = 0U;
+    uint64_t expected_recorded_events = 0U;
+    uint64_t expected_lost_events = 0U;
+    bool verify_runtime_stream_counters = false;
+    DAQHardwareSettings selected_settings;
     bool trigger_is_falling = true;
     std::string recorded_raw_path;
     std::string recorded_config_path;
@@ -924,13 +1352,21 @@ int main(int argc, char **argv) {
             config_contents =
                 ReadTextFile(config_file, "runtime config snapshot");
             runtime_metadata = ParseRuntimeMetadata(metadata_contents);
-            const DAQHardwareSettings selected_settings =
-                LoadDAQHardwareSettings(ConfigParser::FromText(
-                    config_contents, AbsolutePath(config_file)));
+            selected_settings = LoadDAQHardwareSettings(ConfigParser::FromText(
+                config_contents, AbsolutePath(config_file)));
             ValidateRuntimeMetadataAgainstConfig(runtime_metadata,
                                                  selected_settings);
             expected_record_length = selected_settings.record_length;
             expected_channel_mask = selected_settings.channel_mask;
+            verify_runtime_stream_counters =
+                RequireMetadataUnsigned(runtime_metadata, "schema_version",
+                                        1U, 2U) >= 2U;
+            if (verify_runtime_stream_counters) {
+                expected_recorded_events = RequireMetadataUnsigned(
+                    runtime_metadata, "recorded_events", 0U, UINT64_MAX);
+                expected_lost_events = RequireMetadataUnsigned(
+                    runtime_metadata, "lost_events", 0U, UINT64_MAX);
+            }
             trigger_is_falling =
                 RequireMetadataString(
                     RequireMetadataField(runtime_metadata, "hardware"),
@@ -1140,6 +1576,7 @@ int main(int argc, char **argv) {
     
     uint32_t record_len_branch = 0; 
     std::vector<uint16_t> wave_ch[8];
+    double short_charge_ch[8] = {0.0};
     double charge_ch[8] = {0.0};
     double pulse_height_ch[8] = {0.0};
     double pulse_start_time_ch[8] = {0.0}; 
@@ -1222,7 +1659,32 @@ int main(int argc, char **argv) {
             fOut->TestBit(TFile::kWriteError);
 
         TParameter<int> p_run_num("RunNumber", run_number);
-        if (p_run_num.Write() <= 0 || fOut->TestBit(TFile::kWriteError)) {
+        TParameter<int> p_dsp_schema("WaveformDspSchema", 1);
+        TParameter<int> p_dsp_baseline(
+            "DspBaselineSamples",
+            static_cast<int>(selected_settings.software_dsp.waveform
+                                 .baseline_samples));
+        TParameter<int> p_dsp_short(
+            "DspShortGateSamples",
+            static_cast<int>(selected_settings.software_dsp.waveform
+                                 .short_gate_samples));
+        TParameter<int> p_dsp_long(
+            "DspLongGateSamples",
+            static_cast<int>(selected_settings.software_dsp.waveform
+                                 .long_gate_samples));
+        TParameter<double> p_dsp_start(
+            "DspPulseStartThresholdAdc",
+            selected_settings.software_dsp.waveform
+                .pulse_start_threshold_adc);
+        TParameter<int> p_coincidence_window(
+            "SoftwareCoincidenceWindowNs",
+            static_cast<int>(selected_settings.software_dsp
+                                 .coincidence_window_ns));
+        if (p_run_num.Write() <= 0 || p_dsp_schema.Write() <= 0 ||
+            p_dsp_baseline.Write() <= 0 || p_dsp_short.Write() <= 0 ||
+            p_dsp_long.Write() <= 0 || p_dsp_start.Write() <= 0 ||
+            p_coincidence_window.Write() <= 0 ||
+            fOut->TestBit(TFile::kWriteError)) {
             initial_write_failed = true;
         }
         if (initial_write_failed) {
@@ -1243,6 +1705,7 @@ int main(int argc, char **argv) {
                      "BoardEventCounter/i");
 
         for (int i = 0; i < 8; ++i) {
+            tOut->Branch(Form("ShortCharge_CH%d", i), &short_charge_ch[i], Form("ShortCharge_CH%d/D", i));
             tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
             tOut->Branch(Form("PulseHeight_CH%d", i), &pulse_height_ch[i], Form("PulseHeight_CH%d/D", i));
             tOut->Branch(Form("PulseStart_T0_CH%d", i), &pulse_start_time_ch[i], Form("PulseStart_T0_CH%d/D", i));
@@ -1282,12 +1745,30 @@ int main(int argc, char **argv) {
             g_running = 0;
             break;
         }
+        if (header.EventID != current_event - 1U) {
+            std::cerr << "\n[Error] Raw EventID is not the exact zero-based "
+                         "stream index at event "
+                      << current_event - 1U << " (observed="
+                      << header.EventID << ")\n";
+            conversion_failed = true;
+            g_running = 0;
+            break;
+        }
 
         if (is_first_event) {
             first_ttt = header.ExtendedTTT;
             prev_board_counter = header.BoardEventCounter;
             is_first_event = false;
         } else {
+            if (header.ExtendedTTT <= last_ttt) {
+                std::cerr << "\n[Error] ExtendedTTT is not strictly "
+                             "increasing at event "
+                          << current_event - 1U << " (previous=" << last_ttt
+                          << ", current=" << header.ExtendedTTT << ")\n";
+                conversion_failed = true;
+                g_running = 0;
+                break;
+            }
             const uint32_t diff =
                 (header.BoardEventCounter - prev_board_counter) & 0xFFFFFFU;
             if (diff == 0U) {
@@ -1328,6 +1809,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 8; ++i) {
             if ((header.ChannelMask >> i) & 1) active_ch++;
             wave_ch[i].clear();
+            short_charge_ch[i] = 0.0;
             charge_ch[i] = 0.0;
             pulse_height_ch[i] = 0.0; 
             pulse_start_time_ch[i] = -1.0;
@@ -1357,81 +1839,14 @@ int main(int argc, char **argv) {
                 uint16_t* trace_ptr = raw_waveform_buffer.data() + offset;
                 size_t trace_len = header.RecordLength;
 
-                if (trace_len > 0) {
-                    size_t init_window = std::min((size_t)5, trace_len);
-                    double init_base = 0.0;
-                    for (size_t i = 0; i < init_window; ++i) init_base += trace_ptr[i];
-                    init_base /= init_window;
-
-                    size_t baseline_samples = trace_len / 4; 
-                    for (size_t i = init_window; i < trace_len; ++i) {
-                        const double baseline_excursion =
-                            trigger_is_falling
-                                ? init_base - trace_ptr[i]
-                                : trace_ptr[i] - init_base;
-                        if (baseline_excursion > 30.0) {
-                            baseline_samples = (i > 5) ? i - 5 : 1; 
-                            break;
-                        }
-                    }
-                    if (baseline_samples > 150) baseline_samples = 150; 
-                    
-                    double baseline = 0.0;
-                    for(size_t i = 0; i < baseline_samples; ++i) {
-                        baseline += trace_ptr[i];
-                    }
-                    baseline /= baseline_samples;
-                    baseline_ch[ch] = baseline;
-
-                    // ====================================================================
-                    // [핵심 교정] 노이즈 상쇄(Zero-Sum)가 완벽히 적용된 전하량 적분
-                    // ====================================================================
-                    double charge = 0.0;
-                    double pulse_extremum = baseline;
-
-                    if (trigger_is_falling) {
-                        for(size_t i = baseline_samples; i < trace_len; ++i) {
-                            // Preserve the established falling-polarity DSP
-                            // arithmetic exactly.
-                            charge += (baseline - trace_ptr[i]);
-                            if (trace_ptr[i] < pulse_extremum) {
-                                pulse_extremum = trace_ptr[i];
-                            }
-                        }
-                        pulse_height_ch[ch] =
-                            (baseline - pulse_extremum > 0)
-                                ? (baseline - pulse_extremum) : 0.0;
-                    } else {
-                        for(size_t i = baseline_samples; i < trace_len; ++i) {
-                            charge += (trace_ptr[i] - baseline);
-                            if (trace_ptr[i] > pulse_extremum) {
-                                pulse_extremum = trace_ptr[i];
-                            }
-                        }
-                        pulse_height_ch[ch] =
-                            (pulse_extremum - baseline > 0)
-                                ? (pulse_extremum - baseline) : 0.0;
-                    }
-
-                    // Keep signed noise cancellation; only non-positive net
-                    // charge is clipped to zero for either polarity.
-                    charge_ch[ch] = (charge > 0) ? charge : 0.0;
-                    // ====================================================================
-
-                    const double trigger_threshold =
-                        trigger_is_falling ? baseline - 30.0
-                                           : baseline + 30.0;
-                    for(size_t i = baseline_samples; i < trace_len; ++i) {
-                        const bool threshold_crossed =
-                            trigger_is_falling
-                                ? trace_ptr[i] < trigger_threshold
-                                : trace_ptr[i] > trigger_threshold;
-                        if (threshold_crossed) {
-                            pulse_start_time_ch[ch] = i * 2.0; 
-                            break;
-                        }
-                    }
-                }
+                const cpnr::WaveformDspValues dsp = cpnr::ComputeWaveformDsp(
+                    trace_ptr, trace_len, trigger_is_falling,
+                    selected_settings.software_dsp.waveform);
+                baseline_ch[ch] = dsp.baseline;
+                short_charge_ch[ch] = dsp.short_charge;
+                charge_ch[ch] = dsp.charge;
+                pulse_height_ch[ch] = dsp.pulse_height;
+                pulse_start_time_ch[ch] = dsp.pulse_start_ns;
 
                 if (save_waveform || (debug_event_id >= 0 && (int)header.EventID == debug_event_id)) {
                     wave_ch[ch].assign(trace_ptr, trace_ptr + trace_len);
@@ -1545,13 +1960,27 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (g_running && debug_event_id < 0 && verify_runtime_stream_counters &&
+        (current_event != expected_recorded_events ||
+         lost_events != expected_lost_events)) {
+        std::cerr << "\n[Error] Raw stream counters disagree with authenticated "
+                     "RunMetadata: recorded="
+                  << current_event << "/" << expected_recorded_events
+                  << ", lost=" << lost_events << "/"
+                  << expected_lost_events << "\n";
+        conversion_failed = true;
+        g_running = 0;
+    }
+
     if (g_running && debug_event_id < 0) {
         std::cout << "\r\033[K[Progress] 100.0% | Events: " << current_event << " | Done.          \n";
 
-        double real_time_sec = (last_ttt > first_ttt) ? (last_ttt - first_ttt) * 8e-9 : 0.0;
-        double dead_time_sec = total_acquired_samples * 2e-9; 
-        double live_time_sec = real_time_sec - dead_time_sec;
-        if (live_time_sec < 0) live_time_sec = 0.0;
+        const double real_time_sec =
+            dt5730_timing::ElapsedSeconds(first_ttt, last_ttt);
+        const double recorded_window_sum_sec =
+            static_cast<double>(total_acquired_samples) *
+            (dt5730_timing::kAdcSamplePeriodNs /
+             dt5730_timing::kNanosecondsPerSecond);
         
         const long double total_triggers =
             static_cast<long double>(current_event) +
@@ -1561,24 +1990,43 @@ int main(int argc, char **argv) {
                 ? static_cast<double>(static_cast<long double>(lost_events) /
                                       total_triggers * 100.0L)
                 : 0.0;
-        double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
-        
-        double avg_rate = (real_time_sec > 0) ? (current_event / real_time_sec) : 0.0;
+        const double recorded_window_pct =
+            dt5730_timing::RecordedWindowToElapsedPercent(
+                recorded_window_sum_sec, real_time_sec);
+        const double avg_rate =
+            dt5730_timing::AverageRecordedEventRateHz(current_event,
+                                                      real_time_sec);
 
         std::cout << "\n\033[1;36m========== [ ROOT Conversion Summary ] ==========\033[0m\n"
                   << " - Recorded Events : " << current_event << "\n"
-                  << " - Lost Events     : " << lost_events << " (" << std::fixed << std::setprecision(3) << lost_events_pct << " %, Board Buffer Full)\n"
+                  << " - Lost Events     : " << lost_events << " (" << std::fixed << std::setprecision(3) << lost_events_pct << " %, accepted-trigger counter gaps; cause not inferred)\n"
                   << " - HW Real Time    : " << std::fixed << std::setprecision(2) << real_time_sec << " sec\n"
-                  << " - HW Live Time    : " << std::fixed << std::setprecision(2) << live_time_sec << " sec\n"
-                  << " - True Dead Time  : " << std::fixed << std::setprecision(5) << dead_time_pct << " % (Record Window)\n"
+                  << " - Record Windows  : " << std::fixed << std::setprecision(6) << recorded_window_sum_sec << " sec (sum; overlaps possible)\n"
+                  << " - Window / Time   : " << std::fixed << std::setprecision(5) << recorded_window_pct << " % (not dead time)\n"
+                  << " - HW Dead Time    : N/A (no hardware busy/live-time scaler)\n"
                   << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n"
                   << "\033[1;36m=================================================\033[0m\n\n";
 
         if (fOut) {
             fOut->cd();
+            TParameter<int> p_timing_schema("TimingSummarySchema", 2);
+            TParameter<double> p_ttt_lsb(
+                "TriggerTimeTagRawLsb_ns",
+                dt5730_timing::kTriggerTimeTagRawLsbNs);
+            TParameter<double> p_ttt_resolution(
+                "TriggerTimeTagObservableResolution_ns",
+                dt5730_timing::kTriggerTimeTagObservableResolutionNs);
+            TParameter<double> p_adc_period(
+                "ADCSamplePeriod_ns", dt5730_timing::kAdcSamplePeriodNs);
             TParameter<double> p_real("RealTime_sec", real_time_sec);
-            TParameter<double> p_live("LiveTime_sec", live_time_sec);
-            TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
+            TParameter<double> p_window_sum(
+                "RecordedWindowSum_sec", recorded_window_sum_sec);
+            TParameter<double> p_window_ratio(
+                "RecordedWindowToElapsed_pct", recorded_window_pct);
+            TParameter<int> p_dead_available("DeadTimeMeasurementAvailable",
+                                             0);
+            TObjString p_dead_method(
+                "unavailable_no_hardware_busy_or_livetime_scaler");
             TParameter<double> p_rate("TriggerRate_Hz", avg_rate); 
             const uint64_t long64_max = static_cast<uint64_t>(
                 std::numeric_limits<Long64_t>::max());
@@ -1591,8 +2039,15 @@ int main(int argc, char **argv) {
                 TParameter<Long64_t> p_rec(
                     "RecordedEvents_count", static_cast<Long64_t>(current_event));
 
-                if (p_real.Write() <= 0 || p_live.Write() <= 0 ||
-                    p_dead.Write() <= 0 || p_lost.Write() <= 0 ||
+                if (p_timing_schema.Write() <= 0 ||
+                    p_ttt_lsb.Write() <= 0 ||
+                    p_ttt_resolution.Write() <= 0 ||
+                    p_adc_period.Write() <= 0 ||
+                    p_real.Write() <= 0 || p_window_sum.Write() <= 0 ||
+                    p_window_ratio.Write() <= 0 ||
+                    p_dead_available.Write() <= 0 ||
+                    p_dead_method.Write("DeadTimeMethod") <= 0 ||
+                    p_lost.Write() <= 0 ||
                     p_rec.Write() <= 0 || p_rate.Write() <= 0 ||
                     fOut->TestBit(TFile::kWriteError)) {
                     std::cerr << "[Error] ROOT summary write failed\n";

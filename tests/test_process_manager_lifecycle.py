@@ -99,6 +99,7 @@ class ProcessManagerLifecycleTests(unittest.TestCase):
 
         popen.assert_not_called()
         self.assertEqual(finished, [-signal.SIGINT])
+        self.assertTrue(manager.launch_cancelled_before_process)
 
     def test_stop_during_validation_prevents_process_creation(self):
         validation_entered = threading.Event()
@@ -170,6 +171,48 @@ class ProcessManagerLifecycleTests(unittest.TestCase):
         self.assertEqual(fake_process.kill_calls, 1)
         self.assertEqual(fake_process.wait_calls, 0)
 
+    def test_grace_timeout_offers_operator_force_stop_without_blocking(self):
+        manager = self.ProcessManager(
+            ["unused"], graceful_stop_timeout_sec=0.05
+        )
+        fake_process = IgnoringFakeProcess([])
+        offered = []
+        logs = []
+        manager.force_stop_available_signal.connect(lambda: offered.append(True))
+        manager.log_signal.connect(logs.append)
+        with manager._process_lock:
+            manager.process = fake_process
+
+        started = time.monotonic()
+        manager.stop()
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.wait_for(manager.force_stop_is_available)
+        self.assertEqual(fake_process.signals, [signal.SIGINT])
+        self.assertTrue(offered)
+        self.assertEqual(fake_process.kill_calls, 0)
+        self.assertIn("operator force-stop", "\n".join(logs))
+
+        manager.force_stop()
+        self.assertEqual(fake_process.kill_calls, 1)
+        self.assertTrue(manager.force_stop_was_escalated())
+
+    def test_grace_timeout_auto_escalates_during_shutdown(self):
+        manager = self.ProcessManager(
+            ["unused"], graceful_stop_timeout_sec=0.05
+        )
+        fake_process = IgnoringFakeProcess([])
+        escalated = []
+        manager.auto_force_escalated_signal.connect(
+            lambda: escalated.append(True)
+        )
+        with manager._process_lock:
+            manager.process = fake_process
+
+        manager.stop(auto_force=True)
+        self.wait_for(lambda: fake_process.kill_calls == 1)
+        self.assertTrue(manager.force_stop_was_escalated())
+        self.assertTrue(escalated)
+
     @unittest.skipUnless(os.name == "posix", "SIGINT integration is POSIX-only")
     def test_real_child_gracefully_finalizes_without_blocking_stop(self):
         child = """
@@ -202,6 +245,35 @@ while True:
         self.assertIn("child-finalized", logs)
         self.assertEqual(finished, [0])
 
+    @unittest.skipUnless(os.name == "posix", "signal integration is POSIX-only")
+    def test_real_sigint_ignoring_child_is_auto_killed_after_bound(self):
+        child = """
+import signal
+import time
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+print("child-ready", flush=True)
+while True:
+    time.sleep(0.05)
+"""
+        logs = []
+        finished = []
+        manager = self.ProcessManager(
+            [sys.executable, "-u", "-c", child],
+            graceful_stop_timeout_sec=0.1,
+        )
+        manager.log_signal.connect(logs.append)
+        manager.finished_signal.connect(finished.append)
+        manager.start()
+        self.wait_for(lambda: "child-ready" in logs)
+
+        manager.stop(auto_force=True)
+        self.wait_for_thread(manager)
+
+        self.assertTrue(manager.force_stop_was_escalated())
+        self.assertEqual(finished, [-signal.SIGKILL])
+        self.assertIn("automatically force-stopping", "\n".join(logs))
+
 
 class FakeProcess:
     def __init__(self, lines):
@@ -227,6 +299,11 @@ class FakeProcess:
     def kill(self):
         self.kill_calls += 1
         self.returncode = -signal.SIGKILL
+
+
+class IgnoringFakeProcess(FakeProcess):
+    def send_signal(self, requested_signal):
+        self.signals.append(requested_signal)
 
 
 if __name__ == "__main__":

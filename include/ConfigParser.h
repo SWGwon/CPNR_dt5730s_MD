@@ -11,8 +11,12 @@
 #include <stdexcept>
 
 class ConfigParser {
+public:
+    using KeyValueMap = std::map<std::string, std::string>;
+    using SectionMap = std::map<std::string, KeyValueMap>;
+
 private:
-    std::map<std::string, std::map<std::string, std::string>> data_;
+    SectionMap data_;
 
     // [핵심] 문자열 양끝의 스페이스, 탭, 캐리지리턴(\r) 및 복붙 시 딸려오는 NBSP 제거
     static std::string trim(const std::string& str) {
@@ -33,6 +37,7 @@ private:
         std::string line, current_section;
         std::set<std::string> declared_sections;
         size_t line_number = 0;
+        size_t parsed_entry_count = 0;
         while (std::getline(file, line)) {
             ++line_number;
             line = trim(line);
@@ -58,6 +63,9 @@ private:
                                              source_name + " at line " +
                                              std::to_string(line_number));
                 }
+                // Preserve declared-but-empty sections so schema validation
+                // cannot miss an unknown section simply because it has no key.
+                data_.try_emplace(current_section);
             } else {
                 size_t eq_pos = line.find('=');
                 if (eq_pos == std::string::npos || current_section.empty()) {
@@ -82,13 +90,14 @@ private:
                                              std::to_string(line_number));
                 }
                 section[key] = val;
+                ++parsed_entry_count;
             }
         }
 
         if (file.bad()) {
             throw std::runtime_error("Error while reading config: " + source_name);
         }
-        if (data_.empty()) {
+        if (parsed_entry_count == 0U) {
             throw std::runtime_error("Config contains no settings: " + source_name);
         }
     }
@@ -169,6 +178,11 @@ public:
         if (value_it == section_it->second.end()) return default_val;
         return value_it->second;
     }
+
+    // DAQConfig validates the complete parsed schema before consuming any
+    // values.  Exposing a const view prevents typos from being silently
+    // ignored by optional getters while keeping ConfigParser generally useful.
+    const SectionMap& GetSections() const noexcept { return data_; }
 
 private:
     ConfigParser() = default;

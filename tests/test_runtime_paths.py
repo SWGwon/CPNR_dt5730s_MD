@@ -28,6 +28,7 @@ from core.runtime_paths import (  # noqa: E402
     frontend_expected_absent_paths,
     inspect_output_filesystem,
     metadata_status_paths,
+    pin_verified_executable,
     raw_partial_path,
     raw_event_size_bytes,
     production_sources,
@@ -110,6 +111,8 @@ class RuntimePathTests(unittest.TestCase):
                       frontend_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "src" / "Sha256.cpp",
                       production_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "WaveformDsp.cpp",
+                      production_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "include" / "Sha256.h",
                       production_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "src" / "RootValidator.cpp",
@@ -117,6 +120,10 @@ class RuntimePathTests(unittest.TestCase):
         self.assertIn(PROJECT_ROOT / "src" / "DAQConfig.cpp",
                       root_validator_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "src" / "Sha256.cpp",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "RawRootFidelity.cpp",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "WaveformDsp.cpp",
                       root_validator_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "include" / "DAQConfig.h",
                       root_validator_sources(PROJECT_ROOT))
@@ -344,6 +351,16 @@ class RuntimePathTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeValidationError):
             build_root_validation_arguments("/data/run.root", max_events=-1)
+        self.assertEqual(
+            build_root_validation_arguments(
+                "/data/run.root", raw_fidelity=True
+            ),
+            ["-i", "/data/run.root", "--raw-fidelity"],
+        )
+        with self.assertRaises(RuntimeValidationError):
+            build_root_validation_arguments(
+                "/data/run.root", max_events=1, raw_fidelity=True
+            )
 
     def test_non_positive_run_number_is_rejected(self):
         with self.assertRaises(RuntimeValidationError):
@@ -375,6 +392,105 @@ class RuntimePathTests(unittest.TestCase):
             executable.write_text("changed binary", encoding="utf-8")
             with self.assertRaises(RuntimeValidationError):
                 verify_expected_hashes(expected)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "procfd executable pinning is Linux-only"
+    )
+    def test_pinned_executable_keeps_verified_inode_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            executable = directory / "validator"
+            executable.write_bytes(b"verified executable bytes\n")
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+            identity, descriptor, launch_path = pin_verified_executable(
+                executable, []
+            )
+            try:
+                pinned_status = os.stat(launch_path)
+                original_status = executable.stat()
+                self.assertEqual(
+                    (pinned_status.st_dev, pinned_status.st_ino),
+                    (original_status.st_dev, original_status.st_ino),
+                )
+                self.assertEqual(
+                    launch_path, f"/proc/{os.getpid()}/fd/{descriptor}"
+                )
+                self.assertFalse(os.get_inheritable(descriptor))
+                self.assertEqual(
+                    Path(launch_path).read_bytes(),
+                    b"verified executable bytes\n",
+                )
+
+                replacement = directory / "replacement"
+                replacement.write_bytes(b"unverified replacement\n")
+                replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+                os.replace(replacement, executable)
+
+                self.assertEqual(executable.read_bytes(), b"unverified replacement\n")
+                self.assertEqual(
+                    Path(launch_path).read_bytes(),
+                    b"verified executable bytes\n",
+                )
+                self.assertNotEqual(
+                    executable.stat().st_ino, os.fstat(descriptor).st_ino
+                )
+                self.assertEqual(identity["path"], str(executable.resolve()))
+                self.assertEqual(identity["inode"], os.fstat(descriptor).st_ino)
+            finally:
+                os.close(descriptor)
+            self.assertFalse(os.path.exists(launch_path))
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "procfd executable pinning is Linux-only"
+    )
+    def test_pinned_executable_rejects_open_to_path_swap_and_closes_fd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            executable = directory / "validator"
+            replacement = directory / "replacement"
+            executable.write_bytes(b"first inode\n")
+            replacement.write_bytes(b"second inode\n")
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+            real_open = os.open
+            real_stat = os.stat
+            opened_descriptors = []
+            swapped = False
+
+            def capture_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened_descriptors.append(descriptor)
+                return descriptor
+
+            def swap_before_path_check(path, *args, **kwargs):
+                nonlocal swapped
+                if (
+                    not swapped
+                    and Path(path) == executable
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    swapped = True
+                    os.replace(replacement, executable)
+                return real_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch(
+                    "core.runtime_paths.os.open", side_effect=capture_open
+                ),
+                mock.patch(
+                    "core.runtime_paths.os.stat", side_effect=swap_before_path_check
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeValidationError, "다른 inode"
+                ):
+                    pin_verified_executable(executable, [])
+
+            self.assertTrue(swapped)
+            self.assertEqual(len(opened_descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened_descriptors[0])
 
     def test_deployed_gui_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

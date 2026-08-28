@@ -1,8 +1,10 @@
 import os
 import configparser
+import hashlib
 import json
 import re
 import math
+import stat
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
                              QGroupBox, QSpinBox, QComboBox, QFileDialog, QMessageBox)
@@ -64,8 +66,176 @@ def validate_stop_condition(stop_index, max_events, run_time_sec):
         raise ValueError(f"알 수 없는 Stop Cond 선택값입니다: {stop_index}")
 
 
+MAX_TERMINAL_METADATA_BYTES = 4 * 1024 * 1024
+TERMINAL_ACQUISITION_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _absolute_path(value):
+    return os.path.abspath(os.path.expanduser(os.fspath(value)))
+
+
+def _require_matching_path(document, field, expected):
+    observed = document.get(field)
+    if not isinstance(observed, str) or not observed:
+        raise ValueError(f"runtime metadata {field} is missing")
+    if _absolute_path(observed) != _absolute_path(expected):
+        raise ValueError(f"runtime metadata {field} does not match the launch")
+
+
+def _require_matching_sha256(document, field, expected):
+    observed = document.get(field)
+    if (
+        not isinstance(observed, str)
+        or len(observed) != 64
+        or any(character not in "0123456789abcdef" for character in observed)
+    ):
+        raise ValueError(f"runtime metadata {field} is not lowercase SHA-256")
+    if observed != expected:
+        raise ValueError(f"runtime metadata {field} does not match the launch")
+
+
+def _read_stable_terminal_metadata(metadata_path):
+    path = _absolute_path(metadata_path)
+    with open(path, "rb") as metadata_file:
+        before = os.fstat(metadata_file.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("runtime metadata is not a regular file")
+        if before.st_size > MAX_TERMINAL_METADATA_BYTES:
+            raise ValueError("runtime metadata exceeds the 4 MiB safety limit")
+        payload = metadata_file.read(MAX_TERMINAL_METADATA_BYTES + 1)
+        after = os.fstat(metadata_file.fileno())
+    before_identity = (
+        before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev, after.st_ino, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns,
+    )
+    if before_identity != after_identity or len(payload) != before.st_size:
+        raise ValueError("runtime metadata changed while it was read")
+    try:
+        document = json.loads(payload.decode("utf-8", errors="strict"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("runtime metadata is not valid UTF-8") from exc
+    if not isinstance(document, dict):
+        raise ValueError("runtime metadata must be a JSON object")
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    identity = file_identity(path)
+    if identity["sha256"] != payload_sha256:
+        raise ValueError("runtime metadata path changed after it was read")
+    return document, identity
+
+
+def load_terminal_run_metadata(metadata_path, context):
+    """Return identity-bound canonical terminal truth for one launched run."""
+
+    if not isinstance(context, dict):
+        raise ValueError("launched run context is unavailable")
+    required_context = (
+        "raw_file", "metadata_path", "run_number", "config_path",
+        "config_sha256", "frontend_path", "frontend_sha256",
+    )
+    missing = [key for key in required_context if not context.get(key)]
+    if missing:
+        raise ValueError(
+            "launched run context is missing identity fields: "
+            + ", ".join(missing)
+        )
+    if _absolute_path(metadata_path) != _absolute_path(context["metadata_path"]):
+        raise ValueError("terminal metadata path differs from the launched run")
+
+    document, identity = _read_stable_terminal_metadata(metadata_path)
+    if document.get("schema_version") != 2:
+        raise ValueError("runtime metadata schema_version must be 2")
+    if document.get("run_number") != int(context["run_number"]):
+        raise ValueError("runtime metadata run_number does not match the launch")
+    status = document.get("acquisition_status")
+    if status not in TERMINAL_ACQUISITION_STATUSES:
+        raise ValueError(
+            "runtime metadata acquisition_status is not terminal"
+        )
+
+    _require_matching_path(
+        document, "requested_raw_output_path", context["raw_file"]
+    )
+    _require_matching_path(document, "metadata_path", context["metadata_path"])
+    _require_matching_path(document, "config_path", context["config_path"])
+    _require_matching_path(document, "binary_path", context["frontend_path"])
+    _require_matching_sha256(
+        document, "config_sha256", context["config_sha256"]
+    )
+    _require_matching_sha256(
+        document, "binary_sha256", context["frontend_sha256"]
+    )
+
+    published = document.get("raw_output_published")
+    finalized = document.get("raw_output_finalized")
+    if not isinstance(published, bool) or not isinstance(finalized, bool):
+        raise ValueError("runtime metadata raw publication flags are invalid")
+    if published:
+        _require_matching_path(document, "raw_output_path", context["raw_file"])
+        if not os.path.isfile(context["raw_file"]):
+            raise ValueError("published raw output is missing")
+
+    failure_reason = document.get("failure_reason")
+    termination_reason = document.get("termination_reason")
+    if not isinstance(termination_reason, str) or not termination_reason:
+        raise ValueError("runtime metadata termination_reason is missing")
+    if status == "completed":
+        if termination_reason not in {
+            "event_limit", "time_limit", "operator_stop", "completed"
+        }:
+            raise ValueError("completed metadata has an invalid termination_reason")
+        if failure_reason is not None:
+            raise ValueError("completed metadata contains a failure_reason")
+        if not published or not finalized:
+            raise ValueError("completed metadata does not confirm raw finalization")
+        if document.get("raw_finalization_error") is not None:
+            raise ValueError("completed metadata contains raw_finalization_error")
+    elif status == "failed":
+        if not isinstance(failure_reason, str) or not failure_reason:
+            raise ValueError("failed metadata requires failure_reason")
+    else:
+        if not termination_reason.startswith("cancelled_"):
+            raise ValueError("cancelled metadata has an invalid termination_reason")
+        if failure_reason is not None:
+            raise ValueError("cancelled metadata contains failure_reason")
+
+    if finalized:
+        output_size = document.get("raw_output_size_bytes")
+        event_bytes = document.get("raw_event_bytes")
+        recorded_events = document.get("recorded_events")
+        last_complete_offset = document.get("last_complete_offset")
+        for name, value in (
+            ("raw_output_size_bytes", output_size),
+            ("raw_event_bytes", event_bytes),
+            ("recorded_events", recorded_events),
+            ("last_complete_offset", last_complete_offset),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"runtime metadata {name} is invalid")
+        if event_bytes <= 0:
+            raise ValueError("runtime metadata raw_event_bytes must be positive")
+        if recorded_events * event_bytes != output_size:
+            raise ValueError("runtime metadata raw event accounting is inconsistent")
+        if last_complete_offset != output_size:
+            raise ValueError("runtime metadata complete offset is inconsistent")
+        digest = document.get("raw_output_sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("runtime metadata raw_output_sha256 is invalid")
+        if published and os.path.getsize(context["raw_file"]) != output_size:
+            raise ValueError("published raw size differs from terminal metadata")
+
+    return document, identity
+
+
 def load_completed_run_metadata(metadata_path, raw_path, run_number):
-    """Validate the terminal sidecar before treating rc=0 as DAQ success."""
+    """Legacy structural check; DAQ lifecycle uses identity-bound validation."""
 
     with open(metadata_path, "r", encoding="utf-8") as metadata_file:
         document = json.load(metadata_file)
@@ -375,12 +545,12 @@ class DaqTab(QWidget):
         dash_layout.addWidget(QLabel("Storage:", styleSheet=lbl_style), 0, 0); self.val_disk = QLabel("Checking...", styleSheet=self.val_style); dash_layout.addWidget(self.val_disk, 0, 1)
         dash_layout.addWidget(QLabel("Batch/Scan:", styleSheet=lbl_style), 0, 2); self.val_batch = QLabel("1/1", styleSheet=self.val_style); dash_layout.addWidget(self.val_batch, 0, 3)
         
-        dash_layout.addWidget(QLabel("Live Time:", styleSheet=lbl_style), 0, 4); self.val_live_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_live_time, 0, 5)
+        dash_layout.addWidget(QLabel("HW Real Time:", styleSheet=lbl_style), 0, 4); self.val_real_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_real_time, 0, 5)
         dash_layout.addWidget(QLabel("Events:", styleSheet=lbl_style), 0, 6); self.val_events = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_events, 0, 7)
         
         dash_layout.addWidget(QLabel("Data Speed:", styleSheet=lbl_style), 1, 0); self.val_speed = QLabel("0.00 MB/s", styleSheet=self.val_style); dash_layout.addWidget(self.val_speed, 1, 1)
-        dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 2); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 3)
-        dash_layout.addWidget(QLabel("Dead Time:", styleSheet=lbl_style), 1, 4); self.val_dead_time = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_dead_time, 1, 5)
+        dash_layout.addWidget(QLabel("Pub Send Fail:", styleSheet=lbl_style), 1, 2); self.val_pub_send_failures = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_pub_send_failures, 1, 3)
+        dash_layout.addWidget(QLabel("Record Window:", styleSheet=lbl_style), 1, 4); self.val_record_window = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_record_window, 1, 5)
         
         # =========================================================================
         # [신규 추가] 레이아웃 우측 하단에 Trig Rate 블록 추가
@@ -754,7 +924,7 @@ class DaqTab(QWidget):
 
     def update_dashboard(self, stats):
         self.last_stats = stats
-        self.val_live_time.setText(stats.get('live_time', stats.get('Live', '0.0 s')))
+        self.val_real_time.setText(stats.get('real_time', '0.0 s'))
         self.val_events.setText(stats.get('events', stats.get('Events', '0')))
         self.val_speed.setText(stats.get('speed', stats.get('Speed', '0.00 MB/s'))) 
         
@@ -768,17 +938,25 @@ class DaqTab(QWidget):
         self.val_rate.setText(rate_val)
         # =========================================================================
         
-        dt_str = stats.get('dead_time', stats.get('DT', '0.000 %'))
-        self.val_dead_time.setText(dt_str)
+        window_str = stats.get('window_load', '0.000 %')
+        self.val_record_window.setText(window_str)
         try:
-            dt_val = float(dt_str.replace('%', '').strip())
-            self.val_dead_time.setStyleSheet(self.val_style_warn if dt_val > 5.0 else self.val_style)
+            window_value = float(window_str.replace('%', '').strip())
+            # Above 100% means event record windows overlap in time.  This is
+            # not hardware dead time, but is useful as a high-rate warning.
+            self.val_record_window.setStyleSheet(
+                self.val_style_warn if window_value > 100.0 else self.val_style
+            )
         except ValueError:
             pass
 
-        drops = parse_drop_count(stats.get('drops', stats.get('Drops', '0')))
-        self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
-        self.val_drops.setText(str(drops))
+        send_failures = parse_drop_count(
+            stats.get('publisher_send_failures', '0')
+        )
+        self.val_pub_send_failures.setStyleSheet(
+            self.val_style_warn if send_failures > 0 else self.val_style
+        )
+        self.val_pub_send_failures.setText(str(send_failures))
 
     @pyqtSlot(str)
     def handle_fatal_error(self, err_type):
@@ -1131,6 +1309,7 @@ class DaqTab(QWidget):
     def restore_run_controls(self):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop DAQ")
         self.combo_mode.setEnabled(True)
         self.combo_stop_cond.setEnabled(True)
         self.spin_run_no.setEnabled(True)
@@ -1298,6 +1477,12 @@ class DaqTab(QWidget):
         self.daq_process.led_signal.connect(self.hardware_led_signal.emit)
         self.daq_process.temp_signal.connect(self.hardware_temp_signal.emit)
         self.daq_process.fatal_signal.connect(self.handle_fatal_error)
+        self.daq_process.force_stop_available_signal.connect(
+            self._offer_daq_force_stop
+        )
+        self.daq_process.auto_force_escalated_signal.connect(
+            self._report_daq_auto_force_stop
+        )
         self.daq_process.finished_signal.connect(self.on_batch_finished)
         # Emit the public completion signal only after on_batch_finished has
         # persisted terminal state and recovered the controls.
@@ -1312,21 +1497,20 @@ class DaqTab(QWidget):
             if self.current_run_context else None
         )
         metadata_error = None
-        metadata_valid = False
+        terminal_document = None
         metadata_path = context.get("metadata_path") if context else None
-        if returncode == 0 and context:
+        if context and metadata_path and os.path.isfile(metadata_path):
             try:
-                load_completed_run_metadata(
-                    metadata_path,
-                    context["raw_file"],
-                    context["run_number"],
+                terminal_document, metadata_identity = (
+                    load_terminal_run_metadata(metadata_path, context)
                 )
-                metadata_identity = file_identity(metadata_path)
                 context["metadata_sha256"] = metadata_identity["sha256"]
                 context["metadata_exists"] = True
-                metadata_valid = True
+                context["terminal_acquisition_status"] = (
+                    terminal_document["acquisition_status"]
+                )
                 self.append_log(
-                    f"[Runtime] Completed metadata: "
+                    "[Runtime] Identity-validated terminal metadata: "
                     f"{identity_summary(metadata_identity)}"
                 )
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1335,31 +1519,71 @@ class DaqTab(QWidget):
                     metadata_path and os.path.isfile(metadata_path)
                 )
                 self.append_log(
-                    "[Provenance Error] Frontend가 성공 종료했지만 terminal "
+                    "[Provenance Error] Canonical terminal "
                     f"metadata를 신뢰할 수 없습니다: {metadata_path} ({exc})"
                 )
-        elif returncode == 0:
-            metadata_error = "completed frontend has no in-memory run context"
+        elif not context:
+            metadata_error = "launched frontend has no in-memory run context"
+        else:
+            context["metadata_exists"] = False
+            metadata_error = (
+                "canonical terminal metadata is missing; process outcome is "
+                "interrupted/unknown"
+            )
 
-        if returncode == 0 and metadata_valid:
-            db_status = "daq_completed"
-        elif self.stop_requested:
+        if terminal_document is not None:
+            terminal_status = terminal_document["acquisition_status"]
+            db_status = {
+                "completed": "daq_completed",
+                "failed": "daq_failed",
+                "cancelled": "daq_cancelled",
+            }[terminal_status]
+            if returncode != 0 or self.stop_requested:
+                self.append_log(
+                    "[Lifecycle] Terminal sidecar truth takes precedence over "
+                    f"return code/stop intent: status={terminal_status}, "
+                    f"exit={returncode}, stop_requested={self.stop_requested}."
+                )
+        elif (
+            self.daq_process
+            and getattr(
+                self.daq_process, "launch_cancelled_before_process", False
+            )
+        ):
             db_status = "daq_cancelled"
+            metadata_error = "launch was cancelled before frontend creation"
         elif self.daq_process and not self.daq_process.process_started:
             db_status = "daq_launch_failed"
         else:
             db_status = "daq_failed"
+            self.append_log(
+                "[Lifecycle Unknown] Frontend 종료를 terminal sidecar로 확인할 "
+                "수 없어 interrupted/unknown으로 보존합니다. Stop 요청 여부만으로 "
+                "cancelled를 추정하지 않습니다."
+            )
         if self.current_run_id > 0:
             try:
-                error_message = (
-                    None if db_status == "daq_completed"
-                    else metadata_error
-                    or (
+                if db_status == "daq_completed":
+                    error_message = None
+                elif db_status == "daq_launch_failed":
+                    error_message = (
                         self.daq_process.failure_message
                         if self.daq_process else ""
+                    ) or metadata_error or "frontend launch failed"
+                elif terminal_document is not None:
+                    error_message = (
+                        terminal_document.get("failure_reason")
+                        or terminal_document.get("termination_reason")
                     )
-                    or f"frontend exit code {returncode}"
-                )
+                else:
+                    error_message = (
+                        metadata_error
+                        or (
+                            self.daq_process.failure_message
+                            if self.daq_process else ""
+                        )
+                        or f"frontend exit code {returncode}"
+                    )
                 if db_status == "daq_launch_failed":
                     self.db.mark_daq_launch_failed(
                         self.current_run_id,
@@ -1399,15 +1623,52 @@ class DaqTab(QWidget):
             self.current_batch += 1
             self.launch_current_batch()
         else:
-            self.append_log("\n========== [ All DAQ Sequences Completed ] ==========")
+            if db_status == "daq_completed":
+                self.append_log(
+                    "\n========== [ All DAQ Sequences Completed ] =========="
+                )
+            else:
+                self.append_log(
+                    "\n========== [ DAQ Sequence Ended: "
+                    f"{db_status} ] =========="
+                )
             self.restore_run_controls()
             
             self.spin_run_no.setValue(self.current_run_no + 1)
             self.save_settings()
 
-    def stop_all(self):
+    @pyqtSlot()
+    def _offer_daq_force_stop(self):
+        self.append_log(
+            "[Warning] DAQ가 graceful-stop 제한시간 안에 종료되지 않았습니다. "
+            "raw/metadata가 아직 finalize되지 않았을 수 있습니다. 계속 실행 중인 "
+            "child를 종료하려면 Force Stop DAQ를 누르십시오."
+        )
+        self.btn_stop.setText("Force Stop DAQ")
+        self.btn_stop.setEnabled(True)
+
+    @pyqtSlot()
+    def _report_daq_auto_force_stop(self):
+        self.append_log(
+            "[Warning] 애플리케이션 종료 제한시간이 지나 DAQ child를 자동 "
+            "force-stop했습니다. Terminal sidecar가 없으면 결과는 "
+            "interrupted/unknown입니다."
+        )
+        self.btn_stop.setEnabled(False)
+
+    def stop_all(self, auto_force=False):
         self.total_batches = 0
         self.stop_requested = True
         if self.daq_process:
+            if (
+                not auto_force
+                and hasattr(self.daq_process, "force_stop_is_available")
+                and self.daq_process.force_stop_is_available()
+            ):
+                self.btn_stop.setEnabled(False)
+                self.daq_process.force_stop()
+                return
             # ProcessManager latches this even before QThread/Popen starts.
-            self.daq_process.stop()
+            self.btn_stop.setText("Stopping DAQ…")
+            self.btn_stop.setEnabled(False)
+            self.daq_process.stop(auto_force=bool(auto_force))
