@@ -8,11 +8,17 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -Wall -Wextra -pthread
 # Re-run configure before a build whenever provenance-relevant source/config or
 # the current main ref/index changes. This keeps embedded commit/dirty stamps
 # from silently lagging behind a plain `cmake --build` invocation.
-file(GLOB_RECURSE CPNR_PROVENANCE_INPUTS LIST_DIRECTORIES false
+file(GLOB_RECURSE CPNR_PROVENANCE_INPUTS CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
     "${CMAKE_SOURCE_DIR}/src/*" "${CMAKE_SOURCE_DIR}/include/*"
     "${CMAKE_SOURCE_DIR}/gui/*" "${CMAKE_SOURCE_DIR}/config/*"
-    "${CMAKE_SOURCE_DIR}/tests/*" "${CMAKE_SOURCE_DIR}/README.md"
-    "${CMAKE_SOURCE_DIR}/CMakeLists.txt")
+    "${CMAKE_SOURCE_DIR}/tests/*")
+list(FILTER CPNR_PROVENANCE_INPUTS EXCLUDE REGEX
+    "/__pycache__/|\\.py[co]$")
+list(APPEND CPNR_PROVENANCE_INPUTS
+    "${CMAKE_SOURCE_DIR}/README.md"
+    "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+    "${CMAKE_SOURCE_DIR}/requirements.txt")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CPNR_PROVENANCE_INPUTS}
     "${CMAKE_SOURCE_DIR}/.git/HEAD"
@@ -123,7 +129,8 @@ if(BUILD_DAQ_APPLICATIONS)
   endif()
   execute_process(
       COMMAND git status --porcelain --untracked-files=all --
-              CMakeLists.txt README.md src include gui config tests
+              CMakeLists.txt README.md requirements.txt
+              src include gui config tests
               ":(exclude,glob)gui/**/__pycache__/**"
               ":(exclude,glob)gui/**/*.pyc"
               ":(exclude,glob)tests/**/__pycache__/**"
@@ -161,18 +168,103 @@ if(BUILD_DAQ_APPLICATIONS)
   # [Tier 1] Frontend
   if(BUILD_DAQ_FRONTEND)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(ZMQ REQUIRED libzmq)
+    pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+    find_package(Threads REQUIRED)
+
+    set(CAEN_ROOT "" CACHE PATH
+        "CAEN SDK prefix containing include/ and lib/ (or lib64/)")
+    set(_CAEN_HINTS ${CAEN_ROOT} $ENV{CAEN_ROOT})
+    set(_CAEN_SEARCH_MODE)
+    if(CAEN_ROOT OR NOT "$ENV{CAEN_ROOT}" STREQUAL "")
+      # An explicit SDK prefix is authoritative. Do not silently combine its
+      # header with ABI-incompatible CAEN libraries from a system location.
+      set(_CAEN_SEARCH_MODE NO_DEFAULT_PATH)
+    endif()
+    find_path(CAENDIGITIZER_INCLUDE_DIR
+        NAMES CAENDigitizer.h
+        HINTS ${_CAEN_HINTS}
+        PATH_SUFFIXES include
+        ${_CAEN_SEARCH_MODE})
+    find_library(CAENDIGITIZER_LIBRARY
+        NAMES CAENDigitizer
+        HINTS ${_CAEN_HINTS}
+        PATH_SUFFIXES lib lib64
+        ${_CAEN_SEARCH_MODE})
+    find_library(CAENCOMM_LIBRARY
+        NAMES CAENComm
+        HINTS ${_CAEN_HINTS}
+        PATH_SUFFIXES lib lib64
+        ${_CAEN_SEARCH_MODE})
+    find_library(CAENVME_LIBRARY
+        NAMES CAENVME
+        HINTS ${_CAEN_HINTS}
+        PATH_SUFFIXES lib lib64
+        ${_CAEN_SEARCH_MODE})
+    find_library(LIBUSB_LIBRARY
+        NAMES usb-1.0
+        HINTS ${_CAEN_HINTS}
+        PATH_SUFFIXES lib lib64)
+    if(NOT CAENDIGITIZER_INCLUDE_DIR OR
+       NOT CAENDIGITIZER_LIBRARY OR
+       NOT CAENCOMM_LIBRARY OR
+       NOT CAENVME_LIBRARY OR
+       NOT LIBUSB_LIBRARY)
+      message(FATAL_ERROR
+          "CAEN SDK not found. Install CAENVMELib, CAENComm, and "
+          "CAENDigitizer plus libusb-1.0, or configure with "
+          "-DCAEN_ROOT=<prefix>. "
+          "Found header='${CAENDIGITIZER_INCLUDE_DIR}', "
+          "Digitizer='${CAENDIGITIZER_LIBRARY}', "
+          "Comm='${CAENCOMM_LIBRARY}', VME='${CAENVME_LIBRARY}', "
+          "libusb='${LIBUSB_LIBRARY}'.")
+    endif()
+
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${CAENDIGITIZER_INCLUDE_DIR})
+    set(CMAKE_REQUIRED_LIBRARIES
+        ${CAENDIGITIZER_LIBRARY} ${CAENCOMM_LIBRARY} ${CAENVME_LIBRARY}
+        ${LIBUSB_LIBRARY})
+    unset(CAEN_HAS_OPEN_DIGITIZER2 CACHE)
+    check_cxx_source_compiles(
+        "#include <CAENDigitizer.h>\nint main() { int handle = -1; return CAEN_DGTZ_OpenDigitizer2(CAEN_DGTZ_USB, nullptr, 0, 0, &handle); }"
+        CAEN_HAS_OPEN_DIGITIZER2)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(NOT CAEN_HAS_OPEN_DIGITIZER2)
+      message(FATAL_ERROR
+          "The selected CAENDigitizer SDK does not provide "
+          "CAEN_DGTZ_OpenDigitizer2. Install CAENDigitizer >= 2.17.0.")
+    endif()
+
     add_executable(frontend_dt5730
         src/frontend_dt5730.cpp
         src/DAQManager.cpp
         src/DAQConfig.cpp
         src/TriggerCalibration.cpp
         src/Sha256.cpp)
-    target_include_directories(frontend_dt5730 PRIVATE include ${ZMQ_INCLUDE_DIRS})
+    target_include_directories(frontend_dt5730 PRIVATE
+        include ${CAENDIGITIZER_INCLUDE_DIR})
     target_compile_definitions(frontend_dt5730 PRIVATE
         CPNR_GIT_COMMIT="${CPNR_GIT_COMMIT}"
         CPNR_BUILD_TIMESTAMP="${CPNR_BUILD_TIMESTAMP}")
-    target_link_libraries(frontend_dt5730 ${ZMQ_LIBRARIES} CAENDigitizer CAENComm CAENVME pthread)
+    # Ubuntu links with --as-needed by default. Keep CAEN's transitive runtime
+    # stack as direct ELF dependencies so the executable RUNPATH also resolves
+    # CAENDigitizer -> CAENComm -> CAENVME -> libusb without LD_LIBRARY_PATH.
+    if(UNIX AND NOT APPLE)
+      target_link_options(frontend_dt5730 PRIVATE "LINKER:--no-as-needed")
+    endif()
+    target_link_libraries(frontend_dt5730 PRIVATE
+        PkgConfig::ZMQ
+        ${CAENDIGITIZER_LIBRARY}
+        ${CAENCOMM_LIBRARY}
+        ${CAENVME_LIBRARY}
+        ${LIBUSB_LIBRARY}
+        Threads::Threads)
+    message(STATUS "CAEN SDK include: ${CAENDIGITIZER_INCLUDE_DIR}")
+    message(STATUS "CAENDigitizer library: ${CAENDIGITIZER_LIBRARY}")
+    message(STATUS "CAENComm library: ${CAENCOMM_LIBRARY}")
+    message(STATUS "CAENVME library: ${CAENVME_LIBRARY}")
+    message(STATUS "libusb library: ${LIBUSB_LIBRARY}")
   endif()
 
   # [Tier 2] Production
@@ -208,9 +300,13 @@ if(BUILD_DAQ_APPLICATIONS)
   # ==============================================================================
   # [Requirement] GUI Deployment Automation
   # ==============================================================================
-  # 1. GUI/config deployment is an explicit always-built target, so a stale
-  #    bin/gui cannot survive a production-only or frontend-disabled rebuild.
+  # 1. GUI/config deployment is an explicit always-built target. Remove only
+  #    the generated GUI destination first so deleted/renamed source modules
+  #    cannot survive there; keep bin/config because it may contain run-time
+  #    configuration edited by the operator.
   add_custom_target(deploy_runtime ALL
+      COMMAND ${CMAKE_COMMAND} -E rm -rf
+      ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gui
       COMMAND ${CMAKE_COMMAND} -E copy_directory
       ${CMAKE_SOURCE_DIR}/gui ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gui
       COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -218,8 +314,19 @@ if(BUILD_DAQ_APPLICATIONS)
       COMMENT "Deploying GUI and configuration files to bin/..."
   )
 
-  # 2. 메인 GUI 실행을 위한 래퍼 셸 스크립트 자동 생성
-  # 작업 디렉토리를 항상 'bin/'으로 고정하여 상대 경로(config, data) 탐색 시 혼선 방지
-  file(WRITE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/daq_gui "#!/bin/bash\ncd \"\$(dirname \"\$0\")\"\npython3 gui/main.py \"\$@\"\n")
+  # 2. 메인 GUI 실행을 위한 래퍼 셸 스크립트 자동 생성. 프로젝트의
+  # build/venv를 우선 사용하되, 시스템 설치를 사용하는 기존 환경도 유지합니다.
+  # 작업 디렉토리는 항상 bin/으로 고정합니다.
+  file(WRITE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/daq_gui [=[#!/bin/bash
+set -euo pipefail
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
+python_bin="$project_root/build/venv/bin/python"
+if [[ ! -x "$python_bin" ]]; then
+  python_bin="$(command -v python3)"
+fi
+cd "$script_dir"
+exec "$python_bin" gui/main.py "$@"
+]=])
   execute_process(COMMAND chmod +x ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/daq_gui)
 endif()

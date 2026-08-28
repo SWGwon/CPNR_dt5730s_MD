@@ -120,11 +120,13 @@ CPNR_dt5730s/
   * `CAENUSB` (USB 커널 드라이버)
   * `CAENVME` (CAENVMELib)
   * `CAENComm`
-  * `CAENDigitizer` (v1.0 버전)
+  * `CAENDigitizer` 2.17.0 이상
+    (`Digitizer 1.0`은 장비/API 세대명이며 라이브러리 버전 1.0을 뜻하지 않습니다.)
   > ⚠️ **[주의] 커널(Kernel) 업데이트 관련:** Linux OS의 커널 버전이 업데이트될 경우, 기존에 빌드된 `CAENUSB` 커널 모듈(드라이버)의 종속성이 끊어져 장치를 인식하지 못합니다. **OS 커널 업데이트 직후에는 반드시 `CAENUSB` 소스 디렉토리로 이동하여 설치 스크립트(예: `sudo sh install` 을 이용한 DKMS 빌드)를 재실행**해야 합니다.
   > 신형 장비 경우 `libusb-1.0` 라이브러리를 이용함에 따라 커널 모듈 종속성에 대하여 유연하게 대처할 수 있습니다. 
 * **Data Libraries:** 
   * ROOT 6 (built with C++17 지원 플래그)
+  * libusb 1.0 (`libusb-1.0-0-dev`)
   * ZeroMQ (`libzmq3-dev`)
 * **Python Libraries:** 
   * `PyQt6`, `pyqtgraph`, `numpy`, `pyzmq`
@@ -141,6 +143,27 @@ cd CPNR_dt5730s_MD
 mkdir build && cd build
 cmake ..
 make -j4
+```
+
+프로젝트 루트 디렉토리에서, CAEN 라이브러리를 시스템 전역이 아닌 별도 prefix에
+설치했다면 해당 경로를
+명시합니다. 이 prefix에는 `include/CAENDigitizer.h`와 `lib/` 또는 `lib64/`의
+`libCAENDigitizer`, `libCAENComm`, `libCAENVME`가 있어야 합니다.
+
+```bash
+PKG_CONFIG_PATH="$PWD/build/local/lib/pkgconfig" \
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH="$PWD/build/local" \
+  -DCAEN_ROOT="$PWD/build/local"
+cmake --build build -j4
+```
+
+GUI 의존성은 시스템 Python과 섞지 않고 프로젝트 venv에 설치할 수 있습니다.
+`bin/daq_gui`는 `build/venv`가 있으면 자동으로 이 Python을 사용합니다.
+
+```bash
+python3 -m venv build/venv
+build/venv/bin/python -m pip install -r requirements.txt
 ```
 
 하드웨어 SDK나 ROOT/ZeroMQ 없이 설정 검증 회귀 테스트만 실행할 수도 있습니다.

@@ -1,0 +1,4 @@
+PyQt6==6.11.0
+numpy==2.5.2
+pyqtgraph==0.14.0
+pyzmq==27.2.0
