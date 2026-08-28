@@ -30,6 +30,7 @@ include(CTest)
 option(BUILD_DAQ_APPLICATIONS "Build hardware DAQ applications and deploy the GUI" ON)
 option(BUILD_DAQ_FRONTEND "Build the CAEN/ZeroMQ hardware frontend" ON)
 option(BUILD_PRODUCTION_CONVERTER "Build the ROOT production converter" ON)
+option(BUILD_ROOT_VALIDATOR "Build the read-only production ROOT validator" ON)
 
 if(BUILD_TESTING)
   add_executable(config_parser_tests tests/config_parser_tests.cpp src/DAQConfig.cpp)
@@ -114,9 +115,12 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_trigger_settings.py)
   add_test(NAME gui_process_output_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_process_output.py)
+  add_test(NAME gui_root_validation_output_regression
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v
+              tests/test_root_validation_output.py)
   set_tests_properties(
       gui_runtime_path_regression gui_trigger_threshold_regression
-      gui_process_output_regression
+      gui_process_output_regression gui_root_validation_output_regression
       PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
@@ -270,33 +274,64 @@ if(BUILD_DAQ_APPLICATIONS)
     message(STATUS "libusb library: ${LIBUSB_LIBRARY}")
   endif()
 
-  # [Tier 2] Production
-  if(BUILD_PRODUCTION_CONVERTER)
+  # [Tier 2] Production and read-only ROOT validation
+  if(BUILD_PRODUCTION_CONVERTER OR BUILD_ROOT_VALIDATOR)
     find_package(ROOT QUIET COMPONENTS Core Tree Hist RIO Rint Gpad Graf Gui)
     if(ROOT_FOUND)
       include(${ROOT_USE_FILE})
-      add_executable(production_dt5730
-          src/production_dt5730.cpp
-          src/DAQConfig.cpp
-          src/Sha256.cpp)
-      target_include_directories(production_dt5730 PRIVATE include)
-      target_compile_definitions(production_dt5730 PRIVATE
-          CPNR_GIT_COMMIT="${CPNR_GIT_COMMIT}"
-          CPNR_BUILD_TIMESTAMP="${CPNR_BUILD_TIMESTAMP}")
-      target_link_libraries(production_dt5730 ${ROOT_LIBRARIES})
-      if(BUILD_TESTING)
-        add_test(NAME production_provenance_integration
-            COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_SOURCE_DIR}/tests/production_integration_test.py
-                    $<TARGET_FILE:production_dt5730>
-                    ${CMAKE_SOURCE_DIR}/config/dt5730s_ls_coin.conf
-                    ${ROOT_root_CMD}
-                    ${ROOT_rootls_CMD})
-        set_tests_properties(production_provenance_integration PROPERTIES
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      if(BUILD_PRODUCTION_CONVERTER)
+        add_executable(production_dt5730
+            src/production_dt5730.cpp
+            src/DAQConfig.cpp
+            src/Sha256.cpp)
+        target_include_directories(production_dt5730 PRIVATE include)
+        target_compile_definitions(production_dt5730 PRIVATE
+            CPNR_GIT_COMMIT="${CPNR_GIT_COMMIT}"
+            CPNR_BUILD_TIMESTAMP="${CPNR_BUILD_TIMESTAMP}")
+        target_link_libraries(production_dt5730 ${ROOT_LIBRARIES})
+        if(BUILD_TESTING)
+          add_test(NAME production_provenance_integration
+              COMMAND ${Python3_EXECUTABLE}
+                      ${CMAKE_SOURCE_DIR}/tests/production_integration_test.py
+                      $<TARGET_FILE:production_dt5730>
+                      ${CMAKE_SOURCE_DIR}/config/dt5730s_ls_coin.conf
+                      ${ROOT_root_CMD}
+                      ${ROOT_rootls_CMD})
+          set_tests_properties(production_provenance_integration PROPERTIES
+              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+              RESOURCE_LOCK production_converter_fixture)
+        endif()
+      endif()
+
+      if(BUILD_ROOT_VALIDATOR)
+        add_executable(root_validate_dt5730
+            src/root_validate_dt5730.cpp
+            src/RootValidator.cpp
+            src/DAQConfig.cpp
+            src/Sha256.cpp)
+        target_include_directories(root_validate_dt5730 PRIVATE include)
+        target_compile_options(root_validate_dt5730 PRIVATE
+            -Wall -Wextra -Werror)
+        target_compile_definitions(root_validate_dt5730 PRIVATE
+            CPNR_GIT_COMMIT="${CPNR_GIT_COMMIT}"
+            CPNR_BUILD_TIMESTAMP="${CPNR_BUILD_TIMESTAMP}")
+        target_link_libraries(root_validate_dt5730 ${ROOT_LIBRARIES})
+        if(BUILD_TESTING AND BUILD_PRODUCTION_CONVERTER)
+          add_test(NAME root_validation_integration
+              COMMAND ${Python3_EXECUTABLE}
+                      ${CMAKE_SOURCE_DIR}/tests/root_validation_integration_test.py
+                      $<TARGET_FILE:root_validate_dt5730>
+                      $<TARGET_FILE:production_dt5730>
+                      ${CMAKE_SOURCE_DIR}/config/dt5730s_ls_coin.conf
+                      ${ROOT_root_CMD})
+          set_tests_properties(root_validation_integration PROPERTIES
+              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+              RESOURCE_LOCK production_converter_fixture)
+        endif()
       endif()
     else()
-      message(WARNING "ROOT framework not found. Skipping 'production_dt5730' build.")
+      message(WARNING
+          "ROOT framework not found. Skipping production/validation tools.")
     endif()
   endif()
 

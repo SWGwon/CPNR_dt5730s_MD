@@ -16,11 +16,14 @@ from core.runtime_paths import (  # noqa: E402
     RuntimeValidationError,
     build_frontend_command,
     build_production_arguments,
+    build_root_validation_arguments,
     create_run_config_snapshot,
+    default_production_output,
     file_identity,
     frontend_sources,
     metadata_status_paths,
     production_sources,
+    root_validator_sources,
     sidecar_paths,
     verify_binary_fresh,
     verify_deployed_gui,
@@ -37,6 +40,18 @@ class RuntimePathTests(unittest.TestCase):
                       production_sources(PROJECT_ROOT))
         self.assertIn(PROJECT_ROOT / "include" / "Sha256.h",
                       production_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "RootValidator.cpp",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "DAQConfig.cpp",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "src" / "Sha256.cpp",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "include" / "DAQConfig.h",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / "include" / "EventHeader.h",
+                      root_validator_sources(PROJECT_ROOT))
+        self.assertIn(PROJECT_ROOT / ".git" / "index",
+                      root_validator_sources(PROJECT_ROOT))
 
     def test_sidecar_names_are_bound_to_raw_file(self):
         raw = Path("/tmp/example_run007.dat")
@@ -153,6 +168,24 @@ class RuntimePathTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("-m") + 1],
                          "/data/run.dat.run.json")
         self.assertIn("-w", arguments)
+
+    def test_production_output_and_validation_arguments_match_cli(self):
+        raw = Path("/data/take.with.dots/run021.dat")
+        self.assertEqual(
+            default_production_output(raw),
+            Path("/data/take.with.dots/run021_prod.root"),
+        )
+        self.assertEqual(
+            build_root_validation_arguments(
+                "/data/take.with.dots/run021_prod.root", max_events=25000
+            ),
+            [
+                "-i", "/data/take.with.dots/run021_prod.root",
+                "--max-events", "25000",
+            ],
+        )
+        with self.assertRaises(RuntimeValidationError):
+            build_root_validation_arguments("/data/run.root", max_events=-1)
 
     def test_non_positive_run_number_is_rejected(self):
         with self.assertRaises(RuntimeValidationError):

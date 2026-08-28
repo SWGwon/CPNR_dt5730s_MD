@@ -128,6 +128,29 @@ def production_sources(project_root: os.PathLike[str] | str) -> list[Path]:
     return sources
 
 
+def root_validator_sources(project_root: os.PathLike[str] | str) -> list[Path]:
+    """Return every source that can change the deployed ROOT validator."""
+
+    root = Path(project_root).resolve()
+    sources = [
+        root / "CMakeLists.txt",
+        root / "src" / "root_validate_dt5730.cpp",
+        root / "src" / "RootValidator.cpp",
+        root / "src" / "DAQConfig.cpp",
+        root / "src" / "Sha256.cpp",
+        root / "include" / "RootValidator.h",
+        root / "include" / "DAQConfig.h",
+        root / "include" / "ConfigParser.h",
+        root / "include" / "EventHeader.h",
+        root / "include" / "Sha256.h",
+        root / ".git" / "HEAD",
+        root / ".git" / "index",
+        root / ".git" / "refs" / "heads" / "main",
+        root / ".git" / "packed-refs",
+    ]
+    return sources
+
+
 def verify_deployed_gui(runtime_gui_dir: os.PathLike[str] | str,
                         project_root: os.PathLike[str] | str) -> None:
     """Reject an out-of-date bin/gui copy when the deployed GUI is in use."""
@@ -324,6 +347,34 @@ def build_production_arguments(
         arguments.append("-w")
     if debug_event_id is not None:
         arguments.extend(["-d", str(debug_event_id)])
+    return arguments
+
+
+def default_production_output(
+    raw_input: os.PathLike[str] | str,
+) -> Path:
+    """Mirror production_dt5730's default ``*_prod.root`` naming exactly."""
+
+    raw = str(Path(raw_input).expanduser().resolve())
+    last_dot = raw.rfind(".")
+    last_slash = max(raw.rfind("/"), raw.rfind("\\"))
+    if last_dot < 0 or last_dot < last_slash:
+        return Path(raw + "_prod.root")
+    return Path(raw[:last_dot] + "_prod.root")
+
+
+def build_root_validation_arguments(
+    root_input: os.PathLike[str] | str,
+    *,
+    max_events: int = 0,
+) -> list[str]:
+    """Build the argument vector for the read-only validation worker."""
+
+    if max_events < 0:
+        raise RuntimeValidationError("검증 event 수는 0 이상이어야 합니다.")
+    arguments = ["-i", str(Path(root_input).expanduser().resolve())]
+    if max_events > 0:
+        arguments.extend(["--max-events", str(max_events)])
     return arguments
 
 

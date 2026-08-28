@@ -3,11 +3,12 @@ import os
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSlot, QSettings, QProcess
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess
 from core.DatabaseManager import DatabaseManager
 from core.runtime_paths import (
     RuntimeValidationError,
     build_production_arguments,
+    default_production_output,
     file_identity,
     find_project_root,
     identity_summary,
@@ -20,6 +21,8 @@ from core.runtime_paths import (
 )
 
 class ProductionTab(QWidget):
+    rootOutputReady = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         
@@ -39,6 +42,7 @@ class ProductionTab(QWidget):
         self.process.finished.connect(self.handle_finished)
         
         self.last_stats = {}; self.current_raw_file = ""
+        self.current_root_output = ""
         self.completed_run_context = None
         self.init_ui()
         self.load_settings()
@@ -309,6 +313,11 @@ class ProductionTab(QWidget):
             return
 
         self.current_raw_file = str(raw_path)
+        self.current_root_output = (
+            "" if is_debug_mode else str(
+                output_path or default_production_output(raw_path)
+            )
+        )
         self.progress_bar.setValue(0); self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
         self.log_console.clear(); self.last_stats = {}
         self.lbl_production_identity.setText(identity_summary(executable_identity))
@@ -366,5 +375,20 @@ class ProductionTab(QWidget):
             if self.current_raw_file and self.last_stats:
                 self.db.update_production_summary(self.current_raw_file, self.last_stats)
                 self.log_console.append("<span style='color:#6f42c1;'><b>[DB] Production Summary pushed to database.</b></span>")
+            if self.current_root_output:
+                if os.path.isfile(self.current_root_output):
+                    self.rootOutputReady.emit(
+                        os.path.abspath(self.current_root_output)
+                    )
+                    self.log_console.append(
+                        "<span style='color:#17a2b8;'><b>[Validation]</b> "
+                        "완성된 ROOT 파일을 검증 탭에 전달했습니다.</span>"
+                    )
+                else:
+                    self.log_console.append(
+                        "<span style='color:red;'><b>[Error]</b> Conversion은 "
+                        "성공했지만 예상 ROOT 출력을 찾지 못했습니다: "
+                        f"{self.current_root_output}</span>"
+                    )
         else:
             self.log_console.append(f"<span style='color:red;'><b>[System] Conversion Exited with Code: {exitCode}</b></span>")

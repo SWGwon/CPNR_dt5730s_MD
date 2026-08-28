@@ -4,6 +4,7 @@ from widgets.DaqTab import DaqTab
 from widgets.ConfigTab import ConfigTab
 from widgets.MonitorTab import MonitorTab
 from widgets.ProductionTab import ProductionTab
+from widgets.RootValidationTab import RootValidationTab
 from widgets.DatabaseTab import DatabaseTab
 from widgets.EnvTab import EnvTab
 
@@ -21,6 +22,7 @@ class MainWindow(QMainWindow):
         self.config_tab = ConfigTab()
         self.monitor_tab = MonitorTab()
         self.production_tab = ProductionTab()
+        self.root_validation_tab = RootValidationTab()
         self.database_tab = DatabaseTab()
 
         self.tabs.addTab(self.daq_tab, "🚀 DAQ Control")
@@ -28,6 +30,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.config_tab, "⚙️ Hardware Config")
         self.tabs.addTab(self.monitor_tab, "📈 Live Monitor")
         self.tabs.addTab(self.production_tab, "🔬 Offline Production")
+        self.tabs.addTab(self.root_validation_tab, "✅ ROOT Validation")
         self.tabs.addTab(self.database_tab, "🗄️ Run DB History")
 
         self.init_statusbar()
@@ -36,6 +39,9 @@ class MainWindow(QMainWindow):
         self.daq_tab.hardware_temp_signal.connect(self.monitor_tab.update_temperature)
         self.daq_tab.daq_finished_signal.connect(self.reset_led_dashboard)
         self.daq_tab.runContextReady.connect(self.production_tab.set_run_context)
+        self.production_tab.rootOutputReady.connect(
+            self.root_validation_tab.set_root_file
+        )
         self.config_tab.configPathChanged.connect(self.daq_tab.set_config_path)
         if self.config_tab.current_config_path:
             self.daq_tab.set_config_path(self.config_tab.current_config_path)
@@ -98,4 +104,5 @@ class MainWindow(QMainWindow):
         self.daq_tab.stop_all()
         self.monitor_tab.cleanup()
         self.production_tab.stop_all()
+        self.root_validation_tab.stop_all(wait=True)
         event.accept()

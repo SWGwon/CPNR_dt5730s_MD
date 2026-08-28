@@ -34,7 +34,8 @@ CPNR_dt5730s/
 ├── src/                        # [Tier 1 & 2] 초고속 C++ 데이터 수집 및 오프라인 생산 엔진
 │   ├── DAQManager.cpp          # (Tier 1) 하드웨어 제어, ZMQ 스트리밍, 이진 기록 코어
 │   ├── frontend_dt5730.cpp     # (Tier 1) 프론트엔드 독립 실행 메인 프로그램
-│   └── production_dt5730.cpp   # (Tier 2) 이진 데이터 ROOT 변환 및 Micro-Time(T0) 추출기
+│   ├── production_dt5730.cpp   # (Tier 2) 이진 데이터 ROOT 변환 및 Micro-Time(T0) 추출기
+│   └── RootValidator.cpp       # production ROOT 무결성/threshold/provenance 검증기
 │
 ├── gui/                        # [Tier 3] Python PyQt6 엣지 컴퓨팅 기반 제어 센터
 │   ├── main.py                 # GUI 어플리케이션 진입점 (Entry Point)
@@ -48,6 +49,7 @@ CPNR_dt5730s/
 │       ├── ConfigTab.py        # ⚙️ Hardware Config (마스터 아키텍트 파라미터 계산기)
 │       ├── MonitorTab.py       # 📈 Live Monitor (다중 채널 자동 감지 오버레이 스펙트럼)
 │       ├── ProductionTab.py    # 🔬 Offline Production (ROOT 변환 제어 및 디버깅)
+│       ├── RootValidationTab.py # ✅ ROOT Validation (읽기 전용 전수 검증)
 │       └── DatabaseTab.py      # 🗄️ Run DB History (측정 이력 및 스냅샷 조회)
 │
 └── python_tools/               # [보조 도구] 독립 실행형 유틸리티
@@ -78,7 +80,10 @@ CPNR_dt5730s/
 ![Offline Production ROOT](docs/images/Prod_root.png)
 > 이진 데이터(`.dat`)의 ROOT 변환을 전담합니다. 변환 예상 시간(ETA) 출력 기능과 함께, 파형 내부의 정밀 펄스 시작 시간(T0) 추출 기능, 파형 강제 저장(-w) 옵션, 그리고 특정 이벤트를 팝업으로 띄우는 하드코어 디버깅(-d) 모드를 지원합니다.
 
-### 5. Run DB History
+### 5. Production ROOT Validation
+> ROOT 구조와 branch type, EventID/TTT 연속성, event mask/record length, summary 통계, 채널별 finite/range/sentinel, baseline 안정화, threshold 실효값, AND/OR routing 증거를 읽기 전용으로 검사합니다. 최신 파일은 내장 config/metadata와 SHA-256까지 대조하며, 구형 파일은 데이터 무결성과 추적 불가(provenance)를 분리해 표시합니다.
+
+### 6. Run DB History
 ![Run DB History](docs/images/db_tab.png)
 > SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업. 당시 장비에 인가된 다중 채널 고전압(HV) 값과 `.conf` 설정 파일의 전체 스냅샷을 영구 보존하고 추적합니다.
 > 
@@ -267,6 +272,13 @@ GUI가 실행하는 hardware frontend의 고정 위치는 `./bin/frontend_dt5730
 
 GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui`와 다르면 실행을 차단합니다. Runtime JSON에는 binary/config 경로, git/build 정보, input range, ADC bits, polarity, DC offset, 채널별 measured baseline/threshold write/readback과 trigger routing readback이 저장되고, production 변환 시 JSON과 config 전체가 ROOT의 `RunMetadata`와 `RunConfig`로 들어갑니다.
 
+GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-events`를 생략하면 전체 tree를 검사하며, JSON 보고서는 stdout, 진행률/진단은 stderr로 분리됩니다. `--max-events` 표본 검사는 빠른 이상 탐지용이며 전체 파일에 대한 양성 판정은 `SKIP`으로 남습니다. 특히 metadata가 없는 구형 파일의 cutoff/상대 threshold 추론은 전수 검사에서만 제공합니다.
+
+```bash
+./bin/root_validate_dt5730 -i /absolute/run021_prod.root \
+  > run021_prod.root.validation.json
+```
+
 메타데이터는 기존 파일을 덮어쓰지 않습니다. 장비 설정 검증 직후와 acquisition 시작 직후 상태는 각각 `<raw>.run.json.status.hardware_verified_not_started.json`, `<raw>.run.json.status.running.json`에 불변 스냅샷으로 남고, production이 사용하는 `<raw>.run.json`은 `completed` 또는 `failed` terminal 상태에서 한 번만 생성됩니다. 각 파일은 검증한 열린 inode를 no-clobber 방식으로 게시하므로 동시 경로 교체나 이전 run 산출물을 덮어쓰지 않습니다.
 
 **가벼운 CLI 모니터링 단독 실행 (X-Server 불필요):**
@@ -281,6 +293,7 @@ GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui
 * **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
 * **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, Micro-Time(T0) 추출, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
+* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전수 또는 제한 event 수만 검사합니다. PASS/WARN/FAIL과 채널별 baseline/threshold/routing 지표를 표로 보여 주고, 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 
 ---
