@@ -325,6 +325,15 @@ python_bin="$project_root/build/venv/bin/python"
 if [[ ! -x "$python_bin" ]]; then
   python_bin="$(command -v python3)"
 fi
+# Prefer project-local native libraries. Besides the CAEN stack this also lets
+# a non-root installation provide Qt's small XCB runtime dependencies.
+for local_lib in \
+    "$project_root/build/local/lib" \
+    "$project_root"/build/local/usr/lib/*-linux-gnu; do
+  if [[ -d "$local_lib" ]]; then
+    export LD_LIBRARY_PATH="$local_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+done
 cd "$script_dir"
 exec "$python_bin" gui/main.py "$@"
 ]=])

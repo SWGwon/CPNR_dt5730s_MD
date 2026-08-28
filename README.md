@@ -128,6 +128,7 @@ CPNR_dt5730s/
   * ROOT 6 (built with C++17 지원 플래그)
   * libusb 1.0 (`libusb-1.0-0-dev`)
   * ZeroMQ (`libzmq3-dev`)
+  * Qt/X11 runtime (`libxcb-cursor0`, Ubuntu 24.04의 PyQt6 xcb 플러그인에 필요)
 * **Python Libraries:** 
   * `PyQt6`, `pyqtgraph`, `numpy`, `pyzmq`
 
@@ -136,6 +137,12 @@ CPNR_dt5730s/
 ## 🚀 Build & Installation
 
 CMake를 활용하여 C++ 백엔드를 빌드함과 동시에, GUI 구동을 위한 Python 모듈들이 `bin/` 디렉토리로 자동 배포(Deployment)됩니다.
+
+Ubuntu의 X11 세션에서 PyQt6 GUI를 실행하려면 다음 런타임 패키지가 필요합니다.
+
+```bash
+sudo apt-get install libxcb-cursor0
+```
 
 ```bash
 git clone https://github.com/SWGwon/CPNR_dt5730s_MD.git
