@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <cstdio>
+#include <stdexcept>
 
 int main() {
   int failures = 0;
@@ -19,6 +20,26 @@ int main() {
   check(Sha256Hex("abc"),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "abc SHA-256 vector");
+  Sha256Accumulator streamed;
+  streamed.Update("a", 1);
+  streamed.Update(nullptr, 0);
+  streamed.Update("bc", 2);
+  check(streamed.FinalHex(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "incremental SHA-256 vector");
+  check(streamed.FinalHex(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "incremental SHA-256 finalization is idempotent");
+  if (streamed.SizeBytes() != 3U) {
+    std::cerr << "[FAIL] incremental SHA-256 byte count\n";
+    ++failures;
+  }
+  try {
+    streamed.Update("x", 1);
+    std::cerr << "[FAIL] update after SHA-256 finalization was accepted\n";
+    ++failures;
+  } catch (const std::logic_error&) {
+  }
   std::FILE* fixture = std::tmpfile();
   if (!fixture || std::fwrite("abc", 1, 3, fixture) != 3 ||
       std::fflush(fixture) != 0) {

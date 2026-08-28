@@ -25,7 +25,9 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -37,6 +39,7 @@
 #include <typeinfo>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #ifndef CPNR_GIT_COMMIT
 #define CPNR_GIT_COMMIT "unknown"
@@ -67,14 +70,24 @@ struct FileIdentity {
   std::int64_t ctime_nanoseconds = 0;
 };
 
-FileIdentity StatRegularFile(const std::string& path) {
-  struct stat status {};
-  if (::stat(path.c_str(), &status) != 0) {
-    throw std::runtime_error("Cannot stat input ROOT file '" + path +
-                             "': " + std::strerror(errno));
+class ScopedFileDescriptor {
+ public:
+  explicit ScopedFileDescriptor(int descriptor) : descriptor_(descriptor) {}
+  ScopedFileDescriptor(const ScopedFileDescriptor&) = delete;
+  ScopedFileDescriptor& operator=(const ScopedFileDescriptor&) = delete;
+  ~ScopedFileDescriptor() {
+    if (descriptor_ >= 0) ::close(descriptor_);
   }
+  int get() const { return descriptor_; }
+
+ private:
+  int descriptor_ = -1;
+};
+
+FileIdentity IdentityFromStat(const struct stat& status,
+                              const std::string& description) {
   if (!S_ISREG(status.st_mode) || status.st_size < 0) {
-    throw std::runtime_error("Input ROOT path is not a regular file: " + path);
+    throw std::runtime_error(description + " is not a regular file");
   }
   return {static_cast<std::uint64_t>(status.st_dev),
           static_cast<std::uint64_t>(status.st_ino),
@@ -84,6 +97,31 @@ FileIdentity StatRegularFile(const std::string& path) {
           static_cast<std::int64_t>(status.st_mtim.tv_nsec),
           static_cast<std::int64_t>(status.st_ctim.tv_sec),
           static_cast<std::int64_t>(status.st_ctim.tv_nsec)};
+}
+
+FileIdentity StatRegularPath(const std::string& path,
+                             const std::string& description) {
+  struct stat status {};
+  if (::stat(path.c_str(), &status) != 0) {
+    throw std::runtime_error("Cannot stat " + description + " '" + path +
+                             "': " + std::strerror(errno));
+  }
+  return IdentityFromStat(status, description + " '" + path + "'");
+}
+
+FileIdentity StatRegularFile(const std::string& path) {
+  return StatRegularPath(path, "input ROOT file");
+}
+
+FileIdentity DescriptorIdentity(
+    int descriptor,
+    const std::string& description = "pinned input ROOT descriptor") {
+  struct stat status {};
+  if (::fstat(descriptor, &status) != 0) {
+    throw std::runtime_error("Cannot identify " + description + ": " +
+                             std::string(std::strerror(errno)));
+  }
+  return IdentityFromStat(status, description);
 }
 
 bool SameIdentity(const FileIdentity& left, const FileIdentity& right) {
@@ -131,6 +169,44 @@ void Progress(const RootValidationOptions& options, double percent,
 
 bool IsCancelled(const RootValidationOptions& options) {
   return options.cancelled != nullptr && options.cancelled->load();
+}
+
+class ValidationCancelled final : public std::runtime_error {
+ public:
+  explicit ValidationCancelled(const std::string& stage)
+      : std::runtime_error("Validation cancelled while " + stage) {}
+};
+
+std::optional<std::string> Sha256DescriptorCancellable(
+    int descriptor, std::uint64_t size_bytes,
+    const RootValidationOptions& options) {
+  if (descriptor < 0) {
+    throw std::runtime_error("Invalid file descriptor for SHA-256");
+  }
+  Sha256Accumulator accumulator;
+  std::array<std::uint8_t, 1024U * 1024U> buffer{};
+  std::uint64_t offset = 0U;
+  while (offset < size_bytes) {
+    if (IsCancelled(options)) return std::nullopt;
+    const std::size_t requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(buffer.size(), size_bytes - offset));
+    const ssize_t count = ::pread(descriptor, buffer.data(), requested,
+                                  static_cast<off_t>(offset));
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) {
+      throw std::runtime_error(
+          "Cannot read file descriptor for SHA-256 (" +
+          std::string(std::strerror(errno)) + ")");
+    }
+    if (count == 0) {
+      throw std::runtime_error(
+          "File became shorter while computing SHA-256");
+    }
+    accumulator.Update(buffer.data(), static_cast<std::size_t>(count));
+    offset += static_cast<std::uint64_t>(count);
+  }
+  if (IsCancelled(options)) return std::nullopt;
+  return accumulator.FinalHex();
 }
 
 struct CheckCollector {
@@ -493,7 +569,7 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
     return state;
   }
 
-  const std::array<std::pair<const char*, const char*>, 15> objects = {{
+  const std::array<std::pair<const char*, const char*>, 21> objects = {{
       {"RunConfig", "TMacro"},
       {"RunConfigExact", "TObjString"},
       {"RunConfigSha256", "TObjString"},
@@ -502,6 +578,12 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
       {"InputFile", "TObjString"},
       {"ConfigFile", "TObjString"},
       {"MetadataFile", "TObjString"},
+      {"RecordedRawOutputPath", "TObjString"},
+      {"ResolvedRawInputPath", "TObjString"},
+      {"RecordedConfigPath", "TObjString"},
+      {"ResolvedConfigPath", "TObjString"},
+      {"RecordedMetadataPath", "TObjString"},
+      {"ResolvedMetadataPath", "TObjString"},
       {"ExecutablePath", "TObjString"},
       {"ExecutableSha256", "TObjString"},
       {"ExecutableBuildTime", "TObjString"},
@@ -998,11 +1080,20 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
   return state;
 }
 
-void ValidateExternalArtifact(const std::string& name,
-                              const std::string& path,
-                              std::optional<std::uint64_t> expected_size,
-                              const std::string& expected_sha256,
-                              CheckCollector* checks) {
+struct ArtifactDigestObservation {
+  FileIdentity identity;
+  std::string sha256;
+};
+
+using ArtifactDigestCache =
+    std::map<std::string, ArtifactDigestObservation>;
+
+void ValidateExternalArtifact(
+    const std::string& name, const std::string& path,
+    std::optional<std::uint64_t> expected_size,
+    const std::string& expected_sha256, CheckCollector* checks,
+    const RootValidationOptions& options, bool hash_contents,
+    ArtifactDigestCache* cache) {
   if (path.empty()) {
     checks->Add("FAIL", "provenance", name, nullptr,
                 "non-empty recorded artifact path",
@@ -1010,24 +1101,93 @@ void ValidateExternalArtifact(const std::string& name,
     return;
   }
   std::error_code error;
-  if (!fs::is_regular_file(fs::path(path), error) || error) {
+  fs::path absolute = fs::absolute(fs::path(path), error);
+  if (error) {
+    checks->Add("FAIL", "provenance", name, error.message(),
+                "resolvable artifact path",
+                "The recorded artifact path could not be resolved.");
+    return;
+  }
+  const std::string absolute_path = absolute.lexically_normal().string();
+  const int descriptor = ::open(absolute_path.c_str(),
+                                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0 && (errno == ENOENT || errno == ENOTDIR)) {
     checks->Add("SKIP", "provenance", name,
-                {{"path", path}, {"available", false}},
+                {{"path", absolute_path}, {"available", false}},
                 "verify when artifact is available",
                 "The external artifact is not present at its recorded path; "
                 "this does not invalidate the self-contained ROOT report.");
     return;
   }
+  if (descriptor < 0) {
+    checks->Add("FAIL", "provenance", name,
+                {{"path", absolute_path},
+                 {"error", std::string(std::strerror(errno))}},
+                "readable non-symlink regular artifact",
+                "The external artifact could not be opened safely.");
+    return;
+  }
+  const ScopedFileDescriptor pinned_artifact(descriptor);
   try {
-    const std::uint64_t observed_size =
-        static_cast<std::uint64_t>(fs::file_size(fs::path(path)));
-    const std::string observed_sha256 = Sha256FileHex(path);
+    const FileIdentity initial_identity = DescriptorIdentity(
+        pinned_artifact.get(), "pinned external artifact descriptor");
+    const FileIdentity initial_path_identity =
+        StatRegularPath(absolute_path, "external artifact");
+    if (!SameIdentity(initial_identity, initial_path_identity)) {
+      throw std::runtime_error(
+          "artifact path changed while its descriptor was opened");
+    }
+    const std::uint64_t observed_size = initial_identity.size;
     const bool size_matches =
         !expected_size || observed_size == *expected_size;
+    if (!hash_contents) {
+      checks->Add(size_matches ? "SKIP" : "FAIL", "provenance", name,
+                  {{"path", absolute_path},
+                   {"available", true},
+                   {"size_bytes", observed_size},
+                   {"sha256", nullptr}},
+                  {{"size_bytes", expected_size ? Json(*expected_size)
+                                                 : Json(nullptr)},
+                   {"sha256", expected_sha256}},
+                  size_matches
+                      ? "Prefix validation checks artifact identity and size but deliberately skips reading all artifact bytes for SHA-256."
+                      : "The available artifact size differs from its recorded identity even without a content hash.");
+      return;
+    }
+
+    std::string observed_sha256;
+    const auto cached = cache->find(absolute_path);
+    if (cached != cache->end()) {
+      if (!SameIdentity(cached->second.identity, initial_identity)) {
+        throw std::runtime_error(
+            "artifact identity differs from an earlier observation");
+      }
+      observed_sha256 = cached->second.sha256;
+    } else {
+      const std::optional<std::string> digest =
+          Sha256DescriptorCancellable(pinned_artifact.get(), observed_size,
+                                      options);
+      if (!digest) {
+        throw ValidationCancelled("hashing external provenance artifacts");
+      }
+      const FileIdentity final_identity = DescriptorIdentity(
+          pinned_artifact.get(), "pinned external artifact descriptor");
+      const FileIdentity final_path_identity =
+          StatRegularPath(absolute_path, "external artifact");
+      if (!SameIdentity(initial_identity, final_identity) ||
+          !SameIdentity(initial_identity, final_path_identity)) {
+        throw std::runtime_error(
+            "artifact identity changed while computing SHA-256");
+      }
+      observed_sha256 = *digest;
+      cache->emplace(absolute_path,
+                     ArtifactDigestObservation{initial_identity,
+                                               observed_sha256});
+    }
     const bool hash_matches = observed_sha256 == expected_sha256;
     checks->Add(size_matches && hash_matches ? "PASS" : "FAIL",
                 "provenance", name,
-                {{"path", AbsolutePath(path)},
+                {{"path", absolute_path},
                  {"size_bytes", observed_size},
                  {"sha256", observed_sha256}},
                 {{"size_bytes", expected_size ? Json(*expected_size)
@@ -1036,6 +1196,8 @@ void ValidateExternalArtifact(const std::string& name,
                 size_matches && hash_matches
                     ? "Available external artifact matches its recorded identity."
                     : "Available external artifact differs from its recorded identity.");
+  } catch (const ValidationCancelled&) {
+    throw;
   } catch (const std::exception& error_detail) {
     checks->Add("FAIL", "provenance", name, error_detail.what(),
                 "readable artifact matching recorded size/SHA-256",
@@ -1045,8 +1207,11 @@ void ValidateExternalArtifact(const std::string& name,
 
 void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
                                 const std::optional<std::string>& config_contents,
-                                CheckCollector* checks) {
+                                CheckCollector* checks,
+                                const RootValidationOptions& options,
+                                bool hash_contents) {
   if (!metadata.parsed || !metadata.hardware.valid) return;
+  ArtifactDigestCache cache;
   try {
     const Json& document = metadata.document;
     const std::string raw_path =
@@ -1057,7 +1222,7 @@ void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
     const std::string raw_sha =
         RequireString(document, "raw_output_sha256", "metadata");
     ValidateExternalArtifact("external_raw_output", raw_path, raw_size,
-                             raw_sha, checks);
+                             raw_sha, checks, options, hash_contents, &cache);
 
     const std::string config_path =
         RequireString(document, "config_path", "metadata");
@@ -1068,14 +1233,15 @@ void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
         config_contents
             ? std::optional<std::uint64_t>(config_contents->size())
             : std::nullopt,
-        config_sha, checks);
+        config_sha, checks, options, hash_contents, &cache);
 
     const std::string frontend_path =
         RequireString(document, "binary_path", "metadata");
     const std::string frontend_sha =
         RequireString(document, "binary_sha256", "metadata");
     ValidateExternalArtifact("external_frontend_binary", frontend_path,
-                             std::nullopt, frontend_sha, checks);
+                             std::nullopt, frontend_sha, checks, options,
+                             hash_contents, &cache);
 
     const std::optional<std::string> production_path =
         ReadStringObject(file, "ExecutablePath");
@@ -1083,7 +1249,8 @@ void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
         ReadStringObject(file, "ExecutableSha256");
     if (production_path && production_sha) {
       ValidateExternalArtifact("external_production_binary", *production_path,
-                               std::nullopt, *production_sha, checks);
+                               std::nullopt, *production_sha, checks, options,
+                               hash_contents, &cache);
     } else {
       checks->Add("FAIL", "provenance", "external_production_binary",
                   nullptr, "ExecutablePath and ExecutableSha256",
@@ -1096,23 +1263,80 @@ void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
         ReadStringObject(file, "ConfigFile");
     const std::optional<std::string> root_metadata =
         ReadStringObject(file, "MetadataFile");
+    const std::optional<std::string> recorded_raw_object =
+        ReadStringObject(file, "RecordedRawOutputPath");
+    const std::optional<std::string> resolved_raw_object =
+        ReadStringObject(file, "ResolvedRawInputPath");
+    const std::optional<std::string> recorded_config_object =
+        ReadStringObject(file, "RecordedConfigPath");
+    const std::optional<std::string> resolved_config_object =
+        ReadStringObject(file, "ResolvedConfigPath");
+    const std::optional<std::string> recorded_metadata_object =
+        ReadStringObject(file, "RecordedMetadataPath");
+    const std::optional<std::string> resolved_metadata_object =
+        ReadStringObject(file, "ResolvedMetadataPath");
     const std::string metadata_path =
         RequireString(document, "metadata_path", "metadata");
-    const bool paths_match =
-        root_input && root_config && root_metadata &&
-        AbsolutePath(*root_input) == AbsolutePath(raw_path) &&
-        AbsolutePath(*root_config) == AbsolutePath(config_path) &&
-        AbsolutePath(*root_metadata) == AbsolutePath(metadata_path);
-    checks->Add(paths_match ? "PASS" : "FAIL", "provenance",
+    const auto is_absolute = [](const std::optional<std::string>& path) {
+      return path && fs::path(*path).is_absolute();
+    };
+    const bool paths_authenticated =
+        root_input && root_config && root_metadata && recorded_raw_object &&
+        resolved_raw_object && recorded_config_object &&
+        resolved_config_object && recorded_metadata_object &&
+        resolved_metadata_object &&
+        *recorded_raw_object == raw_path &&
+        *recorded_config_object == config_path &&
+        *recorded_metadata_object == metadata_path &&
+        AbsolutePath(*root_input) == AbsolutePath(*resolved_raw_object) &&
+        AbsolutePath(*root_config) == AbsolutePath(*resolved_config_object) &&
+        AbsolutePath(*root_metadata) ==
+            AbsolutePath(*resolved_metadata_object) &&
+        is_absolute(recorded_raw_object) && is_absolute(resolved_raw_object) &&
+        is_absolute(recorded_config_object) &&
+        is_absolute(resolved_config_object) &&
+        is_absolute(recorded_metadata_object) &&
+        is_absolute(resolved_metadata_object);
+    const bool raw_relocated =
+        recorded_raw_object && resolved_raw_object &&
+        AbsolutePath(*recorded_raw_object) !=
+            AbsolutePath(*resolved_raw_object);
+    const bool config_relocated =
+        recorded_config_object && resolved_config_object &&
+        AbsolutePath(*recorded_config_object) !=
+            AbsolutePath(*resolved_config_object);
+    const bool metadata_relocated =
+        recorded_metadata_object && resolved_metadata_object &&
+        AbsolutePath(*recorded_metadata_object) !=
+            AbsolutePath(*resolved_metadata_object);
+    checks->Add(paths_authenticated ? "PASS" : "FAIL", "provenance",
                 "embedded_artifact_paths",
-                {{"input", root_input ? Json(*root_input) : Json(nullptr)},
-                 {"config", root_config ? Json(*root_config) : Json(nullptr)},
-                 {"metadata",
-                  root_metadata ? Json(*root_metadata) : Json(nullptr)}},
-                {{"input", raw_path},
-                 {"config", config_path},
-                 {"metadata", metadata_path}},
-                "ROOT provenance paths must agree with embedded RunMetadata.");
+                {{"recorded",
+                  {{"raw", recorded_raw_object
+                               ? Json(*recorded_raw_object) : Json(nullptr)},
+                   {"config", recorded_config_object
+                                  ? Json(*recorded_config_object)
+                                  : Json(nullptr)},
+                   {"metadata", recorded_metadata_object
+                                    ? Json(*recorded_metadata_object)
+                                    : Json(nullptr)}}},
+                 {"resolved",
+                  {{"raw", resolved_raw_object
+                               ? Json(*resolved_raw_object) : Json(nullptr)},
+                   {"config", resolved_config_object
+                                  ? Json(*resolved_config_object)
+                                  : Json(nullptr)},
+                   {"metadata", resolved_metadata_object
+                                    ? Json(*resolved_metadata_object)
+                                    : Json(nullptr)}}},
+                 {"relocated",
+                  {{"raw", raw_relocated},
+                   {"config", config_relocated},
+                   {"metadata", metadata_relocated}}}},
+                "recorded locators match RunMetadata; resolved locators are absolute and match compatibility aliases",
+                paths_authenticated
+                    ? "Original RunMetadata locators and authenticated current artifact locations are preserved independently."
+                    : "Recorded/resolved artifact provenance objects are missing, relative, or internally inconsistent.");
 
     const std::optional<std::string> embedded_metadata =
         ReadStringObject(file, "RunMetadata");
@@ -1120,8 +1344,31 @@ void ValidateExternalProvenance(TFile& file, const MetadataState& metadata,
       ValidateExternalArtifact(
           "external_runtime_metadata", metadata_path,
           std::optional<std::uint64_t>(embedded_metadata->size()),
-          Sha256Hex(*embedded_metadata), checks);
+          Sha256Hex(*embedded_metadata), checks, options, hash_contents,
+          &cache);
     }
+    if (resolved_raw_object) {
+      ValidateExternalArtifact("external_resolved_raw_output",
+                               *resolved_raw_object, raw_size, raw_sha,
+                               checks, options, hash_contents, &cache);
+    }
+    if (resolved_config_object) {
+      ValidateExternalArtifact(
+          "external_resolved_runtime_config", *resolved_config_object,
+          config_contents
+              ? std::optional<std::uint64_t>(config_contents->size())
+              : std::nullopt,
+          config_sha, checks, options, hash_contents, &cache);
+    }
+    if (resolved_metadata_object && embedded_metadata) {
+      ValidateExternalArtifact(
+          "external_resolved_runtime_metadata", *resolved_metadata_object,
+          std::optional<std::uint64_t>(embedded_metadata->size()),
+          Sha256Hex(*embedded_metadata), checks, options, hash_contents,
+          &cache);
+    }
+  } catch (const ValidationCancelled&) {
+    throw;
   } catch (const std::exception& error) {
     checks->Add("FAIL", "provenance", "external_artifact_validation",
                 error.what(), "well-formed artifact identity fields",
@@ -1201,7 +1448,7 @@ struct DerivedWaveformValues {
 };
 
 DerivedWaveformValues RecomputeWaveformValues(
-    const std::vector<UShort_t>& trace) {
+    const std::vector<UShort_t>& trace, bool falling_polarity) {
   DerivedWaveformValues values;
   if (trace.empty()) return values;
 
@@ -1214,7 +1461,11 @@ DerivedWaveformValues RecomputeWaveformValues(
 
   std::size_t baseline_samples = trace.size() / 4U;
   for (std::size_t sample = initial_window; sample < trace.size(); ++sample) {
-    if (initial_baseline - static_cast<double>(trace[sample]) > 30.0) {
+    const double baseline_excursion =
+        falling_polarity
+            ? initial_baseline - static_cast<double>(trace[sample])
+            : static_cast<double>(trace[sample]) - initial_baseline;
+    if (baseline_excursion > 30.0) {
       baseline_samples = sample > 5U ? sample - 5U : 1U;
       break;
     }
@@ -1227,18 +1478,38 @@ DerivedWaveformValues RecomputeWaveformValues(
   }
   values.baseline /= static_cast<double>(baseline_samples);
 
-  double minimum_adc = values.baseline;
+  double pulse_extremum = values.baseline;
   double integrated_charge = 0.0;
-  for (std::size_t sample = baseline_samples; sample < trace.size(); ++sample) {
-    integrated_charge += values.baseline - static_cast<double>(trace[sample]);
-    minimum_adc = std::min(minimum_adc, static_cast<double>(trace[sample]));
+  if (falling_polarity) {
+    for (std::size_t sample = baseline_samples; sample < trace.size(); ++sample) {
+      integrated_charge +=
+          values.baseline - static_cast<double>(trace[sample]);
+      pulse_extremum =
+          std::min(pulse_extremum, static_cast<double>(trace[sample]));
+    }
+    values.pulse_height =
+        std::max(0.0, values.baseline - pulse_extremum);
+  } else {
+    for (std::size_t sample = baseline_samples; sample < trace.size(); ++sample) {
+      integrated_charge +=
+          static_cast<double>(trace[sample]) - values.baseline;
+      pulse_extremum =
+          std::max(pulse_extremum, static_cast<double>(trace[sample]));
+    }
+    values.pulse_height =
+        std::max(0.0, pulse_extremum - values.baseline);
   }
   values.charge = std::max(0.0, integrated_charge);
-  values.pulse_height = std::max(0.0, values.baseline - minimum_adc);
 
-  const double start_threshold = values.baseline - 30.0;
+  const double start_threshold = falling_polarity
+                                     ? values.baseline - 30.0
+                                     : values.baseline + 30.0;
   for (std::size_t sample = baseline_samples; sample < trace.size(); ++sample) {
-    if (static_cast<double>(trace[sample]) < start_threshold) {
+    const bool crossed =
+        falling_polarity
+            ? static_cast<double>(trace[sample]) < start_threshold
+            : static_cast<double>(trace[sample]) > start_threshold;
+    if (crossed) {
       values.pulse_start_ns = 2.0 * static_cast<double>(sample);
       break;
     }
@@ -1287,13 +1558,38 @@ Json ValidateRootFile(const std::string& input_path,
   }
   Progress(options, 0.0, "opening input");
   const std::string absolute_path = AbsolutePath(input_path);
-  const FileIdentity initial_identity = StatRegularFile(absolute_path);
-  Progress(options, 2.0, "hashing input");
-  const std::string initial_sha256 = Sha256FileHex(absolute_path);
-  const FileIdentity post_hash_identity = StatRegularFile(absolute_path);
-  if (!SameIdentity(initial_identity, post_hash_identity)) {
+  const int input_descriptor =
+      ::open(absolute_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (input_descriptor < 0) {
+    throw std::runtime_error("Cannot open input ROOT file read-only '" +
+                             absolute_path + "': " + std::strerror(errno));
+  }
+  const ScopedFileDescriptor pinned_input(input_descriptor);
+  const FileIdentity initial_identity = DescriptorIdentity(pinned_input.get());
+  if (!SameIdentity(initial_identity, StatRegularFile(absolute_path))) {
     throw std::runtime_error(
-        "Input ROOT identity changed while computing its initial SHA-256");
+        "Input ROOT path changed while its read-only descriptor was opened");
+  }
+  const std::string pinned_input_path =
+      "/proc/self/fd/" + std::to_string(pinned_input.get());
+  const bool hash_full_contents = options.max_events == 0U;
+  std::optional<std::string> initial_sha256;
+  if (hash_full_contents) {
+    Progress(options, 2.0, "hashing input");
+    initial_sha256 = Sha256DescriptorCancellable(
+        pinned_input.get(), initial_identity.size, options);
+    if (!initial_sha256) {
+      throw ValidationCancelled("hashing the input ROOT file");
+    }
+    const FileIdentity post_hash_identity =
+        DescriptorIdentity(pinned_input.get());
+    if (!SameIdentity(initial_identity, post_hash_identity) ||
+        !SameIdentity(initial_identity, StatRegularFile(absolute_path))) {
+      throw std::runtime_error(
+          "Input ROOT identity changed while computing its initial SHA-256");
+    }
+  } else {
+    Progress(options, 2.0, "opening prefix without full-file hash");
   }
   const std::string validator_path = ValidatorExecutablePath();
   const std::string validator_sha256 = Sha256FileHex("/proc/self/exe");
@@ -1307,10 +1603,14 @@ Json ValidateRootFile(const std::string& input_path,
                                 {"build_timestamp", CPNR_BUILD_TIMESTAMP}}},
                  {"input", {{"path", absolute_path},
                             {"size_bytes", initial_identity.size},
-                            {"sha256", initial_sha256},
+                            {"sha256", initial_sha256
+                                           ? Json(*initial_sha256)
+                                           : Json(nullptr)},
                             {"max_events", options.max_events == 0U
                                                ? Json(nullptr)
                                                : Json(options.max_events)},
+                            {"validation_mode",
+                             hash_full_contents ? "full" : "prefix"},
                             {"identity_start", IdentityJson(initial_identity)}}},
                  {"analysis", Json::object()},
                  {"overall_status", "PASS"},
@@ -1320,10 +1620,22 @@ Json ValidateRootFile(const std::string& input_path,
                  {"channels", Json::array()},
                  {"metadata", Json::object()}};
   CheckCollector checks(&report["checks"]);
+  if (!hash_full_contents) {
+    checks.Add(
+        "WARN", "operation", "prefix_validation_mode",
+        {{"max_events", options.max_events},
+         {"full_root_sha256", false},
+         {"external_artifact_sha256", false}},
+        "full validation for definitive whole-file conclusions",
+        "Prefix mode scans only the leading event limit and deliberately avoids full-file content hashes; all positive conclusions are limited to that prefix.");
+  }
 
   const int previous_error_level = gErrorIgnoreLevel;
   gErrorIgnoreLevel = kError;
-  std::unique_ptr<TFile> file(TFile::Open(absolute_path.c_str(), "READ"));
+  // ROOT opens a /proc/self/fd path that resolves to the already-authenticated
+  // inode.  A concurrent rename of the public path therefore cannot make the
+  // scan consume different bytes than the hashes in this report.
+  std::unique_ptr<TFile> file(TFile::Open(pinned_input_path.c_str(), "READ"));
   gErrorIgnoreLevel = previous_error_level;
   if (!file || file->IsZombie()) {
     throw std::runtime_error("Input is not a readable ROOT file: " +
@@ -1351,7 +1663,10 @@ Json ValidateRootFile(const std::string& input_path,
   MetadataState metadata = ValidateMetadata(
       *file, &checks, &report["metadata"], &config_contents);
   report["legacy"] = !metadata.present;
-  ValidateExternalProvenance(*file, metadata, config_contents, &checks);
+  const bool falling_polarity =
+      !metadata.hardware.valid || metadata.hardware.polarity == "falling";
+  ValidateExternalProvenance(*file, metadata, config_contents, &checks,
+                             options, hash_full_contents);
 
   const std::optional<int> run_number =
       ReadParameter<int>(*file, "RunNumber");
@@ -1385,12 +1700,14 @@ Json ValidateRootFile(const std::string& input_path,
                "TTree phys_tree", "Physics tree is present.");
   }
 
+  const char* const count_parameter_type =
+      metadata.present ? "TParameter<Long64_t>" : "TParameter<int>";
   const std::array<std::pair<const char*, const char*>, 6> summary_types = {{
       {"RealTime_sec", "TParameter<double>"},
       {"LiveTime_sec", "TParameter<double>"},
       {"DeadTime_pct", "TParameter<double>"},
-      {"LostEvents_count", "TParameter<int>"},
-      {"RecordedEvents_count", "TParameter<int>"},
+      {"LostEvents_count", count_parameter_type},
+      {"RecordedEvents_count", count_parameter_type},
       {"TriggerRate_Hz", "TParameter<double>"}}};
   Json summary_schema_errors = Json::array();
   for (const auto& [name, type] : summary_types) {
@@ -1411,6 +1728,7 @@ Json ValidateRootFile(const std::string& input_path,
   std::uint64_t total_entries = 0U;
   bool scalar_schema_valid = tree != nullptr;
   bool has_waveforms = false;
+  bool has_audit_branches = false;
   if (tree != nullptr) {
     const Long64_t signed_entries = tree->GetEntries();
     if (signed_entries < 0) {
@@ -1438,7 +1756,18 @@ Json ValidateRootFile(const std::string& input_path,
              kDouble_t});
       }
     }
+    const bool pattern_present = tree->GetBranch("Pattern") != nullptr;
+    const bool board_counter_present =
+        tree->GetBranch("BoardEventCounter") != nullptr;
+    const bool inspect_audit_branches =
+        metadata.present || pattern_present || board_counter_present;
+    if (inspect_audit_branches) {
+      specifications.push_back({"Pattern", "UShort_t", kUShort_t});
+      specifications.push_back(
+          {"BoardEventCounter", "UInt_t", kUInt_t});
+    }
     Json branch_errors = Json::array();
+    Json audit_branch_errors = Json::array();
     for (const ScalarBranchSpec& specification : specifications) {
       TBranch* branch = tree->GetBranch(specification.name.c_str());
       TLeaf* leaf =
@@ -1466,7 +1795,12 @@ Json ValidateRootFile(const std::string& input_path,
       if (branch == nullptr || leaf == nullptr ||
           observed_type != specification.type || !branch_type_matches ||
           !scalar_shape || !entries_match) {
-        branch_errors.push_back(
+        Json& errors =
+            specification.name == "Pattern" ||
+                    specification.name == "BoardEventCounter"
+                ? audit_branch_errors
+                : branch_errors;
+        errors.push_back(
             {{"name", specification.name},
              {"type", observed_type.empty() ? Json(nullptr)
                                              : Json(observed_type)},
@@ -1485,12 +1819,37 @@ Json ValidateRootFile(const std::string& input_path,
              {"expected_entries", total_entries}});
       }
     }
-    scalar_schema_valid = scalar_schema_valid && branch_errors.empty();
+    const bool audit_branch_set_valid =
+        inspect_audit_branches && pattern_present && board_counter_present &&
+        audit_branch_errors.empty();
+    has_audit_branches = audit_branch_set_valid;
+    const bool audit_schema_valid =
+        metadata.present ? audit_branch_set_valid
+                         : (!inspect_audit_branches || audit_branch_set_valid);
+    scalar_schema_valid = scalar_schema_valid && branch_errors.empty() &&
+                          audit_schema_valid;
     checks.Add(branch_errors.empty() ? "PASS" : "FAIL", "schema",
                "scalar_branches", branch_errors, Json::array(),
                branch_errors.empty()
                    ? "All 36 required scalar branches have expected leaf types and entry counts."
                    : "Required scalar branches are missing, mistyped, or have inconsistent entries.");
+    checks.Add(metadata.present
+                   ? (audit_schema_valid ? "PASS" : "FAIL")
+                   : (inspect_audit_branches
+                          ? (audit_schema_valid ? "PASS" : "FAIL")
+                          : "SKIP"),
+               "schema", "audit_branches",
+               {{"pattern_present", pattern_present},
+                {"board_event_counter_present", board_counter_present},
+                {"errors", audit_branch_errors}},
+               metadata.present
+                   ? Json("Pattern/UShort_t and BoardEventCounter/UInt_t")
+                   : Json("both audit branches together when present"),
+               !metadata.present && !inspect_audit_branches
+                   ? "Legacy format predates raw-header audit branches."
+                   : audit_schema_valid
+                         ? "Raw Pattern and BoardEventCounter audit fields are preserved with exact scalar types."
+                         : "Audit branches are missing, partial, mistyped, or have inconsistent entries.");
 
     int waveform_count = 0;
     Json waveform_errors = Json::array();
@@ -1536,6 +1895,7 @@ Json ValidateRootFile(const std::string& input_path,
 
   report["summary"]["entries"] = total_entries;
   report["summary"]["waveforms_saved"] = has_waveforms;
+  report["summary"]["audit_branches_saved"] = has_audit_branches;
   if (metadata.hardware.valid && metadata.parsed) {
     const std::uint64_t active_channels = static_cast<std::uint64_t>(
         __builtin_popcount(metadata.hardware.record_mask));
@@ -1585,16 +1945,25 @@ Json ValidateRootFile(const std::string& input_path,
   std::uint64_t read_failures = 0U;
   std::uint64_t routing_evaluable = 0U;
   std::uint64_t routing_passed = 0U;
+  std::uint64_t board_counter_range_violations = 0U;
+  std::uint64_t board_counter_duplicate_violations = 0U;
+  std::uint64_t board_counter_backward_violations = 0U;
+  std::uint64_t board_counter_lost_events = 0U;
+  bool board_counter_loss_overflow = false;
   std::set<std::uint32_t> observed_masks;
   std::set<std::uint32_t> observed_lengths;
+  std::set<std::uint32_t> observed_patterns;
   std::optional<std::uint64_t> first_ttt;
   std::optional<std::uint64_t> last_ttt;
+  std::optional<std::uint32_t> previous_board_counter;
   bool scan_cancelled = false;
 
   UInt_t event_id = 0U;
   ULong64_t sync_time = 0U;
   UShort_t channel_mask = 0U;
   UInt_t record_length = 0U;
+  UShort_t pattern = 0U;
+  UInt_t board_event_counter = 0U;
   std::array<double, kChannelCount> charge{};
   std::array<double, kChannelCount> pulse{};
   std::array<double, kChannelCount> start_time{};
@@ -1612,6 +1981,10 @@ Json ValidateRootFile(const std::string& input_path,
     bind("SyncTime_TTT", &sync_time);
     bind("ChannelMask", &channel_mask);
     bind("RecordLength", &record_length);
+    if (has_audit_branches) {
+      bind("Pattern", &pattern);
+      bind("BoardEventCounter", &board_event_counter);
+    }
     for (int channel = 0; channel < kChannelCount; ++channel) {
       bind("Charge_CH" + std::to_string(channel), &charge[channel]);
       bind("PulseHeight_CH" + std::to_string(channel), &pulse[channel]);
@@ -1636,7 +2009,7 @@ Json ValidateRootFile(const std::string& input_path,
     const std::uint64_t progress_interval =
         std::max<std::uint64_t>(1U, scan_limit / 100U);
     for (std::uint64_t entry = 0U; entry < scan_limit; ++entry) {
-      if ((entry % 1024U) == 0U && IsCancelled(options)) {
+      if (IsCancelled(options)) {
         scan_cancelled = true;
         break;
       }
@@ -1650,6 +2023,33 @@ Json ValidateRootFile(const std::string& input_path,
       last_ttt = sync_time;
       observed_masks.insert(channel_mask);
       observed_lengths.insert(record_length);
+      if (has_audit_branches) {
+        observed_patterns.insert(pattern);
+        if (board_event_counter > 0xFFFFFFU) {
+          ++board_counter_range_violations;
+          previous_board_counter.reset();
+        } else {
+          if (previous_board_counter) {
+            const std::uint32_t difference =
+                (board_event_counter - *previous_board_counter) & 0xFFFFFFU;
+            if (difference == 0U) {
+              ++board_counter_duplicate_violations;
+            } else if (difference > 0x800000U) {
+              ++board_counter_backward_violations;
+            } else if (difference > 1U) {
+              const std::uint64_t newly_lost =
+                  static_cast<std::uint64_t>(difference - 1U);
+              if (board_counter_lost_events >
+                  std::numeric_limits<std::uint64_t>::max() - newly_lost) {
+                board_counter_loss_overflow = true;
+              } else {
+                board_counter_lost_events += newly_lost;
+              }
+            }
+          }
+          previous_board_counter = board_event_counter;
+        }
+      }
       const std::uint32_t required_granularity = metadata.present ? 8U : 4U;
       const bool shape_is_valid =
           channel_mask != 0U && (channel_mask & ~0xFFU) == 0U &&
@@ -1689,8 +2089,12 @@ Json ValidateRootFile(const std::string& input_path,
         }
         const double theoretical_charge_max =
             static_cast<double>(record_length) * kAdcMaximum;
+        const double pulse_height_limit =
+            falling_polarity ? baseline[channel]
+                             : kAdcMaximum - baseline[channel];
         if (baseline[channel] < 0.0 || baseline[channel] > kAdcMaximum ||
-            pulse[channel] < 0.0 || pulse[channel] > baseline[channel] + 1e-9 ||
+            pulse[channel] < 0.0 ||
+            pulse[channel] > pulse_height_limit + 1e-9 ||
             charge[channel] < 0.0 ||
             charge[channel] > theoretical_charge_max + 1e-9) {
           ++accumulator.range_violations;
@@ -1716,8 +2120,12 @@ Json ValidateRootFile(const std::string& input_path,
             std::min(accumulator.charge_min, charge[channel]);
         accumulator.charge_max =
             std::max(accumulator.charge_max, charge[channel]);
-        const double falling_extremum = baseline[channel] - pulse[channel];
-        bool saturated = falling_extremum <= 0.5;
+        const double pulse_extremum =
+            falling_polarity ? baseline[channel] - pulse[channel]
+                             : baseline[channel] + pulse[channel];
+        bool saturated = falling_polarity
+                             ? pulse_extremum <= 0.5
+                             : pulse_extremum >= kAdcMaximum - 0.5;
 
         if ((entry % sample_stride) == 0U) {
           accumulator.baseline_samples.push_back(baseline[channel]);
@@ -1746,7 +2154,8 @@ Json ValidateRootFile(const std::string& input_path,
             if (waveform_range_error) ++accumulator.waveform_range_violations;
             if (!waveform_range_error) {
               const DerivedWaveformValues derived =
-                  RecomputeWaveformValues(*waveforms[channel]);
+                  RecomputeWaveformValues(*waveforms[channel],
+                                          falling_polarity);
               if (!ApproxEqual(derived.baseline, baseline[channel]) ||
                   !ApproxEqual(derived.charge, charge[channel]) ||
                   !ApproxEqual(derived.pulse_height, pulse[channel]) ||
@@ -1777,11 +2186,13 @@ Json ValidateRootFile(const std::string& input_path,
                     return sample >= threshold.readback_adc;
                   });
             }
-          } else if (metadata.hardware.polarity == "falling") {
+          } else {
             crossing_available[channel] = true;
-            crossings[channel] =
-                falling_extremum <=
-                static_cast<double>(threshold.readback_adc);
+            crossings[channel] = falling_polarity
+                                     ? pulse_extremum <= static_cast<double>(
+                                           threshold.readback_adc)
+                                     : pulse_extremum >= static_cast<double>(
+                                           threshold.readback_adc);
           }
           if (crossing_available[channel]) {
             ++accumulator.trigger_evaluable;
@@ -1929,6 +2340,41 @@ Json ValidateRootFile(const std::string& input_path,
                partial_event_scan && ttt_nonincreasing == 0U
                    ? "Timestamps increase in the scanned prefix; the full file was not established."
                    : "Extended trigger timestamps must be strictly increasing.");
+    if (has_audit_branches) {
+      checks.Add(board_counter_range_violations != 0U
+                     ? "FAIL"
+                     : partial_event_scan ? "SKIP" : "PASS",
+                 "integrity", "board_event_counter_range",
+                 board_counter_range_violations, 0,
+                 partial_event_scan && board_counter_range_violations == 0U
+                     ? "BoardEventCounter stayed within its hardware 24-bit range in the scanned prefix."
+                     : "BoardEventCounter must stay within its hardware 24-bit range.");
+      checks.Add(board_counter_loss_overflow
+                     ? "FAIL"
+                     : partial_event_scan ? "SKIP" : "PASS",
+                 "integrity", "board_counter_loss_arithmetic",
+                 {{"overflow", board_counter_loss_overflow},
+                  {"reconstructed_lost_events", board_counter_lost_events}},
+                 "overflow-free unsigned 64-bit reconstruction",
+                 partial_event_scan && !board_counter_loss_overflow
+                     ? "Lost-event reconstruction is overflow-free for the scanned prefix."
+                     : "Modulo-24-bit board-counter deltas must accumulate without overflow.");
+      const bool counter_sequence_invalid =
+          board_counter_duplicate_violations != 0U ||
+          board_counter_backward_violations != 0U;
+      checks.Add(counter_sequence_invalid
+                     ? "FAIL"
+                     : partial_event_scan ? "SKIP" : "PASS",
+                 "integrity", "board_event_counter_sequence",
+                 {{"duplicate_or_stale", board_counter_duplicate_violations},
+                  {"backward_or_reset", board_counter_backward_violations}},
+                 {{"duplicate_or_stale", 0}, {"backward_or_reset", 0}},
+                 counter_sequence_invalid
+                     ? "BoardEventCounter contains a duplicate/stale value or a backward/reset transition; neither can be interpreted as ordinary event loss."
+                 : partial_event_scan
+                     ? "BoardEventCounter advances unambiguously in the scanned prefix; the remainder was not scanned."
+                     : "BoardEventCounter advances monotonically modulo 24 bits, including valid rollover.");
+    }
     const bool shape_constant = observed_masks.size() <= 1U &&
                                 observed_lengths.size() <= 1U &&
                                 shape_violations == 0U;
@@ -1958,16 +2404,38 @@ Json ValidateRootFile(const std::string& input_path,
     }
   }
 
+  report["summary"]["patterns"] = observed_patterns;
+  report["summary"]["board_counter_reconstructed_lost_events"] =
+      has_audit_branches ? Json(board_counter_lost_events) : Json(nullptr);
+  report["summary"]["board_counter_duplicate_or_stale_events"] =
+      has_audit_branches ? Json(board_counter_duplicate_violations)
+                         : Json(nullptr);
+  report["summary"]["board_counter_backward_or_reset_events"] =
+      has_audit_branches ? Json(board_counter_backward_violations)
+                         : Json(nullptr);
+
   const std::optional<double> real_time =
       ReadParameter<double>(*file, "RealTime_sec");
   const std::optional<double> live_time =
       ReadParameter<double>(*file, "LiveTime_sec");
   const std::optional<double> dead_time_percent =
       ReadParameter<double>(*file, "DeadTime_pct");
-  const std::optional<int> lost_events =
-      ReadParameter<int>(*file, "LostEvents_count");
-  const std::optional<int> recorded_events =
-      ReadParameter<int>(*file, "RecordedEvents_count");
+  std::optional<Long64_t> lost_events;
+  std::optional<Long64_t> recorded_events;
+  if (metadata.present) {
+    lost_events = ReadParameter<Long64_t>(*file, "LostEvents_count");
+    recorded_events =
+        ReadParameter<Long64_t>(*file, "RecordedEvents_count");
+  } else {
+    if (const std::optional<int> legacy_lost =
+            ReadParameter<int>(*file, "LostEvents_count")) {
+      lost_events = static_cast<Long64_t>(*legacy_lost);
+    }
+    if (const std::optional<int> legacy_recorded =
+            ReadParameter<int>(*file, "RecordedEvents_count")) {
+      recorded_events = static_cast<Long64_t>(*legacy_recorded);
+    }
+  }
   const std::optional<double> trigger_rate =
       ReadParameter<double>(*file, "TriggerRate_Hz");
   report["summary"]["recorded_events"] =
@@ -2019,16 +2487,39 @@ Json ValidateRootFile(const std::string& input_path,
                total_entries,
                "RecordedEvents_count must equal the full TTree entry count.");
   }
+  if (lost_events && has_audit_branches) {
+    const bool complete_counter_scan =
+        !partial_event_scan && !scan_cancelled && read_failures == 0U &&
+        !board_counter_loss_overflow &&
+        board_counter_range_violations == 0U &&
+        board_counter_duplicate_violations == 0U &&
+        board_counter_backward_violations == 0U;
+    const bool counter_matches =
+        complete_counter_scan && *lost_events >= 0 &&
+        static_cast<std::uint64_t>(*lost_events) ==
+            board_counter_lost_events;
+    checks.Add(complete_counter_scan
+                   ? (counter_matches ? "PASS" : "FAIL")
+                   : "SKIP",
+               "integrity", "board_counter_lost_event_count",
+               complete_counter_scan
+                   ? Json(board_counter_lost_events)
+                   : Json({{"scanned_events", scanned},
+                           {"reconstructed_prefix", board_counter_lost_events}}),
+               *lost_events,
+               complete_counter_scan
+                   ? "LostEvents_count must exactly equal the modulo-24-bit BoardEventCounter reconstruction."
+                   : "The full BoardEventCounter sequence was not available for comparison with LostEvents_count.");
+  }
   if (lost_events) {
-    const std::uint64_t total_triggers =
-        *lost_events >= 0
-            ? total_entries + static_cast<std::uint64_t>(*lost_events)
-            : total_entries;
+    const long double total_triggers =
+        static_cast<long double>(total_entries) +
+        (*lost_events >= 0 ? static_cast<long double>(*lost_events) : 0.0L);
     const double loss_fraction =
-        total_triggers == 0U || *lost_events < 0
+        total_triggers == 0.0L || *lost_events < 0
             ? 0.0
-            : static_cast<double>(*lost_events) /
-                  static_cast<double>(total_triggers);
+            : static_cast<double>(static_cast<long double>(*lost_events) /
+                                  total_triggers);
     report["summary"]["lost_event_fraction"] = loss_fraction;
     const std::string status =
         *lost_events < 0 ? "FAIL"
@@ -2038,7 +2529,9 @@ Json ValidateRootFile(const std::string& input_path,
     checks.Add(status, "data_quality", "lost_events",
                {{"count", *lost_events}, {"fraction", loss_fraction}},
                {{"count", 0}, {"red_fraction", 0.01}},
-               "LostEvents_count is derived from the raw board counter and cannot be independently reconstructed from phys_tree.");
+               has_audit_branches
+                   ? "LostEvents_count is independently reconstructed from preserved BoardEventCounter values."
+                   : "Legacy phys_tree does not preserve BoardEventCounter, so LostEvents_count cannot be independently reconstructed.");
   }
 
   if (!sampled && !scan_cancelled && read_failures == 0U && total_entries > 0U &&
@@ -2259,25 +2752,20 @@ Json ValidateRootFile(const std::string& input_path,
           saturation_fraction > 0.01
               ? "FAIL"
               : saturation_fraction >= 0.001 ? "WARN" : "PASS";
-      const bool saturation_evaluable =
-          has_waveforms || !metadata.hardware.valid ||
-          metadata.hardware.polarity == "falling";
-      checks.Add(!saturation_evaluable
-                     ? "SKIP"
-                 : saturation_status == "PASS" && partial_event_scan
+      checks.Add(saturation_status == "PASS" && partial_event_scan
                      ? "SKIP"
                      : saturation_status,
                  "data_quality",
                  "channel_" + std::to_string(channel) + "_saturation",
                  saturation_fraction,
                  {{"warning_fraction", 0.001}, {"red_fraction", 0.01}},
-                 !saturation_evaluable
-                     ? "A rising-edge saturation check requires archived waveforms; scalar PulseHeight stores only the falling minimum."
-                 : saturation_status == "PASS" && partial_event_scan
+                 saturation_status == "PASS" && partial_event_scan
                      ? "No saturation was found in the prefix, but absence across the full file was not established."
                  : has_waveforms
                      ? "Saturation is detected directly at ADC codes 0 or 16383."
-                     : "Without waveforms this is inferred from Baseline-PulseHeight <= 0.5 ADC.");
+                     : falling_polarity
+                           ? "Without waveforms this is inferred from Baseline-PulseHeight <= 0.5 ADC."
+                           : "Without waveforms this is inferred from Baseline+PulseHeight >= 16382.5 ADC.");
     }
 
     if (metadata.hardware.valid && active && tail_available && threshold.present &&
@@ -2444,10 +2932,26 @@ Json ValidateRootFile(const std::string& input_path,
   }
 
   Progress(options, 97.0, "checking final file identity");
-  const FileIdentity pre_final_hash_identity = StatRegularFile(absolute_path);
-  const std::string final_sha256 = Sha256FileHex(absolute_path);
-  const FileIdentity final_identity = StatRegularFile(absolute_path);
-  const bool identity_unchanged = SameIdentity(initial_identity, final_identity);
+  const FileIdentity pre_final_hash_identity =
+      DescriptorIdentity(pinned_input.get());
+  std::optional<std::string> final_sha256;
+  if (hash_full_contents && !scan_cancelled) {
+    final_sha256 = Sha256DescriptorCancellable(
+        pinned_input.get(), initial_identity.size, options);
+    if (!final_sha256) {
+      scan_cancelled = true;
+      report["analysis"]["completed"] = false;
+      report["analysis"]["cancelled"] = true;
+      checks.Add("WARN", "operation", "cancelled_during_final_hash",
+                 "cancelled", "completed final SHA-256",
+                 "Validation was cancelled while checking the final input digest; partial metrics are retained.");
+    }
+  }
+  const FileIdentity final_identity = DescriptorIdentity(pinned_input.get());
+  const FileIdentity final_path_identity = StatRegularFile(absolute_path);
+  const bool identity_unchanged =
+      SameIdentity(initial_identity, final_identity) &&
+      SameIdentity(initial_identity, final_path_identity);
   const bool stable_while_hashing =
       SameIdentity(pre_final_hash_identity, final_identity);
   checks.Add(identity_unchanged && stable_while_hashing ? "PASS" : "FAIL",
@@ -2457,14 +2961,23 @@ Json ValidateRootFile(const std::string& input_path,
              identity_unchanged && stable_while_hashing
                  ? "Input device/inode/size/mtime remained unchanged during validation."
                  : "Input identity changed while it was being validated.");
-  const bool sha256_unchanged = final_sha256 == initial_sha256;
-  checks.Add(sha256_unchanged ? "PASS" : "FAIL", "integrity",
-             "file_sha256_stable", final_sha256, initial_sha256,
-             sha256_unchanged
-                 ? "Input bytes match the SHA-256 captured before validation."
-                 : "Input bytes changed while validation was in progress.");
+  if (initial_sha256 && final_sha256) {
+    const bool sha256_unchanged = *final_sha256 == *initial_sha256;
+    checks.Add(sha256_unchanged ? "PASS" : "FAIL", "integrity",
+               "file_sha256_stable", *final_sha256, *initial_sha256,
+               sha256_unchanged
+                   ? "Input bytes match the SHA-256 captured before validation."
+                   : "Input bytes changed while validation was in progress.");
+  } else {
+    checks.Add("SKIP", "integrity", "file_sha256_stable", nullptr,
+               "full validation start/end SHA-256",
+               hash_full_contents
+                   ? "Final SHA-256 comparison was skipped because validation was cancelled."
+                   : "Prefix validation deliberately skips both full-file SHA-256 passes so its runtime scales with the requested event prefix.");
+  }
   report["input"]["identity_end"] = IdentityJson(final_identity);
-  report["input"]["sha256_end"] = final_sha256;
+  report["input"]["sha256_end"] =
+      final_sha256 ? Json(*final_sha256) : Json(nullptr);
 
   file->Close();
   report["domain_status"] = {

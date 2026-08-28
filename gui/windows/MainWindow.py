@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QMainWindow, QTabWidget, QStatusBar, QLabel, QWidget, QHBoxLayout
-from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtCore import QProcess, QTimer, pyqtSlot
 from widgets.DaqTab import DaqTab
 from widgets.ConfigTab import ConfigTab
 from widgets.MonitorTab import MonitorTab
@@ -11,6 +11,10 @@ from widgets.EnvTab import EnvTab
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._close_pending = False
+        self._shutdown_ready = False
+        self._close_check_scheduled = False
+        self._monitor_cleaned = False
         self.setWindowTitle("HEP 3-Tier DAQ Control Center (DT5730S 14-bit) - PyQt6")
         self.resize(1200, 900)
 
@@ -42,9 +46,27 @@ class MainWindow(QMainWindow):
         self.production_tab.rootOutputReady.connect(
             self.root_validation_tab.set_root_file
         )
+        self.daq_tab.daq_finished_signal.connect(self._maybe_finish_close)
+        self.production_tab.process.finished.connect(self._maybe_finish_close)
+        self.production_tab.process.errorOccurred.connect(
+            self._maybe_finish_close
+        )
+        self.root_validation_tab.process.finished.connect(
+            self._maybe_finish_close
+        )
+        self.root_validation_tab.process.errorOccurred.connect(
+            self._maybe_finish_close
+        )
         self.config_tab.configPathChanged.connect(self.daq_tab.set_config_path)
+        self.config_tab.configDirtyChanged.connect(
+            self.daq_tab.set_config_dirty
+        )
         if self.config_tab.current_config_path:
             self.daq_tab.set_config_path(self.config_tab.current_config_path)
+        self.daq_tab.set_config_dirty(
+            self.config_tab.current_config_path,
+            self.config_tab.is_dirty(),
+        )
 
         # =========================================================================
         # [신규 추가] DAQ Control 탭과 Hardware Config 탭의 스캔 범위 시각화 파이프라인
@@ -100,9 +122,67 @@ class MainWindow(QMainWindow):
         for key in self.led_widgets:
             self.led_widgets[key].setStyleSheet("color: #555555; font-size: 18px; margin-right: 15px;")
 
+    def _workers_active(self):
+        daq_process = self.daq_tab.daq_process
+        daq_active = bool(
+            daq_process
+            and (
+                daq_process.isRunning()
+                or (
+                    hasattr(daq_process, "has_pending_work")
+                    and daq_process.has_pending_work()
+                )
+            )
+        )
+        production_active = (
+            self.production_tab.process.state()
+            != QProcess.ProcessState.NotRunning
+        )
+        validation_active = (
+            self.root_validation_tab.process.state()
+            != QProcess.ProcessState.NotRunning
+        )
+        return daq_active or production_active or validation_active
+
+    def _cleanup_monitor_once(self):
+        if not self._monitor_cleaned:
+            self._monitor_cleaned = True
+            self.monitor_tab.cleanup()
+
+    def _schedule_close_check(self):
+        if self._close_check_scheduled:
+            return
+        self._close_check_scheduled = True
+        QTimer.singleShot(50, self._maybe_finish_close)
+
+    @pyqtSlot()
+    def _maybe_finish_close(self, *_args):
+        self._close_check_scheduled = False
+        if not self._close_pending:
+            return
+        if self._workers_active():
+            self._schedule_close_check()
+            return
+        self._shutdown_ready = True
+        self.close()
+
     def closeEvent(self, event):
+        if self._shutdown_ready or not self._workers_active():
+            self._cleanup_monitor_once()
+            event.accept()
+            return
+
+        event.ignore()
+        if self._close_pending:
+            self._schedule_close_check()
+            return
+
+        self._close_pending = True
+        self.tabs.setEnabled(False)
+        self.statusBar.showMessage(
+            "Stopping active jobs and waiting for provenance finalization…"
+        )
         self.daq_tab.stop_all()
-        self.monitor_tab.cleanup()
         self.production_tab.stop_all()
-        self.root_validation_tab.stop_all(wait=True)
-        event.accept()
+        self.root_validation_tab.stop_all(wait=False)
+        self._schedule_close_check()

@@ -1,6 +1,7 @@
 #include "EventHeader.h"
 #include "ConfigParser.h"
 #include "DAQConfig.h"
+#include "RaceSafeCleanup.h"
 #include "Sha256.h"
 #include <TApplication.h>
 #include <TCanvas.h>
@@ -8,6 +9,7 @@
 #include <TGraph.h>
 #include <TTree.h>
 #include <TMacro.h>
+#include <TMemFile.h>
 #include <TObjString.h>
 #include <TParameter.h>
 #include <TDatime.h>
@@ -22,6 +24,7 @@
 #include <getopt.h>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <filesystem>
 #include <optional>
 #include <regex>
@@ -65,11 +68,6 @@ struct FileIdentity {
     uint64_t inode = 0U;
 };
 
-struct TemporaryRootOutput {
-    std::string path;
-    FileIdentity identity;
-};
-
 class ScopedDescriptor {
  public:
     ScopedDescriptor() = default;
@@ -79,6 +77,17 @@ class ScopedDescriptor {
     }
     ScopedDescriptor(const ScopedDescriptor&) = delete;
     ScopedDescriptor& operator=(const ScopedDescriptor&) = delete;
+    ScopedDescriptor(ScopedDescriptor&& other) noexcept
+        : descriptor_(other.descriptor_) {
+        other.descriptor_ = -1;
+    }
+    ScopedDescriptor& operator=(ScopedDescriptor&& other) noexcept {
+        if (this != &other) {
+            reset(other.descriptor_);
+            other.descriptor_ = -1;
+        }
+        return *this;
+    }
     int get() const { return descriptor_; }
     void reset(int descriptor) {
         if (descriptor_ >= 0) ::close(descriptor_);
@@ -87,6 +96,12 @@ class ScopedDescriptor {
 
  private:
     int descriptor_ = -1;
+};
+
+struct TemporaryRootOutput {
+    std::string path;
+    FileIdentity identity;
+    ScopedDescriptor descriptor;
 };
 
 bool PathMatchesIdentity(const std::string& path,
@@ -112,29 +127,71 @@ TemporaryRootOutput ReserveTemporaryRootOutput(
     if (::fstat(descriptor, &status) != 0) {
         const int status_error = errno;
         ::close(descriptor);
-        ::unlink(writable_pattern.data());
         throw std::runtime_error(
             "Cannot inspect temporary ROOT output (" +
-            std::string(std::strerror(status_error)) + ")");
-    }
-    if (::close(descriptor) != 0) {
-        const int close_error = errno;
-        ::unlink(writable_pattern.data());
-        throw std::runtime_error(
-            "Cannot close temporary ROOT reservation (" +
-            std::string(std::strerror(close_error)) + ")");
+            std::string(std::strerror(status_error)) +
+            "); preserving it because its identity could not be established: " +
+            writable_pattern.data());
     }
     return {writable_pattern.data(),
             {static_cast<uint64_t>(status.st_dev),
-             static_cast<uint64_t>(status.st_ino)}};
+             static_cast<uint64_t>(status.st_ino)},
+            ScopedDescriptor(descriptor)};
 }
 
-bool RemoveTemporaryRootOutput(const TemporaryRootOutput& temporary) {
-    if (!temporary.path.empty() &&
-        PathMatchesIdentity(temporary.path, temporary.identity)) {
-        return ::unlink(temporary.path.c_str()) == 0;
+void InitializeTemporaryRootReservation(TemporaryRootOutput* temporary) {
+    if (temporary == nullptr || temporary->descriptor.get() < 0) {
+        throw std::runtime_error("Temporary ROOT reservation is not open");
     }
-    return false;
+    TMemFile seed("cpnr_reserved_root", "RECREATE");
+    if (seed.IsZombie() || seed.Write() < 0) {
+        throw std::runtime_error(
+            "Cannot initialize an in-memory ROOT reservation image");
+    }
+    // TMemFile::GetSize() reports its allocated block capacity (typically
+    // megabytes), not the ROOT logical EOF.  Copy only the valid file image so
+    // no trailing reservation bytes survive into the published archive.
+    const Long64_t signed_size = seed.GetEND();
+    if (signed_size <= 0 ||
+        static_cast<ULong64_t>(signed_size) >
+            static_cast<ULong64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("Invalid in-memory ROOT reservation size");
+    }
+    const size_t image_size = static_cast<size_t>(signed_size);
+    std::vector<char> image(image_size);
+    if (seed.CopyTo(image.data(), signed_size) != signed_size) {
+        throw std::runtime_error(
+            "Cannot materialize the ROOT reservation image");
+    }
+    if (::ftruncate(temporary->descriptor.get(), 0) != 0) {
+        throw std::runtime_error(
+            "Cannot truncate temporary ROOT reservation (" +
+            std::string(std::strerror(errno)) + ")");
+    }
+    size_t written = 0U;
+    while (written < image.size()) {
+        const ssize_t result = ::pwrite(
+            temporary->descriptor.get(), image.data() + written,
+            image.size() - written, static_cast<off_t>(written));
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) {
+            throw std::runtime_error(
+                "Cannot initialize temporary ROOT reservation (" +
+                std::string(std::strerror(errno)) + ")");
+        }
+        written += static_cast<size_t>(result);
+    }
+}
+
+bool RemoveTemporaryRootOutput(TemporaryRootOutput* temporary) {
+    const bool removed = temporary != nullptr && !temporary->path.empty() &&
+        cpnr::RemovePathIfSameNode(
+            temporary->path, static_cast<dev_t>(temporary->identity.device),
+            static_cast<ino_t>(temporary->identity.inode), "[Production]");
+    if (temporary != nullptr) {
+        temporary->descriptor.reset(-1);
+    }
+    return removed;
 }
 
 void LinkDescriptorNoReplace(int descriptor, const std::string& target,
@@ -185,50 +242,47 @@ void SyncParentDirectory(const std::string& path) {
     }
 }
 
-void PublishTemporaryRootOutput(const TemporaryRootOutput& temporary,
+void PublishTemporaryRootOutput(TemporaryRootOutput* temporary,
                                 const std::string& final_path) {
-    if (!PathMatchesIdentity(temporary.path, temporary.identity)) {
+    if (temporary == nullptr || temporary->descriptor.get() < 0 ||
+        !PathMatchesIdentity(temporary->path, temporary->identity)) {
         throw std::runtime_error(
             "Temporary ROOT output inode changed before publication");
     }
-    ScopedDescriptor temporary_descriptor(
-        ::open(temporary.path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-    if (temporary_descriptor.get() < 0) {
-        throw std::runtime_error(
-            "Cannot open temporary ROOT output for publication (" +
-            std::string(std::strerror(errno)) + ")");
-    }
     struct stat temporary_status {};
-    if (::fstat(temporary_descriptor.get(), &temporary_status) != 0) {
+    if (::fstat(temporary->descriptor.get(), &temporary_status) != 0) {
         throw std::runtime_error(
             "Cannot identify temporary ROOT output for publication (" +
             std::string(std::strerror(errno)) + ")");
     }
     if (static_cast<uint64_t>(temporary_status.st_dev) !=
-            temporary.identity.device ||
+            temporary->identity.device ||
         static_cast<uint64_t>(temporary_status.st_ino) !=
-            temporary.identity.inode) {
+            temporary->identity.inode) {
         throw std::runtime_error(
             "Temporary ROOT output descriptor identity changed before "
             "publication");
     }
-    if (::fsync(temporary_descriptor.get()) != 0) {
+    if (::fsync(temporary->descriptor.get()) != 0) {
         throw std::runtime_error(
             "Cannot durably sync temporary ROOT output (" +
             std::string(std::strerror(errno)) + ")");
     }
 
-    LinkDescriptorNoReplace(temporary_descriptor.get(), final_path,
+    LinkDescriptorNoReplace(temporary->descriptor.get(), final_path,
                             "ROOT output");
-    if (!PathMatchesIdentity(final_path, temporary.identity)) {
+    if (!PathMatchesIdentity(final_path, temporary->identity)) {
         throw std::runtime_error(
             "Published ROOT output identity changed before verification");
     }
     try {
         SyncParentDirectory(final_path);
     } catch (...) {
-        if (PathMatchesIdentity(final_path, temporary.identity)) {
-            ::unlink(final_path.c_str());
+        if (cpnr::RemovePathIfSameNode(
+                final_path,
+                static_cast<dev_t>(temporary->identity.device),
+                static_cast<ino_t>(temporary->identity.inode),
+                "[Production]")) {
             try {
                 SyncParentDirectory(final_path);
             } catch (...) {
@@ -237,14 +291,14 @@ void PublishTemporaryRootOutput(const TemporaryRootOutput& temporary,
         }
         throw;
     }
-    if (!PathMatchesIdentity(final_path, temporary.identity)) {
+    if (!PathMatchesIdentity(final_path, temporary->identity)) {
         throw std::runtime_error(
             "Published ROOT output identity changed during durable commit");
     }
     if (!RemoveTemporaryRootOutput(temporary)) {
         std::cerr << "[Warning] Published ROOT output, but temporary hard-link "
                      "cleanup was unsafe or failed: "
-                  << temporary.path << "\n";
+                  << temporary->path << "\n";
     } else {
         try {
             SyncParentDirectory(final_path);
@@ -719,16 +773,11 @@ int RunNumberFromMetadata(const Json& metadata) {
         "runtime metadata");
 }
 
-void RequireMetadataPath(const Json& metadata,
-                         const std::string& field_name,
-                         const std::string& selected_path,
-                         const std::string& description) {
+bool MetadataPathWasRelocated(const Json& metadata,
+                              const std::string& field_name,
+                              const std::string& selected_path) {
     const std::string recorded = RequireMetadataString(metadata, field_name);
-    if (AbsolutePath(recorded) != AbsolutePath(selected_path)) {
-        throw std::runtime_error(
-            description + " mismatch: selected " + AbsolutePath(selected_path) +
-            " but RunMetadata records " + AbsolutePath(recorded));
-    }
+    return AbsolutePath(recorded) != AbsolutePath(selected_path);
 }
 
 std::optional<int> RunNumberFromFilename(const std::string& input_file) {
@@ -840,6 +889,13 @@ int main(int argc, char **argv) {
     std::string recorded_raw_sha256;
     uint32_t expected_record_length = 0U;
     uint32_t expected_channel_mask = 0U;
+    bool trigger_is_falling = true;
+    std::string recorded_raw_path;
+    std::string recorded_config_path;
+    std::string recorded_metadata_path;
+    bool raw_path_relocated = false;
+    bool config_path_relocated = false;
+    bool metadata_path_relocated = false;
     int run_number = -1;
     std::string run_number_source;
 
@@ -875,18 +931,34 @@ int main(int argc, char **argv) {
                                                  selected_settings);
             expected_record_length = selected_settings.record_length;
             expected_channel_mask = selected_settings.channel_mask;
+            trigger_is_falling =
+                RequireMetadataString(
+                    RequireMetadataField(runtime_metadata, "hardware"),
+                    "trigger_polarity") == "falling";
             const std::string acquisition_status =
                 RequireMetadataString(runtime_metadata, "acquisition_status");
             if (acquisition_status != "completed") {
                 throw std::runtime_error(
                     "Runtime metadata does not report acquisition_status=completed");
             }
-            RequireMetadataPath(runtime_metadata, "raw_output_path",
-                                input_file, "Raw input path");
-            RequireMetadataPath(runtime_metadata, "config_path",
-                                config_file, "Runtime config path");
-            RequireMetadataPath(runtime_metadata, "metadata_path",
-                                metadata_file, "Runtime metadata path");
+            recorded_raw_path =
+                RequireMetadataString(runtime_metadata, "raw_output_path");
+            recorded_config_path =
+                RequireMetadataString(runtime_metadata, "config_path");
+            recorded_metadata_path =
+                RequireMetadataString(runtime_metadata, "metadata_path");
+            if (!fs::path(recorded_raw_path).is_absolute() ||
+                !fs::path(recorded_config_path).is_absolute() ||
+                !fs::path(recorded_metadata_path).is_absolute()) {
+                throw std::runtime_error(
+                    "RunMetadata raw/config/metadata locators must be absolute paths");
+            }
+            raw_path_relocated = MetadataPathWasRelocated(
+                runtime_metadata, "raw_output_path", input_file);
+            config_path_relocated = MetadataPathWasRelocated(
+                runtime_metadata, "config_path", config_file);
+            metadata_path_relocated = MetadataPathWasRelocated(
+                runtime_metadata, "metadata_path", metadata_file);
             const std::string recorded_config_sha256 =
                 RequireMetadataString(runtime_metadata, "config_sha256");
             const std::string actual_config_sha256 = Sha256Hex(config_contents);
@@ -895,6 +967,22 @@ int main(int argc, char **argv) {
                     "Runtime config SHA-256 mismatch: sidecar records " +
                     recorded_config_sha256 + ", selected snapshot is " +
                     actual_config_sha256);
+            }
+            if (config_path_relocated) {
+                std::cerr
+                    << "[Warning] Runtime config relocated: RunMetadata records "
+                    << recorded_config_path << ", selected "
+                    << AbsolutePath(config_file)
+                    << "; selected config content SHA-256 is authenticated.\n";
+            }
+            if (metadata_path_relocated) {
+                std::cerr
+                    << "[Warning] Runtime metadata sidecar relocated: "
+                       "RunMetadata records "
+                    << recorded_metadata_path << ", selected "
+                    << AbsolutePath(metadata_file)
+                    << "; selected metadata bytes will be embedded with their "
+                       "SHA-256.\n";
             }
             recorded_raw_size_bytes = RequireMetadataField(
                 runtime_metadata, "raw_output_size_bytes").get<uint64_t>();
@@ -1018,6 +1106,12 @@ int main(int argc, char **argv) {
         std::cerr << "[Error] Raw input changed while it was being authenticated\n";
         return 1;
     }
+    if (raw_path_relocated) {
+        std::cerr
+            << "[Warning] Raw input relocated: RunMetadata records "
+            << recorded_raw_path << ", selected " << AbsolutePath(input_file)
+            << "; opened inode size and SHA-256 are authenticated.\n";
+    }
     const std::string descriptor_path =
         "/proc/self/fd/" + std::to_string(raw_input_descriptor.get());
     ifs.open(descriptor_path, std::ios::binary);
@@ -1054,11 +1148,19 @@ int main(int argc, char **argv) {
     if (debug_event_id < 0) {
         try {
             temporary_root_output = ReserveTemporaryRootOutput(output_file);
+            InitializeTemporaryRootReservation(&temporary_root_output);
         } catch (const std::exception& error) {
             std::cerr << "[Error] " << error.what() << "\n";
+            RemoveTemporaryRootOutput(&temporary_root_output);
             return 1;
         }
-        fOut = new TFile(temporary_root_output.path.c_str(), "RECREATE");
+        const std::string temporary_descriptor_path =
+            "/proc/self/fd/" +
+            std::to_string(temporary_root_output.descriptor.get());
+        // Open ROOT through the still-open mkstemp descriptor.  The inode was
+        // seeded with a minimal valid ROOT image above, so UPDATE preserves
+        // that exact reservation instead of deleting/recreating its pathname.
+        fOut = new TFile(temporary_descriptor_path.c_str(), "UPDATE");
         if (!fOut || fOut->IsZombie() ||
             !PathMatchesIdentity(temporary_root_output.path,
                                  temporary_root_output.identity)) {
@@ -1066,7 +1168,7 @@ int main(int argc, char **argv) {
                       << "for " << output_file << "\n";
             if (fOut) fOut->Close();
             delete fOut;
-            RemoveTemporaryRootOutput(temporary_root_output);
+            RemoveTemporaryRootOutput(&temporary_root_output);
             return 1;
         }
 
@@ -1087,7 +1189,7 @@ int main(int argc, char **argv) {
                       << error.what() << "\n";
             fOut->Close();
             delete fOut;
-            RemoveTemporaryRootOutput(temporary_root_output);
+            RemoveTemporaryRootOutput(&temporary_root_output);
             return 1;
         }
 
@@ -1101,6 +1203,16 @@ int main(int argc, char **argv) {
             WriteStringObject("InputFile", AbsolutePath(input_file)) <= 0 ||
             WriteStringObject("ConfigFile", AbsolutePath(config_file)) <= 0 ||
             WriteStringObject("MetadataFile", AbsolutePath(metadata_file)) <= 0 ||
+            WriteStringObject("RecordedRawOutputPath", recorded_raw_path) <= 0 ||
+            WriteStringObject("ResolvedRawInputPath",
+                              AbsolutePath(input_file)) <= 0 ||
+            WriteStringObject("RecordedConfigPath", recorded_config_path) <= 0 ||
+            WriteStringObject("ResolvedConfigPath",
+                              AbsolutePath(config_file)) <= 0 ||
+            WriteStringObject("RecordedMetadataPath",
+                              recorded_metadata_path) <= 0 ||
+            WriteStringObject("ResolvedMetadataPath",
+                              AbsolutePath(metadata_file)) <= 0 ||
             WriteStringObject("ExecutablePath", executable_path) <= 0 ||
             WriteStringObject("ExecutableSha256", executable_sha256) <= 0 ||
             WriteStringObject("ExecutableBuildTime", CPNR_BUILD_TIMESTAMP) <= 0 ||
@@ -1117,7 +1229,7 @@ int main(int argc, char **argv) {
             std::cerr << "[Error] ROOT provenance write failed before conversion\n";
             fOut->Close();
             delete fOut;
-            RemoveTemporaryRootOutput(temporary_root_output);
+            RemoveTemporaryRootOutput(&temporary_root_output);
             return 1;
         }
 
@@ -1126,6 +1238,9 @@ int main(int argc, char **argv) {
         tOut->Branch("SyncTime_TTT", &header.ExtendedTTT, "SyncTime_TTT/l");
         tOut->Branch("ChannelMask", &header.ChannelMask, "ChannelMask/s");
         tOut->Branch("RecordLength", &record_len_branch, "RecordLength/i"); 
+        tOut->Branch("Pattern", &header.Pattern, "Pattern/s");
+        tOut->Branch("BoardEventCounter", &header.BoardEventCounter,
+                     "BoardEventCounter/i");
 
         for (int i = 0; i < 8; ++i) {
             tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
@@ -1137,7 +1252,7 @@ int main(int argc, char **argv) {
     }
 
     std::vector<uint16_t> raw_waveform_buffer;
-    uint32_t current_event = 0;
+    uint64_t current_event = 0;
     
     bool is_first_event = true;
     uint64_t first_ttt = 0, last_ttt = 0, total_acquired_samples = 0;
@@ -1159,7 +1274,8 @@ int main(int argc, char **argv) {
             header.RecordLength % 8U != 0U ||
             header.RecordLength != expected_record_length ||
             header.ChannelMask == 0U || (header.ChannelMask & ~0xFFU) != 0U ||
-            header.ChannelMask != expected_channel_mask) {
+            header.ChannelMask != expected_channel_mask ||
+            header.BoardEventCounter > 0xFFFFFFU) {
             std::cerr << "\n[Error] Invalid/corrupt raw event header at event "
                       << current_event - 1U << "\n";
             conversion_failed = true;
@@ -1172,8 +1288,37 @@ int main(int argc, char **argv) {
             prev_board_counter = header.BoardEventCounter;
             is_first_event = false;
         } else {
-            uint32_t diff = (header.BoardEventCounter - prev_board_counter) & 0xFFFFFF;
-            if (diff > 1) lost_events += (diff - 1); 
+            const uint32_t diff =
+                (header.BoardEventCounter - prev_board_counter) & 0xFFFFFFU;
+            if (diff == 0U) {
+                std::cerr << "\n[Error] Duplicate/stale BoardEventCounter at event "
+                          << current_event - 1U << " (counter="
+                          << header.BoardEventCounter << ")\n";
+                conversion_failed = true;
+                g_running = 0;
+                break;
+            }
+            if (diff > 0x800000U) {
+                std::cerr << "\n[Error] Backward/reset BoardEventCounter at event "
+                          << current_event - 1U << " (previous="
+                          << prev_board_counter << ", current="
+                          << header.BoardEventCounter << ")\n";
+                conversion_failed = true;
+                g_running = 0;
+                break;
+            }
+            if (diff > 1) {
+                const uint64_t newly_lost = static_cast<uint64_t>(diff - 1U);
+                if (lost_events >
+                    std::numeric_limits<uint64_t>::max() - newly_lost) {
+                    std::cerr << "\n[Error] Lost-event counter overflow at event "
+                              << current_event - 1U << "\n";
+                    conversion_failed = true;
+                    g_running = 0;
+                    break;
+                }
+                lost_events += newly_lost;
+            }
         }
         last_ttt = header.ExtendedTTT;
         prev_board_counter = header.BoardEventCounter;
@@ -1220,7 +1365,11 @@ int main(int argc, char **argv) {
 
                     size_t baseline_samples = trace_len / 4; 
                     for (size_t i = init_window; i < trace_len; ++i) {
-                        if (init_base - trace_ptr[i] > 30.0) { 
+                        const double baseline_excursion =
+                            trigger_is_falling
+                                ? init_base - trace_ptr[i]
+                                : trace_ptr[i] - init_base;
+                        if (baseline_excursion > 30.0) {
                             baseline_samples = (i > 5) ? i - 5 : 1; 
                             break;
                         }
@@ -1238,26 +1387,46 @@ int main(int argc, char **argv) {
                     // [핵심 교정] 노이즈 상쇄(Zero-Sum)가 완벽히 적용된 전하량 적분
                     // ====================================================================
                     double charge = 0.0;
-                    double min_adc = baseline; 
-                    
-                    for(size_t i = baseline_samples; i < trace_len; ++i) {
-                        // 1. 빗장(if)을 완전히 제거하여 위/아래 노이즈 요동을 모두 더해 0으로 상쇄
-                        charge += (baseline - trace_ptr[i]);
-                        
-                        // 2. 최대 파고(Pulse Height) 탐색은 실제 펄스의 최저점을 찾아야 하므로 유지
-                        if (trace_ptr[i] < min_adc) {
-                            min_adc = trace_ptr[i];
+                    double pulse_extremum = baseline;
+
+                    if (trigger_is_falling) {
+                        for(size_t i = baseline_samples; i < trace_len; ++i) {
+                            // Preserve the established falling-polarity DSP
+                            // arithmetic exactly.
+                            charge += (baseline - trace_ptr[i]);
+                            if (trace_ptr[i] < pulse_extremum) {
+                                pulse_extremum = trace_ptr[i];
+                            }
                         }
+                        pulse_height_ch[ch] =
+                            (baseline - pulse_extremum > 0)
+                                ? (baseline - pulse_extremum) : 0.0;
+                    } else {
+                        for(size_t i = baseline_samples; i < trace_len; ++i) {
+                            charge += (trace_ptr[i] - baseline);
+                            if (trace_ptr[i] > pulse_extremum) {
+                                pulse_extremum = trace_ptr[i];
+                            }
+                        }
+                        pulse_height_ch[ch] =
+                            (pulse_extremum - baseline > 0)
+                                ? (pulse_extremum - baseline) : 0.0;
                     }
-                    
-                    // 3. 적분 결과가 순수 노이즈 덩어리(결과값이 0 이하)인 경우에만 0으로 컷오프
+
+                    // Keep signed noise cancellation; only non-positive net
+                    // charge is clipped to zero for either polarity.
                     charge_ch[ch] = (charge > 0) ? charge : 0.0;
-                    pulse_height_ch[ch] = (baseline - min_adc > 0) ? (baseline - min_adc) : 0.0; 
                     // ====================================================================
 
-                    double trigger_threshold = baseline - 30.0; 
+                    const double trigger_threshold =
+                        trigger_is_falling ? baseline - 30.0
+                                           : baseline + 30.0;
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
-                        if (trace_ptr[i] < trigger_threshold) {
+                        const bool threshold_crossed =
+                            trigger_is_falling
+                                ? trace_ptr[i] < trigger_threshold
+                                : trace_ptr[i] > trigger_threshold;
+                        if (threshold_crossed) {
                             pulse_start_time_ch[ch] = i * 2.0; 
                             break;
                         }
@@ -1333,7 +1502,11 @@ int main(int argc, char **argv) {
                     } 
                     else if (cmd == "j" || cmd == "jump") {
                         int target; std::cin >> target;
-                        if (target > (int)current_event) { debug_event_id = target; continue_debug = false; }
+                        if (target >= 0 &&
+                            static_cast<uint64_t>(target) > current_event) {
+                            debug_event_id = target;
+                            continue_debug = false;
+                        }
                     }
                 }
             }
@@ -1380,8 +1553,14 @@ int main(int argc, char **argv) {
         double live_time_sec = real_time_sec - dead_time_sec;
         if (live_time_sec < 0) live_time_sec = 0.0;
         
-        uint64_t total_triggers = current_event + lost_events;
-        double lost_events_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
+        const long double total_triggers =
+            static_cast<long double>(current_event) +
+            static_cast<long double>(lost_events);
+        double lost_events_pct =
+            (total_triggers > 0.0L)
+                ? static_cast<double>(static_cast<long double>(lost_events) /
+                                      total_triggers * 100.0L)
+                : 0.0;
         double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
         
         double avg_rate = (real_time_sec > 0) ? (current_event / real_time_sec) : 0.0;
@@ -1400,16 +1579,25 @@ int main(int argc, char **argv) {
             TParameter<double> p_real("RealTime_sec", real_time_sec);
             TParameter<double> p_live("LiveTime_sec", live_time_sec);
             TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
-            TParameter<int> p_lost("LostEvents_count", lost_events);
-            TParameter<int> p_rec("RecordedEvents_count", current_event);
             TParameter<double> p_rate("TriggerRate_Hz", avg_rate); 
-            
-            if (p_real.Write() <= 0 || p_live.Write() <= 0 ||
-                p_dead.Write() <= 0 || p_lost.Write() <= 0 ||
-                p_rec.Write() <= 0 || p_rate.Write() <= 0 ||
-                fOut->TestBit(TFile::kWriteError)) {
-                std::cerr << "[Error] ROOT summary write failed\n";
+            const uint64_t long64_max = static_cast<uint64_t>(
+                std::numeric_limits<Long64_t>::max());
+            if (lost_events > long64_max || current_event > long64_max) {
+                std::cerr << "[Error] Conversion summary exceeds ROOT Long64_t range\n";
                 conversion_failed = true;
+            } else {
+                TParameter<Long64_t> p_lost(
+                    "LostEvents_count", static_cast<Long64_t>(lost_events));
+                TParameter<Long64_t> p_rec(
+                    "RecordedEvents_count", static_cast<Long64_t>(current_event));
+
+                if (p_real.Write() <= 0 || p_live.Write() <= 0 ||
+                    p_dead.Write() <= 0 || p_lost.Write() <= 0 ||
+                    p_rec.Write() <= 0 || p_rate.Write() <= 0 ||
+                    fOut->TestBit(TFile::kWriteError)) {
+                    std::cerr << "[Error] ROOT summary write failed\n";
+                    conversion_failed = true;
+                }
             }
         }
     }
@@ -1428,16 +1616,16 @@ int main(int argc, char **argv) {
         delete fOut;
         if (!conversion_failed && g_running) {
             try {
-                PublishTemporaryRootOutput(temporary_root_output, output_file);
+                PublishTemporaryRootOutput(&temporary_root_output, output_file);
                 std::cout << "\033[1;32m[Production] Conversion complete. Saved to \033[0m"
                           << output_file << "\n";
             } catch (const std::exception& error) {
                 std::cerr << "[Error] " << error.what() << "\n";
                 conversion_failed = true;
-                RemoveTemporaryRootOutput(temporary_root_output);
+                RemoveTemporaryRootOutput(&temporary_root_output);
             }
         } else {
-            RemoveTemporaryRootOutput(temporary_root_output);
+            RemoveTemporaryRootOutput(&temporary_root_output);
         }
     }
 

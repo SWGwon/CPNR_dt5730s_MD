@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import stat as stat_module
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
+
+
+RAW_EVENT_HEADER_BYTES = 24
 
 
 class RuntimeValidationError(ValueError):
@@ -41,6 +47,172 @@ def resolve_path(project_root: os.PathLike[str] | str,
     return path.resolve()
 
 
+def raw_event_size_bytes(record_length: int, channel_mask: int) -> int:
+    """Return the exact on-disk bytes occupied by one frontend raw event."""
+
+    if isinstance(record_length, bool) or not isinstance(record_length, int):
+        raise RuntimeValidationError("RecordLength는 정수여야 합니다.")
+    if record_length < 128 or record_length > 102400 or record_length % 8:
+        raise RuntimeValidationError(
+            "RecordLength는 128..102400 범위의 8의 배수여야 합니다."
+        )
+    if isinstance(channel_mask, bool) or not isinstance(channel_mask, int):
+        raise RuntimeValidationError("ChannelMask는 정수여야 합니다.")
+    if channel_mask < 1 or channel_mask > 0xFF:
+        raise RuntimeValidationError("ChannelMask는 1..255여야 합니다.")
+    active_channels = bin(channel_mask).count("1")
+    return RAW_EVENT_HEADER_BYTES + 2 * record_length * active_channels
+
+
+def expected_raw_size_bytes(
+    record_length: int,
+    channel_mask: int,
+    max_events: int,
+    *,
+    segments: int = 1,
+) -> int | None:
+    """Estimate an event-limited run exactly; return ``None`` if unbounded."""
+
+    event_bytes = raw_event_size_bytes(record_length, channel_mask)
+    if isinstance(max_events, bool) or not isinstance(max_events, int):
+        raise RuntimeValidationError("Max Events는 정수여야 합니다.")
+    if max_events < 0:
+        raise RuntimeValidationError("Max Events는 음수일 수 없습니다.")
+    if isinstance(segments, bool) or not isinstance(segments, int):
+        raise RuntimeValidationError("segment 수는 정수여야 합니다.")
+    if segments < 1:
+        raise RuntimeValidationError("segment 수는 1 이상이어야 합니다.")
+    if max_events == 0:
+        return None
+    return event_bytes * max_events * segments
+
+
+def _nearest_existing_directory(path: Path) -> Path:
+    candidate = path
+    while True:
+        try:
+            candidate_stat = candidate.stat()
+        except FileNotFoundError as exc:
+            if os.path.lexists(candidate):
+                raise RuntimeValidationError(
+                    f"출력 경로에 끊어진 symlink가 있습니다: {candidate}"
+                ) from exc
+        except OSError as exc:
+            raise RuntimeValidationError(
+                f"출력 경로를 확인할 수 없습니다: {candidate} ({exc})"
+            ) from exc
+        else:
+            if not stat_module.S_ISDIR(candidate_stat.st_mode):
+                raise RuntimeValidationError(
+                    f"출력 파일의 상위 경로가 디렉터리가 아닙니다: {candidate}"
+                )
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            raise RuntimeValidationError(
+                f"출력 경로의 파일시스템을 확인할 수 없습니다: {path}"
+            )
+        candidate = parent
+
+
+def _mount_point(path: Path) -> Path:
+    """Best-effort mount point for an existing directory."""
+
+    candidate = Path(os.path.realpath(path))
+    try:
+        device = candidate.stat().st_dev
+    except OSError as exc:
+        raise RuntimeValidationError(
+            f"출력 파일시스템을 확인할 수 없습니다: {candidate} ({exc})"
+        ) from exc
+    while candidate.parent != candidate and not os.path.ismount(candidate):
+        parent = candidate.parent
+        try:
+            if parent.stat().st_dev != device:
+                break
+        except OSError:
+            break
+        candidate = parent
+    return candidate
+
+
+def inspect_output_filesystem(
+    project_root: os.PathLike[str] | str,
+    output_value: os.PathLike[str] | str,
+) -> dict[str, object]:
+    """Inspect free space on the filesystem that will receive an output.
+
+    The final component is intentionally not resolved: a symlink there must
+    remain visible to the separate no-overwrite checks.  If the requested
+    parent does not exist yet, its nearest existing ancestor is inspected.
+    """
+
+    rendered = os.path.expanduser(os.fspath(output_value)).strip()
+    if not rendered:
+        raise RuntimeValidationError("출력 파일 경로가 비어 있습니다.")
+    output = Path(rendered)
+    if not output.is_absolute():
+        output = Path(project_root) / output
+    output = Path(os.path.abspath(output))
+    parent = output.parent
+    inspected = _nearest_existing_directory(parent)
+    if not os.access(inspected, os.W_OK | os.X_OK):
+        raise RuntimeValidationError(
+            f"출력 경로를 생성하거나 쓸 권한이 없습니다: {inspected}"
+        )
+    try:
+        usage = shutil.disk_usage(inspected)
+        stat = inspected.stat()
+    except OSError as exc:
+        raise RuntimeValidationError(
+            f"출력 파일시스템의 여유 공간을 확인할 수 없습니다: "
+            f"{inspected} ({exc})"
+        ) from exc
+    mount = _mount_point(inspected)
+    if hasattr(os, "major") and hasattr(os, "minor"):
+        device = f"{os.major(stat.st_dev)}:{os.minor(stat.st_dev)}"
+    else:  # pragma: no cover - non-POSIX fallback
+        device = str(stat.st_dev)
+    return {
+        "output_path": str(output),
+        "output_parent": str(parent),
+        "inspected_path": str(inspected),
+        "mount_point": str(mount),
+        "device": device,
+        "total_bytes": int(usage.total),
+        "free_bytes": int(usage.free),
+    }
+
+
+def validate_output_capacity(
+    free_bytes: int,
+    expected_raw_bytes: int | None,
+    minimum_free_bytes: int,
+) -> int:
+    """Apply the frontend's capacity rule and return required start bytes."""
+
+    values = (free_bytes, minimum_free_bytes)
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in values):
+        raise RuntimeValidationError("저장공간 값은 정수 byte 단위여야 합니다.")
+    if free_bytes < 0 or minimum_free_bytes < 0:
+        raise RuntimeValidationError("저장공간 값은 음수일 수 없습니다.")
+    if expected_raw_bytes is not None:
+        if (isinstance(expected_raw_bytes, bool)
+                or not isinstance(expected_raw_bytes, int)
+                or expected_raw_bytes < 0):
+            raise RuntimeValidationError("예상 RAW 크기가 올바르지 않습니다.")
+    required = minimum_free_bytes + (expected_raw_bytes or 0)
+    if free_bytes < required:
+        raise RuntimeValidationError(
+            "출력 파일시스템의 여유 공간이 부족합니다: "
+            f"available={free_bytes} bytes, "
+            f"expected_raw={expected_raw_bytes or 0} bytes, "
+            f"required_reserve={minimum_free_bytes} bytes"
+        )
+    return required
+
+
 def sha256_file(path: os.PathLike[str] | str) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -61,6 +233,56 @@ def file_identity(path: os.PathLike[str] | str) -> dict[str, object]:
             timespec="seconds"
         ),
     }
+
+
+def atomic_write_bytes_no_clobber(
+    destination: os.PathLike[str] | str,
+    payload: bytes,
+) -> Path:
+    """Publish a complete byte payload atomically without replacing anything.
+
+    The payload is written and synced through an exclusive temporary file in
+    the destination directory.  ``link`` is the atomic create-if-absent
+    publication step: every existing directory entry, including a broken
+    symlink or one created concurrently, makes it fail with
+    ``FileExistsError`` instead of being replaced.
+    """
+
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    rendered = os.path.expanduser(os.fspath(destination))
+    if not rendered:
+        raise ValueError("destination path is empty")
+    output = Path(os.path.abspath(rendered))
+    if not output.name:
+        raise ValueError("destination must name a file")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".cpnr-export-",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    created = os.fstat(descriptor)
+    created_identity = (created.st_dev, created.st_ino)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("report export write returned zero bytes")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+
+        # Unlike replace/rename, link fails atomically if output has appeared.
+        os.link(temporary, output, follow_symlinks=False)
+        return output
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _remove_if_same_file(temporary, created_identity)
 
 
 def identity_summary(identity: Mapping[str, object]) -> str:
@@ -187,6 +409,60 @@ def sidecar_paths(raw_output: os.PathLike[str] | str) -> tuple[Path, Path]:
     return Path(f"{raw}.config.conf"), Path(f"{raw}.run.json")
 
 
+def raw_partial_path(raw_output: os.PathLike[str] | str) -> Path:
+    """Return the failure-safe working name used by the DAQ frontend."""
+
+    raw = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_output))))
+    return Path(f"{raw}.partial")
+
+
+def _remove_if_same_file(path: Path, expected_identity: tuple[int, int]) -> bool:
+    """Delete only the expected inode without an lstat-to-unlink name race.
+
+    POSIX has no conditional unlink-by-inode.  Move the public name atomically
+    into a private same-directory quarantine, inspect that moved entry, and
+    unlink it only when it is still the file this process created.  A
+    replacement is restored with a no-clobber hard link where possible; if its
+    public name was reused concurrently, both entries are preserved.
+    """
+
+    parent = path.parent if path.parent != Path("") else Path(".")
+    quarantine = Path(tempfile.mkdtemp(prefix=".cpnr-cleanup-", dir=parent))
+    candidate = quarantine / "candidate"
+    quarantine_empty = True
+    try:
+        try:
+            os.rename(path, candidate)
+            quarantine_empty = False
+        except FileNotFoundError:
+            return True
+
+        moved = os.lstat(candidate)
+        if (moved.st_dev, moved.st_ino) == expected_identity:
+            os.unlink(candidate)
+            quarantine_empty = True
+            return True
+
+        try:
+            os.link(candidate, path, follow_symlinks=False)
+            os.unlink(candidate)
+            quarantine_empty = True
+        except OSError:
+            # The public name may have been reused, or the moved entry may not
+            # support hard links.  Leave it in the private quarantine rather
+            # than risking deletion or overwrite of unrelated data.
+            pass
+        return False
+    except OSError:
+        return False
+    finally:
+        if quarantine_empty:
+            try:
+                os.rmdir(quarantine)
+            except OSError:
+                pass
+
+
 def metadata_status_paths(
     metadata_output: os.PathLike[str] | str,
 ) -> tuple[Path, Path]:
@@ -196,6 +472,21 @@ def metadata_status_paths(
     return (
         Path(f"{metadata}.status.hardware_verified_not_started.json"),
         Path(f"{metadata}.status.running.json"),
+    )
+
+
+def frontend_expected_absent_paths(
+    raw_output: os.PathLike[str] | str,
+) -> tuple[Path, ...]:
+    """Artifacts that must still be absent immediately before frontend start."""
+
+    raw = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_output))))
+    _config, metadata = sidecar_paths(raw)
+    return (
+        raw,
+        raw_partial_path(raw),
+        metadata,
+        *metadata_status_paths(metadata),
     )
 
 
@@ -213,7 +504,8 @@ def create_run_config_snapshot(
     raw = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_output))))
     config, metadata = sidecar_paths(raw)
     status_paths = metadata_status_paths(metadata)
-    paths = (raw, config, metadata, *status_paths)
+    partial = raw_partial_path(raw)
+    paths = (raw, partial, config, metadata, *status_paths)
     raw.parent.mkdir(parents=True, exist_ok=True)
     collisions = [path for path in paths if os.path.lexists(path)]
     if collisions:
@@ -248,7 +540,7 @@ def create_run_config_snapshot(
         # being written. Preserve the colliding file and remove only our own
         # snapshot below.
         late_collisions = [
-            path for path in (raw, metadata, *status_paths)
+            path for path in (raw, partial, metadata, *status_paths)
             if os.path.lexists(path)
         ]
         if late_collisions:
@@ -258,15 +550,11 @@ def create_run_config_snapshot(
                 f"차단했습니다: {rendered}"
             )
     except Exception as exc:
-        # Remove only the inode this function created. A concurrently replaced
-        # path is somebody else's data and must be preserved.
+        # Remove only the inode this function created.  The quarantine helper
+        # avoids the lstat-then-unlink race that could otherwise delete a
+        # concurrently installed replacement.
         if created_identity is not None:
-            try:
-                current = os.lstat(config)
-                if (current.st_dev, current.st_ino) == created_identity:
-                    os.unlink(config)
-            except FileNotFoundError:
-                pass
+            _remove_if_same_file(config, created_identity)
         if isinstance(exc, FileExistsError):
             raise RuntimeValidationError(
                 "run output collision이 검사 직후 발생해 실행을 차단했습니다."

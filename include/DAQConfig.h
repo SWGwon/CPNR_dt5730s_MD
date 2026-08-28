@@ -26,6 +26,15 @@ struct DAQTriggerCalibrationSettings {
   uint32_t stable_measurements = 3;
 };
 
+struct DAQStorageSettings {
+  // Keep enough space for runtime metadata and an orderly failed-run prefix.
+  // The preflight reserve is added to the exact raw size for event-limited
+  // runs.  The runtime stop watermark prevents ENOSPC from being the normal
+  // mechanism that ends an unlimited/time-limited run.
+  uint64_t minimum_free_bytes = uint64_t{1024} * 1024U * 1024U;
+  uint64_t stop_free_bytes = uint64_t{512} * 1024U * 1024U;
+};
+
 enum class DAQPairLogic : uint32_t {
   kAnd = 0,
   kOr = 3,
@@ -46,6 +55,7 @@ struct DAQHardwareSettings {
   bool explicit_trigger_routing = false;
   DAQPairLogic pair_logic = DAQPairLogic::kOr;
   DAQTriggerCalibrationSettings trigger_calibration{};
+  DAQStorageSettings storage{};
   std::array<DAQChannelSettings, MAX_CH> channels{};
 };
 

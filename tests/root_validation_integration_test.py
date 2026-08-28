@@ -8,6 +8,7 @@ validator is then required to leave each input byte-for-byte unchanged.
 import hashlib
 import json
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -56,10 +57,18 @@ def read_only_identity(path: Path) -> tuple[int, int, int, int, int, int, str]:
     )
 
 
-def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
+def metadata_for(
+    raw: Path,
+    metadata: Path,
+    run_number: int,
+    *,
+    config: Path = CONFIG,
+    polarity: str = "falling",
+    pair_logic: str = "AND",
+) -> dict:
     channels = []
     for channel, baseline in ((0, 16164.0), (1, 16255.0)):
-        written = round(baseline) - 8
+        written = round(baseline) + (-8 if polarity == "falling" else 8)
         channels.append({
             "channel": channel,
             "trigger_enabled": True,
@@ -67,7 +76,7 @@ def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
             "input_range_readback": 0,
             "requested_dc_offset": 6554,
             "readback_dc_offset": 6554,
-            "polarity_readback": "falling",
+            "polarity_readback": polarity,
             "threshold_mode": "baseline_relative_mv",
             "measured_baseline_adc": baseline,
             "requested_threshold_mv": 1.0,
@@ -86,7 +95,7 @@ def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
             "input_range_readback": 0,
             "requested_dc_offset": 6554,
             "readback_dc_offset": 6554,
-            "polarity_readback": "falling",
+            "polarity_readback": polarity,
             "threshold_mode": "not_used_record_only",
             "measured_baseline_adc": baseline,
             "requested_threshold_mv": None,
@@ -105,9 +114,9 @@ def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
         "raw_output_size_bytes": raw.stat().st_size,
         "raw_output_sha256": sha256(raw),
         "metadata_path": str(metadata),
-        "config_path": str(CONFIG),
-        "config_sha256": sha256(CONFIG),
-        "source_config_path": str(CONFIG),
+        "config_path": str(config),
+        "config_sha256": sha256(config),
+        "source_config_path": str(config),
         "binary_path": str(PRODUCTION),
         "binary_sha256": sha256(PRODUCTION),
         "git_commit": "root-validator-integration-fixture",
@@ -124,7 +133,7 @@ def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
             "clock_source_readback": 0,
             "run_sync_mode": 0,
             "run_sync_mode_readback": 0,
-            "trigger_polarity": "falling",
+            "trigger_polarity": polarity,
             "record_mask": 15,
             "record_mask_readback": 15,
             "record_length": 512,
@@ -132,10 +141,15 @@ def metadata_for(raw: Path, metadata: Path, run_number: int) -> dict:
             "external_trigger_mode": 0,
             "self_trigger_mode": 1,
             "self_trigger_mask": 3,
-            "pair_logic": "AND",
+            "pair_logic": pair_logic,
             "explicit_trigger_routing": True,
             "global_trigger_mask_readback": 1,
-            "pair_logic_readback": [4, 0, 0, 0],
+            "pair_logic_readback": [
+                4 if pair_logic == "AND" else 7,
+                0,
+                0,
+                0,
+            ],
         },
         "channels": channels,
     }
@@ -146,10 +160,15 @@ def write_raw_fixture(
     event_count: int = 256,
     *,
     overlapping_trigger_pulses: bool = True,
+    polarity: str = "falling",
+    pulse_amplitude: int = 16,
+    board_counters: list[int] | tuple[int, ...] | None = None,
 ) -> None:
     record_length = 512
     channel_mask = 0xF
     baselines = (16164, 16255, 8192, 8192)
+    if board_counters is not None and len(board_counters) != event_count:
+        raise ValueError("board_counters length must equal event_count")
     with path.open("wb") as stream:
         for event_id in range(event_count):
             stream.write(struct.pack(
@@ -159,7 +178,8 @@ def write_raw_fixture(
                 record_length,
                 channel_mask,
                 0,
-                event_id,
+                event_id if board_counters is None
+                else board_counters[event_id],
             ))
             for channel, baseline in enumerate(baselines):
                 waveform = [baseline] * record_length
@@ -171,7 +191,12 @@ def write_raw_fixture(
                         240 if overlapping_trigger_pulses
                         else 220 + channel * 40
                     )
-                    waveform[pulse_start:pulse_start + 8] = [baseline - 16] * 8
+                    pulse_value = baseline + (
+                        -pulse_amplitude
+                        if polarity == "falling"
+                        else pulse_amplitude
+                    )
+                    waveform[pulse_start:pulse_start + 8] = [pulse_value] * 8
                 stream.write(struct.pack(
                     f"<{record_length}H", *waveform
                 ))
@@ -183,12 +208,13 @@ def run_converter(
     output: Path,
     run: int,
     *,
+    config: Path = CONFIG,
     save_waveforms: bool = False,
 ):
     command = [
         str(PRODUCTION),
         "-i", str(raw),
-        "-c", str(CONFIG),
+        "-c", str(config),
         "-m", str(metadata),
         "-r", str(run),
         "-o", str(output),
@@ -213,6 +239,53 @@ def run_validator(root_file: Path, *, max_events: int | None = None):
         capture_output=True,
         check=False,
     )
+
+
+def rewrite_board_counters(
+    source: Path, destination: Path, counters: list[int]
+) -> None:
+    rendered_counters = ", ".join(str(value) for value in counters)
+    expression = f'''
+TFile input({json.dumps(str(source))}, "READ");
+auto *source_tree = dynamic_cast<TTree*>(input.Get("phys_tree"));
+if (!source_tree || source_tree->GetEntries() != {len(counters)}) gSystem->Exit(1);
+source_tree->SetBranchStatus("BoardEventCounter", 0);
+TFile output({json.dumps(str(destination))}, "RECREATE");
+TIter next_key(input.GetListOfKeys());
+while (auto *key = dynamic_cast<TKey*>(next_key())) {{
+  if (TString(key->GetName()) == "phys_tree") continue;
+  auto *object = key->ReadObj();
+  if (!object) gSystem->Exit(2);
+  output.cd();
+  object->Write(key->GetName());
+  delete object;
+}}
+input.cd();
+source_tree->SetBranchStatus("BoardEventCounter", 0);
+output.cd();
+auto *destination_tree = source_tree->CloneTree(0);
+if (!destination_tree) gSystem->Exit(3);
+UInt_t replacement_counter = 0;
+destination_tree->Branch(
+    "BoardEventCounter", &replacement_counter, "BoardEventCounter/i");
+std::vector<UInt_t> counters = {{{rendered_counters}}};
+for (Long64_t entry = 0; entry < source_tree->GetEntries(); ++entry) {{
+  if (source_tree->GetEntry(entry) <= 0) gSystem->Exit(4);
+  replacement_counter = counters.at(static_cast<std::size_t>(entry));
+  destination_tree->Fill();
+}}
+destination_tree->Write("phys_tree", TObject::kOverwrite);
+output.Close();
+input.Close();
+'''
+    result = subprocess.run(
+        [str(ROOT), "-l", "-b", "-q", "-e", expression],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
 
 
 def decode_report(result: subprocess.CompletedProcess) -> dict:
@@ -355,6 +428,90 @@ class RootValidationIntegrationTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(read_only_identity(path), identity)
 
+    def test_board_counter_rollover_duplicate_backward_and_range(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_validator_counter_") as temp:
+            directory = Path(temp)
+            counters = [
+                0xFFFFFC,
+                0xFFFFFD,
+                0xFFFFFE,
+                0xFFFFFF,
+                0,
+                1,
+                2,
+                3,
+            ]
+            raw = directory / "rollover.dat"
+            write_raw_fixture(
+                raw, event_count=len(counters), board_counters=counters
+            )
+            metadata = directory / "rollover.dat.run.json"
+            metadata.write_text(
+                json.dumps(metadata_for(raw, metadata, 61), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            valid_root = directory / "rollover.root"
+            conversion = run_converter(
+                raw, metadata, valid_root, 61, save_waveforms=True
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            valid_identity = read_only_identity(valid_root)
+            valid_result = run_validator(valid_root)
+            self.assertEqual(
+                valid_result.returncode,
+                0,
+                valid_result.stdout + valid_result.stderr,
+            )
+            valid_report = decode_report(valid_result)
+            sequence_check = next(
+                item for item in valid_report["checks"]
+                if item.get("name") == "board_event_counter_sequence"
+            )
+            self.assertEqual(sequence_check["status"], "PASS", sequence_check)
+            self.assertEqual(
+                valid_report["summary"].get(
+                    "board_counter_reconstructed_lost_events"
+                ),
+                0,
+                valid_report,
+            )
+            self.assert_validation_was_read_only(valid_root, valid_identity)
+
+            anomaly_sequences = {
+                "duplicate": counters[:6] + [1, 2],
+                "backward": counters[:6] + [0, 1],
+                "range": counters[:6] + [0x1000000, 2],
+            }
+            for label, anomaly in anomaly_sequences.items():
+                with self.subTest(label=label):
+                    malformed = directory / f"{label}.root"
+                    rewrite_board_counters(valid_root, malformed, anomaly)
+                    identity = read_only_identity(malformed)
+                    result = run_validator(malformed)
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+                    report = decode_report(result)
+                    self.assertEqual(report["overall_status"], "FAIL", report)
+                    failed_names = {
+                        item.get("name")
+                        for item in report["checks"]
+                        if item.get("status") == "FAIL"
+                    }
+                    expected_name = (
+                        "board_event_counter_range"
+                        if label == "range"
+                        else "board_event_counter_sequence"
+                    )
+                    self.assertIn(expected_name, failed_names, report)
+                    self.assert_validation_was_read_only(malformed, identity)
+
     def test_valid_production_file_passes_and_is_not_modified(self):
         with tempfile.TemporaryDirectory(prefix="cpnr_root_validator_valid_") as temp:
             directory = Path(temp)
@@ -396,6 +553,26 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 report,
             )
             self.assertTrue(report["summary"].get("waveforms_saved"), report)
+            self.assertTrue(
+                report["summary"].get("audit_branches_saved"), report
+            )
+            self.assertEqual(
+                report["summary"].get(
+                    "board_counter_reconstructed_lost_events"
+                ),
+                0,
+                report,
+            )
+            audit_check = next(
+                check for check in report["checks"]
+                if check.get("name") == "audit_branches"
+            )
+            self.assertEqual(audit_check["status"], "PASS", audit_check)
+            lost_check = next(
+                check for check in report["checks"]
+                if check.get("name") == "board_counter_lost_event_count"
+            )
+            self.assertEqual(lost_check["status"], "PASS", lost_check)
             for channel in report["channels"]:
                 self.assertEqual(
                     channel.get("metrics", {}).get("waveform_dsp_mismatches"),
@@ -422,6 +599,35 @@ class RootValidationIntegrationTests(unittest.TestCase):
             self.assertEqual(sampled_report["overall_status"], "WARN")
             self.assertTrue(sampled_report["analysis"]["sampled"])
             self.assertEqual(
+                sampled_report.get("input", {}).get("validation_mode"),
+                "prefix",
+                sampled_report,
+            )
+            self.assertIsNone(
+                sampled_report.get("input", {}).get("sha256"),
+                sampled_report,
+            )
+            self.assertIsNone(
+                sampled_report.get("input", {}).get("sha256_end"),
+                sampled_report,
+            )
+            sha_check = next(
+                check for check in sampled_report["checks"]
+                if check.get("name") == "file_sha256_stable"
+            )
+            self.assertEqual(sha_check["status"], "SKIP", sha_check)
+            external_hash_checks = [
+                check for check in sampled_report["checks"]
+                if str(check.get("name", "")).startswith("external_")
+                and check.get("name") != "external_artifact_validation"
+            ]
+            self.assertTrue(external_hash_checks, sampled_report)
+            self.assertTrue(
+                all(check.get("status") == "SKIP"
+                    for check in external_hash_checks),
+                external_hash_checks,
+            )
+            self.assertEqual(
                 sampled_report.get("domain_status", {}).get("data_integrity"),
                 "WARN",
                 sampled_report,
@@ -438,6 +644,174 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 if check.get("name") == "analysis_coverage"
             )
             self.assertEqual(coverage["status"], "WARN", coverage)
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_relocated_bundle_provenance_is_authenticated(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_validator_relocation_") as temp:
+            directory = Path(temp)
+            original = directory / "original"
+            relocated = directory / "relocated"
+            original.mkdir()
+            relocated.mkdir()
+
+            raw_name = "fixture_run026.dat"
+            config_name = raw_name + ".config.conf"
+            metadata_name = raw_name + ".run.json"
+            original_raw = original / raw_name
+            original_config = original / config_name
+            original_metadata = original / metadata_name
+            write_raw_fixture(original_raw)
+            shutil.copy2(CONFIG, original_config)
+            original_metadata.write_text(
+                json.dumps(metadata_for(
+                    original_raw,
+                    original_metadata,
+                    26,
+                    config=original_config,
+                ), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            original_files = (
+                original_raw,
+                original_config,
+                original_metadata,
+            )
+            original_identities = {
+                path: read_only_identity(path) for path in original_files
+            }
+
+            relocated_raw = relocated / raw_name
+            relocated_config = relocated / config_name
+            relocated_metadata = relocated / metadata_name
+            for source, destination in zip(
+                original_files,
+                (relocated_raw, relocated_config, relocated_metadata),
+            ):
+                shutil.copy2(source, destination)
+            relocated_files = (
+                relocated_raw,
+                relocated_config,
+                relocated_metadata,
+            )
+            relocated_identities = {
+                path: read_only_identity(path) for path in relocated_files
+            }
+
+            output = relocated / "fixture_run026_prod.root"
+            conversion = run_converter(
+                relocated_raw,
+                relocated_metadata,
+                output,
+                26,
+                config=relocated_config,
+                save_waveforms=True,
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            output_identity = read_only_identity(output)
+            validation = run_validator(output)
+            self.assertEqual(
+                validation.returncode,
+                0,
+                validation.stdout + validation.stderr,
+            )
+            report = decode_report(validation)
+            self.assert_report_shape(report)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            paths = next(
+                check for check in report["checks"]
+                if check.get("name") == "embedded_artifact_paths"
+            )
+            self.assertEqual(paths["status"], "PASS", paths)
+            self.assertEqual(
+                paths.get("observed", {}).get("relocated"),
+                {"raw": True, "config": True, "metadata": True},
+                paths,
+            )
+            for name in (
+                "external_resolved_raw_output",
+                "external_resolved_runtime_config",
+                "external_resolved_runtime_metadata",
+            ):
+                check = next(
+                    item for item in report["checks"]
+                    if item.get("name") == name
+                )
+                self.assertEqual(check["status"], "PASS", check)
+            self.assert_validation_was_read_only(output, output_identity)
+            for path, identity in original_identities.items():
+                self.assertEqual(read_only_identity(path), identity)
+            for path, identity in relocated_identities.items():
+                self.assertEqual(read_only_identity(path), identity)
+
+    def test_rising_polarity_dsp_is_recomputed_and_validated(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_root_validator_rising_") as temp:
+            directory = Path(temp)
+            rising_text, replacements = re.subn(
+                r"(?m)^(\s*TriggerPolarity\s*=\s*)1(\s*(?:#.*)?)$",
+                r"\g<1>0\2",
+                CONFIG.read_text(encoding="utf-8"),
+                count=1,
+            )
+            self.assertEqual(replacements, 1)
+            rising_config = directory / "rising.conf"
+            rising_config.write_text(rising_text, encoding="utf-8")
+
+            raw = directory / "rising_run025.dat"
+            write_raw_fixture(raw, polarity="rising", pulse_amplitude=64)
+            metadata = directory / "rising_run025.dat.run.json"
+            metadata.write_text(
+                json.dumps(metadata_for(
+                    raw,
+                    metadata,
+                    25,
+                    config=rising_config,
+                    polarity="rising",
+                ), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "rising_run025_prod.root"
+            conversion = run_converter(
+                raw,
+                metadata,
+                output,
+                25,
+                config=rising_config,
+                save_waveforms=True,
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            identity = read_only_identity(output)
+            validation = run_validator(output)
+            self.assertEqual(
+                validation.returncode,
+                0,
+                validation.stdout + validation.stderr,
+            )
+            report = decode_report(validation)
+            self.assert_report_shape(report)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            self.assertEqual(
+                report.get("metadata", {}).get("hardware", {}).get(
+                    "trigger_polarity"
+                ),
+                "rising",
+                report,
+            )
+            for channel in report["channels"][:2]:
+                metrics = channel.get("metrics", {})
+                self.assertEqual(metrics.get("waveform_dsp_mismatches"), 0)
+                self.assertEqual(metrics.get("pulse_height_min_adc"), 64.0)
+                self.assertEqual(metrics.get("pulse_height_max_adc"), 64.0)
+                self.assertEqual(metrics.get("charge_min_adc_samples"), 512.0)
+                self.assertEqual(metrics.get("charge_max_adc_samples"), 512.0)
+                self.assertEqual(metrics.get("t0_found_fraction"), 1.0)
             self.assert_validation_was_read_only(output, identity)
 
     def test_legacy_file_is_fully_scanned_but_fails_provenance(self):
@@ -547,6 +921,124 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 report["summary"].get("routing_evidence_mode"),
                 "simultaneous_waveform_comparator_overlap",
             )
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_waveform_or_accepts_nonoverlapping_channel_crossings(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_root_validator_or_") as temp:
+            directory = Path(temp)
+            or_text, replacements = re.subn(
+                r"(?m)^(\s*PairLogic\s*=\s*)AND(\s*(?:#.*)?)$",
+                r"\g<1>OR\2",
+                CONFIG.read_text(encoding="utf-8"),
+                count=1,
+            )
+            self.assertEqual(replacements, 1)
+            or_config = directory / "or.conf"
+            or_config.write_text(or_text, encoding="utf-8")
+            raw = directory / "fixture_run023.dat"
+            write_raw_fixture(
+                raw, event_count=128, overlapping_trigger_pulses=False
+            )
+            metadata = directory / "fixture_run023.dat.run.json"
+            metadata.write_text(
+                json.dumps(
+                    metadata_for(
+                        raw,
+                        metadata,
+                        23,
+                        config=or_config,
+                        pair_logic="OR",
+                    ),
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "fixture_run023_prod.root"
+            conversion = run_converter(
+                raw,
+                metadata,
+                output,
+                23,
+                config=or_config,
+                save_waveforms=True,
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            identity = read_only_identity(output)
+            validation = run_validator(output)
+            self.assertEqual(
+                validation.returncode,
+                0,
+                validation.stdout + validation.stderr,
+            )
+            report = decode_report(validation)
+            self.assert_report_shape(report)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            routing = next(
+                check for check in report["checks"]
+                if check.get("name") == "routing_event_evidence"
+            )
+            self.assertEqual(routing["status"], "PASS", routing)
+            self.assertEqual(
+                report["summary"].get("routing_evidence_mode"),
+                "waveform_comparator_crossing",
+            )
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_post_calibration_baseline_drift_fails_effective_threshold(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_threshold_drift_") as temp:
+            directory = Path(temp)
+            raw = directory / "fixture_run024.dat"
+            write_raw_fixture(raw, event_count=64)
+            metadata = directory / "fixture_run024.dat.run.json"
+            document = metadata_for(raw, metadata, 24)
+            for channel in document["channels"][:2]:
+                stale_baseline = channel["measured_baseline_adc"] - 100.0
+                stale_threshold = round(stale_baseline) - 8
+                channel["measured_baseline_adc"] = stale_baseline
+                channel["written_threshold_adc"] = stale_threshold
+                channel["readback_threshold_adc"] = stale_threshold
+                channel["effective_threshold_mv"] = (
+                    abs(stale_baseline - stale_threshold) * 2000.0 / 16384.0
+                )
+            metadata.write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8"
+            )
+            output = directory / "fixture_run024_prod.root"
+            conversion = run_converter(
+                raw, metadata, output, 24, save_waveforms=True
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            identity = read_only_identity(output)
+            validation = run_validator(output)
+            self.assertEqual(
+                validation.returncode,
+                0,
+                validation.stdout + validation.stderr,
+            )
+            report = decode_report(validation)
+            self.assertEqual(report["overall_status"], "FAIL", report)
+            for channel in (0, 1):
+                threshold_check = next(
+                    check for check in report["checks"]
+                    if check.get("name")
+                    == f"channel_{channel}_effective_threshold"
+                )
+                self.assertEqual(
+                    threshold_check["status"], "FAIL", threshold_check
+                )
+                self.assertGreater(
+                    threshold_check["observed"]["calibration_drift_adc"],
+                    90.0,
+                    threshold_check,
+                )
             self.assert_validation_was_read_only(output, identity)
 
     def test_array_disguised_as_scalar_is_rejected_before_binding(self):

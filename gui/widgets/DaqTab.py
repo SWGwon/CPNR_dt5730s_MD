@@ -1,6 +1,6 @@
 import os
-import shutil
 import configparser
+import json
 import re
 import math
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
@@ -10,26 +10,87 @@ from PyQt6.QtGui import QFont, QTextCursor, QPainter, QColor, QPen, QBrush, QLin
 from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
 
 from core.ProcessManager import ProcessManager
-from core.DatabaseManager import DatabaseManager
+from core.DatabaseManager import DatabaseManager, DatabaseError
 from core.process_output import parse_drop_count
 from core.trigger_settings import millivolts_to_adc_delta
 from core.runtime_paths import (
     RuntimeValidationError,
     build_frontend_command,
     create_run_config_snapshot,
+    expected_raw_size_bytes,
     file_identity,
     find_project_root,
+    frontend_expected_absent_paths,
     frontend_sources,
     identity_summary,
-    metadata_status_paths,
+    inspect_output_filesystem,
+    raw_event_size_bytes,
     resolve_path,
     sidecar_paths,
+    validate_output_capacity,
     verify_binary_fresh,
     verify_deployed_gui,
 )
 
 DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic.conf"
 LEGACY_DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic_master.conf"
+
+
+def format_iec_bytes(value):
+    """Compact, deterministic IEC byte rendering for operator displays."""
+
+    size = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(size) < 1024.0 or suffix == "PiB":
+            precision = 0 if suffix == "B" else 2
+            return f"{size:.{precision}f} {suffix}"
+        size /= 1024.0
+
+
+def validate_stop_condition(stop_index, max_events, run_time_sec):
+    """Reject a selected finite stop mode whose limit would mean unlimited."""
+
+    if stop_index == 1 and max_events <= 0:
+        raise ValueError(
+            "Stop Cond가 Max Events이면 Evts를 1 이상으로 설정해야 합니다. "
+            "0은 무기한 실행으로 변환하지 않습니다."
+        )
+    if stop_index == 2 and run_time_sec <= 0:
+        raise ValueError(
+            "Stop Cond가 Max Time이면 Sec를 1 이상으로 설정해야 합니다. "
+            "0은 무기한 실행으로 변환하지 않습니다."
+        )
+    if stop_index not in (0, 1, 2):
+        raise ValueError(f"알 수 없는 Stop Cond 선택값입니다: {stop_index}")
+
+
+def load_completed_run_metadata(metadata_path, raw_path, run_number):
+    """Validate the terminal sidecar before treating rc=0 as DAQ success."""
+
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        document = json.load(metadata_file)
+    if not isinstance(document, dict):
+        raise ValueError("runtime metadata must be a JSON object")
+    if document.get("acquisition_status") != "completed":
+        raise ValueError(
+            "runtime metadata acquisition_status is not 'completed'"
+        )
+    if document.get("run_number") != int(run_number):
+        raise ValueError(
+            "runtime metadata run_number does not match the launched run"
+        )
+    requested_output = document.get("requested_raw_output_path")
+    if not requested_output or os.path.abspath(requested_output) != os.path.abspath(raw_path):
+        raise ValueError(
+            "runtime metadata requested_raw_output_path does not match the run"
+        )
+    if document.get("raw_output_published") is not True:
+        raise ValueError("runtime metadata does not confirm raw publication")
+    if document.get("raw_output_finalized") is not True:
+        raise ValueError("runtime metadata does not confirm raw finalization")
+    if not os.path.isfile(raw_path):
+        raise ValueError("completed runtime metadata exists but raw output is missing")
+    return document
 
 # =========================================================================
 # [물리적 방향성(Negative Pulse)이 적용된 1D 스캔 비주얼라이저]
@@ -142,13 +203,19 @@ class DaqTab(QWidget):
         self.current_batch = 0; self.total_batches = 1
         self.base_output_path = ""; self.scan_values = [] 
         self.last_stats = {}; self.current_run_id = -1
+        self.current_run_uuid = ""
         self.current_run_no = 1
         self.validated_config_full = ""
         self.validated_config_text = ""
         self.validated_config_identity = {}
         self.validated_frontend_identity = {}
         self.config_uses_mv_threshold = False
+        self.validated_storage_settings = None
+        self.last_storage_plan = None
         self.current_run_context = None
+        self.stop_requested = False
+        self.config_dirty = False
+        self.dirty_config_path = ""
         
         self.setup_ui()
         self.load_settings()
@@ -167,6 +234,7 @@ class DaqTab(QWidget):
         file_layout.addWidget(QLabel("Config (.conf):"), 0, 0)
         self.config_input = QLineEdit(DEFAULT_CONFIG_PATH)
         self.config_input.textChanged.connect(self.refresh_runtime_identities)
+        self.config_input.textChanged.connect(self.update_disk_space)
         file_layout.addWidget(self.config_input, 0, 1)
         self.btn_browse_config = QPushButton("Browse")
         self.btn_browse_config.clicked.connect(self.browse_config)
@@ -176,6 +244,7 @@ class DaqTab(QWidget):
         
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit("data/data_run.dat")
+        self.output_input.textChanged.connect(self.update_disk_space)
         out_layout.addWidget(self.output_input)
         self.spin_run_no = QSpinBox()
         self.spin_run_no.setPrefix("Run No: ")
@@ -226,6 +295,14 @@ class DaqTab(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         file_layout.addWidget(self.lbl_gui_identity, 5, 1, 1, 2)
+
+        file_layout.addWidget(QLabel("Output storage:"), 6, 0)
+        self.lbl_output_storage = QLabel("Checking selected output path...")
+        self.lbl_output_storage.setWordWrap(True)
+        self.lbl_output_storage.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        file_layout.addWidget(self.lbl_output_storage, 6, 1, 1, 2)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
@@ -237,9 +314,11 @@ class DaqTab(QWidget):
         self.combo_stop_cond = QComboBox()
         self.combo_stop_cond.addItems(["Unlimited", "Max Events", "Max Time"])
         self.combo_stop_cond.currentIndexChanged.connect(self.toggle_stop_cond)
+        self.combo_stop_cond.currentIndexChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.combo_stop_cond)
         
         self.spin_events = QSpinBox(); self.spin_events.setRange(0, 2000000000); self.spin_events.setPrefix("Evts: ")
+        self.spin_events.valueChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.spin_events)
         
         self.spin_time = QSpinBox(); self.spin_time.setRange(0, 86400); self.spin_time.setPrefix("Sec: ")
@@ -249,10 +328,12 @@ class DaqTab(QWidget):
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Single Continuous", "Split/Batch Mode", "Auto Threshold Scan"])
         self.combo_mode.currentIndexChanged.connect(self.toggle_batch_mode)
+        self.combo_mode.currentIndexChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.combo_mode)
         
         self.lbl_batch = QLabel("Batches:")
         self.spin_batch = QSpinBox(); self.spin_batch.setRange(2, 999); self.spin_batch.setEnabled(False)
+        self.spin_batch.valueChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.lbl_batch)
         cond_layout1.addWidget(self.spin_batch)
         cond_main_layout.addLayout(cond_layout1)
@@ -271,6 +352,9 @@ class DaqTab(QWidget):
         
         self.spin_scan_start.valueChanged.connect(self.emit_scan_range)
         self.spin_scan_end.valueChanged.connect(self.emit_scan_range)
+        self.spin_scan_start.valueChanged.connect(self.update_disk_space)
+        self.spin_scan_end.valueChanged.connect(self.update_disk_space)
+        self.spin_scan_step.valueChanged.connect(self.update_disk_space)
         
         cond_main_layout.addLayout(self.scan_layout)
 
@@ -446,18 +530,214 @@ class DaqTab(QWidget):
         self.save_settings()
         self.refresh_runtime_identities()
 
+    @pyqtSlot(str, bool)
+    def set_config_dirty(self, path, dirty):
+        self.dirty_config_path = (
+            str(resolve_path(self.proj_dir, path)) if path else ""
+        )
+        self.config_dirty = bool(dirty)
+
+    def ensure_selected_config_is_saved(self, config_path):
+        if not self.config_dirty or not self.dirty_config_path:
+            return
+        selected = str(resolve_path(self.proj_dir, config_path))
+        if selected == self.dirty_config_path:
+            raise ValueError(
+                "Hardware Config 탭에 저장되지 않은 변경사항이 있습니다. "
+                "Save .conf를 누른 뒤 DAQ를 시작하세요."
+            )
+
     def browse_output(self):
         path, _ = QFileDialog.getSaveFileName(self, "Select Base Output File", self.data_dir, "Data Files (*.dat);;All Files (*)")
         if path: 
             self.output_input.setText(os.path.relpath(path, self.proj_dir))
             self.save_settings()
 
-    def update_disk_space(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-        total, used, free = shutil.disk_usage(self.data_dir)
-        free_gb = free / (2**30)
-        self.val_disk.setStyleSheet(self.val_style_warn if free_gb < 10.0 else self.val_style)
-        self.val_disk.setText(f"{free_gb:.1f} GB")
+    def _storage_settings_from_selected_config(self):
+        config_value = self.config_input.text().strip()
+        if not config_value:
+            raise RuntimeValidationError("설정 파일 경로가 비어 있습니다.")
+        config_path = resolve_path(self.proj_dir, config_value)
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                parser.read_file(config_file)
+            record_length = parser.getint("Digitizer", "RecordLength")
+            channel_mask = parser.getint("Digitizer", "ChannelMask")
+            minimum_free_mib = (
+                parser.getint("Storage", "MinimumFreeMiB")
+                if parser.has_option("Storage", "MinimumFreeMiB") else 1024
+            )
+            stop_free_mib = (
+                parser.getint("Storage", "StopFreeMiB")
+                if parser.has_option("Storage", "StopFreeMiB") else 512
+            )
+        except (OSError, UnicodeError, configparser.Error, ValueError) as exc:
+            raise RuntimeValidationError(
+                f"저장공간 계산용 설정을 읽을 수 없습니다: {config_path} ({exc})"
+            ) from exc
+
+        # This also enforces the exact raw-format limits used by the frontend.
+        raw_event_size_bytes(record_length, channel_mask)
+        if not 64 <= minimum_free_mib <= 1048576:
+            raise RuntimeValidationError(
+                "[Storage] MinimumFreeMiB는 64..1048576이어야 합니다."
+            )
+        if not 32 <= stop_free_mib <= 1048575:
+            raise RuntimeValidationError(
+                "[Storage] StopFreeMiB는 32..1048575여야 합니다."
+            )
+        if stop_free_mib >= minimum_free_mib:
+            raise RuntimeValidationError(
+                "[Storage] StopFreeMiB는 MinimumFreeMiB보다 작아야 합니다."
+            )
+        return {
+            "record_length": record_length,
+            "channel_mask": channel_mask,
+            "minimum_free_bytes": minimum_free_mib * 1024 * 1024,
+            "stop_free_bytes": stop_free_mib * 1024 * 1024,
+        }
+
+    def _planned_segment_count(self):
+        mode = self.combo_mode.currentIndex()
+        if mode == 1:
+            return self.spin_batch.value()
+        if mode == 2:
+            start = self.spin_scan_start.value()
+            end = self.spin_scan_end.value()
+            step = self.spin_scan_step.value()
+            return len(
+                range(start, end + 1, step)
+                if start <= end else range(start, end - 1, -step)
+            )
+        return 1
+
+    def _build_storage_plan(self, *, output_path=None, settings=None,
+                            segments=None, enforce=False):
+        settings = settings or self._storage_settings_from_selected_config()
+        segments = self._planned_segment_count() if segments is None else segments
+        stop_index = self.combo_stop_cond.currentIndex()
+        max_events = self.spin_events.value() if stop_index == 1 else 0
+        output_value = (
+            self.output_input.text().strip()
+            if output_path is None else str(output_path)
+        )
+        filesystem = inspect_output_filesystem(
+            self.proj_dir, output_value
+        )
+        event_bytes = raw_event_size_bytes(
+            settings["record_length"], settings["channel_mask"]
+        )
+        expected_segment = expected_raw_size_bytes(
+            settings["record_length"], settings["channel_mask"], max_events
+        )
+        expected_total = expected_raw_size_bytes(
+            settings["record_length"], settings["channel_mask"], max_events,
+            segments=segments,
+        )
+        required_bytes = settings["minimum_free_bytes"] + (
+            expected_total or 0
+        )
+        if enforce:
+            validate_output_capacity(
+                filesystem["free_bytes"], expected_total,
+                settings["minimum_free_bytes"],
+            )
+        return {
+            **filesystem,
+            **settings,
+            "event_bytes": event_bytes,
+            "max_events": max_events,
+            "segments": segments,
+            "expected_segment_bytes": expected_segment,
+            "expected_total_bytes": expected_total,
+            "required_bytes": required_bytes,
+            "capacity_ok": filesystem["free_bytes"] >= required_bytes,
+        }
+
+    def _show_storage_plan(self, plan):
+        expected = plan["expected_total_bytes"]
+        if expected is None:
+            estimate_text = "RAW 크기 미확정(시간/수동 종료)"
+            requirement_text = (
+                f"start reserve {format_iec_bytes(plan['minimum_free_bytes'])}"
+            )
+        else:
+            estimate_text = (
+                f"planned RAW {format_iec_bytes(expected)} "
+                f"({format_iec_bytes(plan['expected_segment_bytes'])}"
+                f" × {plan['segments']})"
+            )
+            requirement_text = (
+                f"required {format_iec_bytes(plan['required_bytes'])}"
+            )
+        ancestor_note = ""
+        if plan["inspected_path"] != plan["output_parent"]:
+            ancestor_note = f"; nearest existing={plan['inspected_path']}"
+        details = (
+            f"target={plan['output_parent']} | filesystem={plan['mount_point']} "
+            f"(dev {plan['device']}{ancestor_note}) | "
+            f"free {format_iec_bytes(plan['free_bytes'])} / "
+            f"{format_iec_bytes(plan['total_bytes'])} | "
+            f"event {format_iec_bytes(plan['event_bytes'])} | "
+            f"{estimate_text} | {requirement_text} | runtime stop watermark "
+            f"{format_iec_bytes(plan['stop_free_bytes'])}"
+        )
+        style = (
+            "color: #495057;" if plan["capacity_ok"] else
+            "color: #dc3545; font-weight: bold;"
+        )
+        self.lbl_output_storage.setStyleSheet(style)
+        self.lbl_output_storage.setText(details)
+        self.val_disk.setStyleSheet(
+            self.val_style if plan["capacity_ok"] else self.val_style_warn
+        )
+        if expected is None:
+            self.val_disk.setText(
+                f"{format_iec_bytes(plan['free_bytes'])} free / "
+                f"{format_iec_bytes(plan['minimum_free_bytes'])} reserve"
+            )
+        else:
+            self.val_disk.setText(
+                f"{format_iec_bytes(plan['free_bytes'])} free / "
+                f"{format_iec_bytes(plan['required_bytes'])} required"
+            )
+        self.val_disk.setToolTip(details)
+        self.last_storage_plan = plan
+
+    @staticmethod
+    def _storage_log_summary(plan):
+        expected = plan["expected_total_bytes"]
+        expected_text = (
+            "unknown" if expected is None else format_iec_bytes(expected)
+        )
+        return (
+            f"filesystem={plan['mount_point']} dev={plan['device']}, "
+            f"free={format_iec_bytes(plan['free_bytes'])}, "
+            f"event={format_iec_bytes(plan['event_bytes'])}, "
+            f"planned_raw={expected_text}, segments={plan['segments']}, "
+            f"start_reserve={format_iec_bytes(plan['minimum_free_bytes'])}, "
+            f"stop_watermark={format_iec_bytes(plan['stop_free_bytes'])}"
+        )
+
+    def update_disk_space(self, *_):
+        if not hasattr(self, "val_disk") or not hasattr(
+            self, "lbl_output_storage"
+        ):
+            return
+        try:
+            plan = self._build_storage_plan()
+            self._show_storage_plan(plan)
+        except (OSError, ValueError, RuntimeValidationError) as exc:
+            self.last_storage_plan = None
+            self.val_disk.setStyleSheet(self.val_style_warn)
+            self.val_disk.setText("Storage unavailable")
+            self.val_disk.setToolTip(str(exc))
+            self.lbl_output_storage.setStyleSheet(
+                "color: #dc3545; font-weight: bold;"
+            )
+            self.lbl_output_storage.setText(f"UNAVAILABLE: {exc}")
 
     def append_log(self, text):
         safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -511,6 +791,7 @@ class DaqTab(QWidget):
             self.stop_all()
 
     def validate_config_before_start(self):
+        self.validated_storage_settings = None
         config_path = self.config_input.text().strip()
         if not config_path:
             raise ValueError("설정 파일 경로가 비어 있습니다.")
@@ -572,6 +853,22 @@ class DaqTab(QWidget):
                 )
             return value
 
+        def optional_int(section, key, default_value, min_value, max_value):
+            if section not in config_data or key not in config_data[section]:
+                return default_value
+            raw_value = config_data[section][key]
+            if not re.fullmatch(r'[+-]?[0-9]+', raw_value):
+                raise ValueError(
+                    f"정수가 아닌 설정값입니다: [{section}] {key}={raw_value}"
+                )
+            value = int(raw_value, 10)
+            if not min_value <= value <= max_value:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"(허용 {min_value}..{max_value})"
+                )
+            return value
+
         def required_choice(section, key, choices):
             if section not in config_data or key not in config_data[section]:
                 raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
@@ -618,6 +915,16 @@ class DaqTab(QWidget):
         if input_range_mv not in (500, 2000):
             raise ValueError("[Digitizer] InputRangeMv는 500 또는 2000이어야 합니다.")
         adc_bits = required_int("Digitizer", "ADCBits", 14, 14)
+        minimum_free_mib = optional_int(
+            "Storage", "MinimumFreeMiB", 1024, 64, 1048576
+        )
+        stop_free_mib = optional_int(
+            "Storage", "StopFreeMiB", 512, 32, 1048575
+        )
+        if stop_free_mib >= minimum_free_mib:
+            raise ValueError(
+                "[Storage] StopFreeMiB는 MinimumFreeMiB보다 작아야 합니다."
+            )
         if "Synchronization" in config_data:
             required_int("Synchronization", "ClockSource", 0, 1)
             required_int("Synchronization", "RunSyncMode", 0, 4)
@@ -752,6 +1059,12 @@ class DaqTab(QWidget):
             )
 
         self.config_uses_mv_threshold = uses_mv_threshold
+        self.validated_storage_settings = {
+            "record_length": record_length,
+            "channel_mask": channel_mask,
+            "minimum_free_bytes": minimum_free_mib * 1024 * 1024,
+            "stop_free_bytes": stop_free_mib * 1024 * 1024,
+        }
         self.validated_config_text = "".join(config_lines)
 
         return config_full
@@ -759,6 +1072,17 @@ class DaqTab(QWidget):
     def start_daq_sequence(self):
         try:
             self.validated_config_full = self.validate_config_before_start()
+            self.ensure_selected_config_is_saved(self.validated_config_full)
+            validate_stop_condition(
+                self.combo_stop_cond.currentIndex(),
+                self.spin_events.value(),
+                self.spin_time.value(),
+            )
+            storage_plan = self._build_storage_plan(
+                settings=self.validated_storage_settings,
+                enforce=True,
+            )
+            self._show_storage_plan(storage_plan)
             if self.combo_mode.currentIndex() == 2 and self.config_uses_mv_threshold:
                 raise ValueError(
                     "Auto Threshold Scan은 legacy absolute ADC threshold 전용입니다. "
@@ -775,12 +1099,16 @@ class DaqTab(QWidget):
             return
 
         self.current_run_no = self.spin_run_no.value()
+        self.stop_requested = False
 
         self.append_log(
             f"[Runtime] Frontend: {identity_summary(frontend_identity)}"
         )
         self.append_log(
             f"[Runtime] Source config: {identity_summary(config_identity)}"
+        )
+        self.append_log(
+            f"[Storage Plan] {self._storage_log_summary(storage_plan)}"
         )
         
         self.save_settings()
@@ -813,7 +1141,23 @@ class DaqTab(QWidget):
         try:
             self.run_single_batch()
             return True
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, DatabaseError) as exc:
+            if self.current_run_id > 0:
+                try:
+                    self.db.mark_daq_launch_failed(
+                        self.current_run_id,
+                        str(exc),
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            self.current_run_context.get("raw_file")
+                            if self.current_run_context else None
+                        ),
+                    )
+                except Exception as db_exc:
+                    self.append_log(
+                        "[DB Error] launch failure 상태를 기록하지 못했습니다: "
+                        f"{db_exc}"
+                    )
             self.total_batches = 0
             self.current_run_context = None
             self.append_log(f"[Launch Error] DAQ를 시작하지 않았습니다: {exc}")
@@ -827,6 +1171,8 @@ class DaqTab(QWidget):
             return False
 
     def run_single_batch(self):
+        self.current_run_id = -1
+        self.current_run_uuid = ""
         self.last_stats = {}
         self.val_batch.setText(f"{self.current_batch} / {self.total_batches}")
         
@@ -844,6 +1190,20 @@ class DaqTab(QWidget):
 
         out_file_full = os.path.abspath(os.path.join(self.proj_dir, output_file))
         os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
+
+        remaining_segments = max(
+            1, self.total_batches - self.current_batch + 1
+        )
+        storage_plan = self._build_storage_plan(
+            output_path=out_file_full,
+            settings=self.validated_storage_settings,
+            segments=remaining_segments,
+            enforce=True,
+        )
+        self._show_storage_plan(storage_plan)
+        self.append_log(
+            f"[Storage Preflight] {self._storage_log_summary(storage_plan)}"
+        )
 
         config_full = self.validated_config_full
         run_config_content = self.validated_config_text
@@ -869,9 +1229,19 @@ class DaqTab(QWidget):
         }
         if self.env_data_provider: current_env_data.update(self.env_data_provider())
 
+        segment_kind = {
+            0: "single", 1: "batch", 2: "threshold_scan"
+        }[mode]
         self.current_run_id = self.db.record_run_start(
-            str(out_file_full), current_env_data, str(config_snapshot_path)
+            str(out_file_full),
+            current_env_data,
+            str(config_snapshot_path),
+            run_number=self.current_run_no,
+            segment_kind=segment_kind,
+            segment_index=self.current_batch,
+            metadata_path=str(metadata_path),
         )
+        self.current_run_uuid = self.db.get_run_uuid(self.current_run_id)
         self.append_log(f"\n========== [ Batch/Scan {self.current_batch}/{self.total_batches} Started ] ==========")
         self.append_log(f"--- Output: {out_file_full} | DB ID: {self.current_run_id} ---")
         self.append_log(
@@ -906,6 +1276,8 @@ class DaqTab(QWidget):
             "frontend_path": self.validated_frontend_identity["path"],
             "frontend_sha256": self.validated_frontend_identity["sha256"],
             "config_sha256": snapshot_identity["sha256"],
+            "db_run_id": self.current_run_id,
+            "run_uuid": self.current_run_uuid,
         }
 
         self.daq_process = ProcessManager(
@@ -916,11 +1288,9 @@ class DaqTab(QWidget):
                     self.validated_frontend_identity["sha256"],
                 str(config_snapshot_path): snapshot_identity["sha256"],
             },
-            expected_absent_paths=[
-                out_file_full,
-                metadata_path,
-                *metadata_status_paths(metadata_path),
-            ],
+            expected_absent_paths=frontend_expected_absent_paths(
+                out_file_full
+            ),
         )
         self.daq_process.log_signal.connect(self.append_log)
         self.daq_process.stat_signal.connect(self.update_dashboard)
@@ -928,37 +1298,104 @@ class DaqTab(QWidget):
         self.daq_process.led_signal.connect(self.hardware_led_signal.emit)
         self.daq_process.temp_signal.connect(self.hardware_temp_signal.emit)
         self.daq_process.fatal_signal.connect(self.handle_fatal_error)
-        self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
         self.daq_process.finished_signal.connect(self.on_batch_finished)
+        # Emit the public completion signal only after on_batch_finished has
+        # persisted terminal state and recovered the controls.
+        self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
 
         self.daq_process.start()
 
     def on_batch_finished(self, returncode):
         self.append_log(f">>> Process Exited (Code: {returncode})")
-        if self.current_run_id > 0 and self.last_stats:
-            self.db.update_daq_summary(self.current_run_id, self.last_stats)
-            self.append_log("[DB] DAQ Summary successfully pushed to database.")
-
-        if returncode == 0 and self.current_run_context:
-            context = dict(self.current_run_context)
-            metadata_path = context["metadata_path"]
-            if os.path.isfile(metadata_path):
+        context = (
+            dict(self.current_run_context)
+            if self.current_run_context else None
+        )
+        metadata_error = None
+        metadata_valid = False
+        metadata_path = context.get("metadata_path") if context else None
+        if returncode == 0 and context:
+            try:
+                load_completed_run_metadata(
+                    metadata_path,
+                    context["raw_file"],
+                    context["run_number"],
+                )
                 metadata_identity = file_identity(metadata_path)
                 context["metadata_sha256"] = metadata_identity["sha256"]
                 context["metadata_exists"] = True
+                metadata_valid = True
                 self.append_log(
                     f"[Runtime] Completed metadata: "
                     f"{identity_summary(metadata_identity)}"
                 )
-            else:
-                context["metadata_exists"] = False
-                self.append_log(
-                    "[Provenance Error] Frontend가 성공 종료했지만 metadata "
-                    f"sidecar가 없습니다: {metadata_path}"
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                metadata_error = str(exc)
+                context["metadata_exists"] = bool(
+                    metadata_path and os.path.isfile(metadata_path)
                 )
+                self.append_log(
+                    "[Provenance Error] Frontend가 성공 종료했지만 terminal "
+                    f"metadata를 신뢰할 수 없습니다: {metadata_path} ({exc})"
+                )
+        elif returncode == 0:
+            metadata_error = "completed frontend has no in-memory run context"
+
+        if returncode == 0 and metadata_valid:
+            db_status = "daq_completed"
+        elif self.stop_requested:
+            db_status = "daq_cancelled"
+        elif self.daq_process and not self.daq_process.process_started:
+            db_status = "daq_launch_failed"
+        else:
+            db_status = "daq_failed"
+        if self.current_run_id > 0:
+            try:
+                error_message = (
+                    None if db_status == "daq_completed"
+                    else metadata_error
+                    or (
+                        self.daq_process.failure_message
+                        if self.daq_process else ""
+                    )
+                    or f"frontend exit code {returncode}"
+                )
+                if db_status == "daq_launch_failed":
+                    self.db.mark_daq_launch_failed(
+                        self.current_run_id,
+                        error_message,
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            context.get("raw_file") if context else None
+                        ),
+                    )
+                else:
+                    self.db.finalize_daq_run(
+                        self.current_run_id,
+                        status=db_status,
+                        exit_code=returncode,
+                        summary_dict=self.last_stats or None,
+                        metadata_path=metadata_path,
+                        error_message=error_message,
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            context.get("raw_file") if context else None
+                        ),
+                    )
+                self.append_log(
+                    f"[DB] DAQ lifecycle recorded: {db_status}."
+                )
+            except Exception as db_exc:
+                # Persistence is ancillary to safe process/UI finalization. A DB
+                # lock or disk failure must never strand disabled controls.
+                self.append_log(
+                    f"[DB Error] DAQ 종료 상태를 기록하지 못했습니다: {db_exc}"
+                )
+
+        if db_status == "daq_completed" and context:
             self.runContextReady.emit(context)
 
-        if self.current_batch < self.total_batches and returncode == 0:
+        if self.current_batch < self.total_batches and db_status == "daq_completed":
             self.current_batch += 1
             self.launch_current_batch()
         else:
@@ -969,5 +1406,8 @@ class DaqTab(QWidget):
             self.save_settings()
 
     def stop_all(self):
-        self.total_batches = 0 
-        if self.daq_process and self.daq_process.isRunning(): self.daq_process.stop()
+        self.total_batches = 0
+        self.stop_requested = True
+        if self.daq_process:
+            # ProcessManager latches this even before QThread/Popen starts.
+            self.daq_process.stop()

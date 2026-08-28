@@ -209,10 +209,12 @@ def validate_report_envelope(
     report: Mapping[str, Any],
     *,
     input_path: str,
+    max_events: int,
+    input_identity_start: Mapping[str, int],
     validator_path: str,
     validator_sha256: str,
 ) -> None:
-    """Authenticate a report against the exact selected input and worker."""
+    """Authenticate a report against the exact launch request and identities."""
 
     if not isinstance(report, Mapping):
         raise ValueError("validator report root must be an object")
@@ -231,6 +233,66 @@ def validate_report_envelope(
             "validator report input does not match the selected file: "
             f"reported={reported_input}, selected={expected_input}"
         )
+    if isinstance(max_events, bool) or not isinstance(max_events, int):
+        raise ValueError("requested max_events must be an integer")
+    if max_events < 0:
+        raise ValueError("requested max_events cannot be negative")
+    if "max_events" not in input_info:
+        raise ValueError("validator report is missing input.max_events")
+    reported_max_events = input_info["max_events"]
+    expected_max_events = None if max_events == 0 else max_events
+    valid_reported_max_events = (
+        reported_max_events is None
+        if expected_max_events is None
+        else (
+            isinstance(reported_max_events, int)
+            and not isinstance(reported_max_events, bool)
+            and reported_max_events == expected_max_events
+        )
+    )
+    if not valid_reported_max_events:
+        raise ValueError(
+            "validator report max_events does not match the launch request: "
+            f"reported={reported_max_events!r}, "
+            f"requested={expected_max_events!r}"
+        )
+
+    identity_fields = (
+        "device",
+        "inode",
+        "mode",
+        "size_bytes",
+        "mtime_seconds",
+        "mtime_nanoseconds",
+        "ctime_seconds",
+        "ctime_nanoseconds",
+    )
+    if not isinstance(input_identity_start, Mapping):
+        raise ValueError("input launch identity is unavailable")
+    reported_identity = input_info.get("identity_start")
+    if not isinstance(reported_identity, Mapping):
+        raise ValueError("validator report is missing input.identity_start")
+    for field in identity_fields:
+        expected_value = input_identity_start.get(field)
+        if (
+            isinstance(expected_value, bool)
+            or not isinstance(expected_value, int)
+        ):
+            raise ValueError(
+                f"input launch identity has invalid {field}: "
+                f"{expected_value!r}"
+            )
+        reported_value = reported_identity.get(field)
+        if (
+            isinstance(reported_value, bool)
+            or not isinstance(reported_value, int)
+            or reported_value != expected_value
+        ):
+            raise ValueError(
+                "validator report input identity does not match launch stat: "
+                f"field={field}, reported={reported_value!r}, "
+                f"expected={expected_value!r}"
+            )
     validator = report.get("validator")
     if not isinstance(validator, Mapping):
         raise ValueError("validator report is missing validator identity")

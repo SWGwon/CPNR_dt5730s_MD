@@ -4,9 +4,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QIODevice,
     QProcess,
-    QSaveFile,
     QSettings,
     QTimer,
     Qt,
@@ -46,6 +44,7 @@ from core.root_validation_output import (
 )
 from core.runtime_paths import (
     RuntimeValidationError,
+    atomic_write_bytes_no_clobber,
     build_root_validation_arguments,
     file_identity,
     find_project_root,
@@ -122,7 +121,7 @@ class RootValidationTab(QWidget):
         self._last_report = None
         self._run_active = False
         self._cancel_requested = False
-        self._expected_validator_identity = None
+        self._clear_launch_expectations()
         self._run_generation = 0
 
         self._setup_ui()
@@ -155,8 +154,9 @@ class RootValidationTab(QWidget):
         self.spin_max_events.setSingleStep(10_000)
         self.spin_max_events.setSpecialValueText("All events")
         self.spin_max_events.setToolTip(
-            "0 scans every event. A positive limit produces a sampled report "
-            "and is recorded in the exported JSON."
+            "0 scans every event. A positive limit scans only the leading "
+            "event prefix; the limit and partial coverage are recorded in "
+            "the exported JSON."
         )
         self.spin_max_events.valueChanged.connect(self._handle_option_changed)
         input_layout.addWidget(QLabel("Scan limit:"), 1, 0)
@@ -382,6 +382,7 @@ class RootValidationTab(QWidget):
     def start_validation(self):
         if self._run_active:
             return
+        self._clear_launch_expectations()
         input_value = self.input_edit.text().strip()
         if not input_value:
             self._log("[Error] Select a production ROOT file first.")
@@ -414,7 +415,6 @@ class RootValidationTab(QWidget):
         self._active_root_path = str(root_path)
         self._last_report = None
         self._cancel_requested = False
-        self._expected_validator_identity = dict(validator_identity)
         self._run_active = True
         self._run_generation += 1
         self._clear_tables_and_summary()
@@ -424,9 +424,10 @@ class RootValidationTab(QWidget):
         self.lbl_validator_identity.setText(identity_summary(validator_identity))
         self.lbl_validator_identity.setStyleSheet("color: #495057;")
 
+        requested_max_events = self.spin_max_events.value()
         arguments = build_root_validation_arguments(
             self._active_root_path,
-            max_events=self.spin_max_events.value(),
+            max_events=requested_max_events,
         )
         self._log(
             "[Validation] Read-only scan starting: "
@@ -435,6 +436,34 @@ class RootValidationTab(QWidget):
         self.process.setWorkingDirectory(self.proj_dir)
         self.process.setProgram(self.validator_path)
         self.process.setArguments(arguments)
+        try:
+            input_status = os.stat(
+                self._active_root_path, follow_symlinks=False
+            )
+        except OSError as error:
+            self._log(
+                "[Error] Validation launch blocked while capturing the input "
+                f"identity: {error}"
+            )
+            self._run_active = False
+            self._clear_launch_expectations()
+            self.progress_bar.setFormat("Failed to start")
+            self.lbl_overall.setText("FAIL")
+            self._apply_status_style(self.lbl_overall, "FAIL")
+            self._set_running_ui(False)
+            return
+        self._expected_validator_identity = dict(validator_identity)
+        self._expected_max_events = requested_max_events
+        self._expected_input_identity = {
+            "device": int(input_status.st_dev),
+            "inode": int(input_status.st_ino),
+            "mode": int(input_status.st_mode),
+            "size_bytes": int(input_status.st_size),
+            "mtime_seconds": input_status.st_mtime_ns // 1_000_000_000,
+            "mtime_nanoseconds": input_status.st_mtime_ns % 1_000_000_000,
+            "ctime_seconds": input_status.st_ctime_ns // 1_000_000_000,
+            "ctime_nanoseconds": input_status.st_ctime_ns % 1_000_000_000,
+        }
         self.process.start()
 
     @pyqtSlot()
@@ -576,7 +605,7 @@ class RootValidationTab(QWidget):
             )
 
         self._run_active = False
-        self._expected_validator_identity = None
+        self._clear_launch_expectations()
         self._set_running_ui(False)
 
     def _handle_process_error(self, process_error):
@@ -588,7 +617,7 @@ class RootValidationTab(QWidget):
         )
         if process_error == QProcess.ProcessError.FailedToStart:
             self._run_active = False
-            self._expected_validator_identity = None
+            self._clear_launch_expectations()
             self.progress_bar.setFormat("Failed to start")
             self.lbl_overall.setText("FAIL")
             self._apply_status_style(self.lbl_overall, "FAIL")
@@ -598,15 +627,28 @@ class RootValidationTab(QWidget):
         identity = self._expected_validator_identity
         if not isinstance(identity, Mapping):
             raise ValueError("validator launch identity is unavailable")
+        input_identity = self._expected_input_identity
+        if not isinstance(input_identity, Mapping):
+            raise ValueError("input launch identity is unavailable")
+        max_events = self._expected_max_events
+        if isinstance(max_events, bool) or not isinstance(max_events, int):
+            raise ValueError("validation launch max_events is unavailable")
         validate_report_envelope(
             report,
             input_path=self._active_root_path,
+            max_events=max_events,
+            input_identity_start=input_identity,
             validator_path=str(identity["path"]),
             validator_sha256=str(identity["sha256"]),
         )
         verify_expected_hashes(
             {str(identity["path"]): str(identity["sha256"])}
         )
+
+    def _clear_launch_expectations(self):
+        self._expected_validator_identity = None
+        self._expected_input_identity = None
+        self._expected_max_events = None
 
     def _render_report(self, report):
         self._render_summary(report)
@@ -630,11 +672,13 @@ class RootValidationTab(QWidget):
             analysis = {}
         total = analysis.get("events_total", summary.get("entries"))
         scanned = analysis.get("events_scanned", total)
-        sampled = bool(analysis.get("sampled", False))
+        prefix_limited = bool(analysis.get("sampled", False))
         if total is None and scanned is None:
             entries_text = "—"
-        elif sampled and total is not None:
-            entries_text = f"{display_value(scanned)} / {display_value(total)} sampled"
+        elif prefix_limited and total is not None:
+            entries_text = (
+                f"{display_value(scanned)} / {display_value(total)} prefix"
+            )
         elif total is not None:
             entries_text = display_value(total)
         else:
@@ -810,10 +854,10 @@ class RootValidationTab(QWidget):
         )
         if not selected:
             return
-        destination = Path(selected).expanduser().resolve()
+        destination = Path(os.path.abspath(os.path.expanduser(selected)))
         input_path = Path(self._active_root_path).resolve()
         same_input = destination == input_path
-        if destination.exists() and not same_input:
+        if os.path.lexists(destination) and not same_input:
             try:
                 same_input = os.path.samefile(destination, input_path)
             except OSError:
@@ -826,16 +870,14 @@ class RootValidationTab(QWidget):
                 f"없습니다:\n{input_path}",
             )
             return
-        if destination.exists():
-            answer = QMessageBox.question(
+        if os.path.lexists(destination):
+            QMessageBox.warning(
                 self,
-                "Replace Existing Report?",
-                f"The report already exists:\n{destination}\n\nReplace it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                "Export Blocked",
+                f"The report path already exists:\n{destination}\n\n"
+                "Choose a new name; existing files are never replaced.",
             )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+            return
 
         try:
             payload = (
@@ -855,25 +897,22 @@ class RootValidationTab(QWidget):
                 f"The in-memory report is not valid strict JSON:\n{error}",
             )
             return
-        save_file = QSaveFile(str(destination))
-        save_file.setDirectWriteFallback(False)
-        mode = QIODevice.OpenModeFlag.WriteOnly | QIODevice.OpenModeFlag.Text
-        if not save_file.open(mode):
-            QMessageBox.critical(
+        try:
+            atomic_write_bytes_no_clobber(destination, payload)
+        except FileExistsError:
+            QMessageBox.warning(
                 self,
-                "Export Error",
-                f"Cannot open report for atomic export:\n{destination}\n"
-                f"{save_file.errorString()}",
+                "Export Blocked",
+                f"The report path appeared during export:\n{destination}\n\n"
+                "Nothing was replaced. Choose a new name and try again.",
             )
             return
-        written = save_file.write(payload)
-        if written != len(payload) or not save_file.commit():
-            save_file.cancelWriting()
+        except OSError as error:
             QMessageBox.critical(
                 self,
                 "Export Error",
-                f"Could not atomically publish report:\n{destination}\n"
-                f"{save_file.errorString()}",
+                f"Could not atomically publish the report without replacing "
+                f"an existing file:\n{destination}\n{error}",
             )
             return
         self.settings.setValue("last_export_dir", str(destination.parent))

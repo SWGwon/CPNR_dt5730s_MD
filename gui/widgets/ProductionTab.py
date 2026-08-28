@@ -1,5 +1,6 @@
 import re
 import os
+import html
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
@@ -36,14 +37,25 @@ class ProductionTab(QWidget):
         self.settings = QSettings("CPNR", "DT5730S_ProductionTab")
         self.db = DatabaseManager(os.path.join(self.data_dir, "run_history.db"))
         
-        self.process = QProcess()
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.SeparateChannels
+        )
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.handle_finished)
+        self.process.errorOccurred.connect(self.handle_process_error)
         
         self.last_stats = {}; self.current_raw_file = ""
         self.current_root_output = ""
         self.completed_run_context = None
+        self._stderr_buffer = ""
+        self._run_active = False
+        self._cancel_requested = False
+        self._active_db_run_id = None
+        self._active_run_uuid = None
+        self._db_production_begun = False
+        self._db_terminal_recorded = False
         self.init_ui()
         self.load_settings()
         self.log_pattern = re.compile(r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)")
@@ -105,7 +117,7 @@ class ProductionTab(QWidget):
         self.btn_run = QPushButton("Run ROOT Conversion")
         self.btn_run.setStyleSheet("background-color: #5bc0de; color: white; font-weight: bold; padding: 8px;")
         self.btn_run.clicked.connect(self.run_conversion)
-        self.btn_stop = QPushButton("Force Stop")
+        self.btn_stop = QPushButton("Stop Conversion")
         self.btn_stop.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 8px;")
         self.btn_stop.clicked.connect(self.stop_all)
         
@@ -229,6 +241,15 @@ class ProductionTab(QWidget):
         )
 
     def run_conversion(self):
+        if (
+            self._run_active
+            or self.process.state() != QProcess.ProcessState.NotRunning
+        ):
+            self.log_console.append(
+                "<span style='color:#b45309;'>[Warning] Conversion이 이미 "
+                "실행 중이므로 중복 실행하지 않았습니다.</span>"
+            )
+            return
         self.save_settings()
         raw_value = self.input_edit.text().strip()
         config_value = self.config_edit.text().strip()
@@ -318,8 +339,55 @@ class ProductionTab(QWidget):
                 output_path or default_production_output(raw_path)
             )
         )
-        self.progress_bar.setValue(0); self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
+        self.progress_bar.setValue(0); self.progress_bar.setFormat("%p%")
+        self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
         self.log_console.clear(); self.last_stats = {}
+        self._stderr_buffer = ""
+        self._run_active = True
+        self._cancel_requested = False
+        self._db_terminal_recorded = False
+        self._active_db_run_id = None
+        self._active_run_uuid = None
+        self._db_production_begun = False
+        context_db_identity_supplied = False
+        if context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
+            context_run_id = context.get("db_run_id")
+            context_run_uuid = context.get("run_uuid")
+            context_db_identity_supplied = context_run_id is not None
+            if context_run_id is not None and context_run_uuid:
+                try:
+                    resolved_run = self.db.resolve_run_identity(
+                        int(context_run_id),
+                        run_uuid=context_run_uuid,
+                        output_file=raw_path,
+                    )
+                    self._active_db_run_id = int(resolved_run["id"])
+                    self._active_run_uuid = str(resolved_run["run_uuid"])
+                except Exception as db_exc:
+                    self.log_console.append(
+                        "<span style='color:red;'>[DB Error] 전달된 run "
+                        "id/UUID/raw identity가 현재 DB와 일치하지 않습니다. "
+                        f"잘못된 행은 갱신하지 않습니다: "
+                        f"{html.escape(str(db_exc))}</span>"
+                    )
+            elif context_run_id is not None:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] 전달된 DAQ context에 "
+                    "run_uuid가 없어 정수 id만으로 DB 행을 갱신하지 "
+                    "않습니다.</span>"
+                )
+        if self._active_db_run_id is None and not context_db_identity_supplied:
+            try:
+                self._active_db_run_id = self.db.find_run_id_by_output(raw_path)
+                if self._active_db_run_id is not None:
+                    self._active_run_uuid = self.db.get_run_uuid(
+                        self._active_db_run_id
+                    )
+            except Exception as db_exc:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] Run identity lookup "
+                    f"failed: {html.escape(str(db_exc))}</span>"
+                )
         self.lbl_production_identity.setText(identity_summary(executable_identity))
         self.btn_run.setEnabled(False); self.set_debug_controls_enabled(is_debug_mode)
         self.log_console.append(
@@ -332,16 +400,41 @@ class ProductionTab(QWidget):
             f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
         )
         self.log_console.append(f"<b>[System] Starting:</b> {executable} {' '.join(args)}")
+        if self._active_db_run_id is not None:
+            try:
+                self.db.begin_production(
+                    self._active_db_run_id,
+                    run_uuid=self._active_run_uuid,
+                    output_file=self.current_raw_file,
+                )
+                self._db_production_begun = True
+            except Exception as db_exc:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] Production launch "
+                    f"status was not recorded: {html.escape(str(db_exc))}</span>"
+                )
         self.process.setWorkingDirectory(self.proj_dir)
         self.process.start(str(executable), args)
 
     def stop_all(self):
-        if self.process.state() == QProcess.ProcessState.Running:
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_requested = True
             self.process.terminate()
-            self.process.waitForFinished(15000)
-            if self.process.state() == QProcess.ProcessState.Running: self.process.kill()
-            self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
-            self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
+            self.log_console.append(
+                "<span style='color:#b45309;'>[System] Graceful conversion "
+                "stop requested; waiting for finalization.</span>"
+            )
+
+    def force_stop(self):
+        """Explicit recovery action; normal Stop never blocks or kills."""
+
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_requested = True
+            self.process.kill()
+            self.log_console.append(
+                "<span style='color:red;'>[System] Explicit force stop "
+                "requested.</span>"
+            )
 
     def send_debug_command(self, cmd_str):
         if self.process.state() == QProcess.ProcessState.Running: self.process.write(cmd_str.encode('utf-8'))
@@ -363,18 +456,127 @@ class ProductionTab(QWidget):
 
     @pyqtSlot()
     def handle_stderr(self):
-        while self.process.canReadLine():
-            line = self.process.readLine().data().decode('utf-8', errors='ignore').strip()
-            if line: self.log_console.append(f"<span style='color:red;'>{line}</span>")
+        payload = bytes(self.process.readAllStandardError()).decode(
+            'utf-8', errors='replace'
+        )
+        if payload:
+            self._stderr_buffer += payload
+            self._consume_stderr(final=False)
+
+    def _consume_stderr(self, final=False):
+        lines = self._stderr_buffer.splitlines(keepends=True)
+        remainder = ""
+        if (
+            lines
+            and not final
+            and not lines[-1].endswith(('\n', '\r'))
+        ):
+            remainder = lines.pop()
+        self._stderr_buffer = remainder
+        for raw_line in lines:
+            line = raw_line.rstrip('\r\n')
+            if line:
+                self.log_console.append(
+                    "<span style='color:red;'>"
+                    f"{html.escape(line)}</span>"
+                )
+
+    def handle_process_error(self, process_error):
+        self.handle_stderr()
+        error_text = html.escape(self.process.errorString())
+        self.log_console.append(
+            "<span style='color:red;'><b>[Process Error]</b> "
+            f"{error_text} ({process_error.name})</span>"
+        )
+        if process_error == QProcess.ProcessError.FailedToStart:
+            self._run_active = False
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Failed to start")
+            self.btn_run.setEnabled(True)
+            self.set_debug_controls_enabled(False)
+            self._record_production_terminal(
+                "production_launch_failed", -1,
+                error_message=self.process.errorString(),
+            )
+
+    def _record_production_terminal(
+        self, status, exit_code, *, root_file=None, error_message=None
+    ):
+        if self._db_terminal_recorded:
+            return
+        if self._active_db_run_id is None:
+            self._db_terminal_recorded = True
+            return
+        try:
+            if not self._db_production_begun:
+                self.db.begin_production(
+                    self._active_db_run_id,
+                    run_uuid=self._active_run_uuid,
+                    output_file=self.current_raw_file,
+                )
+                self._db_production_begun = True
+            self.db.finalize_production_run(
+                self._active_db_run_id,
+                status=status,
+                exit_code=exit_code,
+                summary_dict=self.last_stats or None,
+                root_file=root_file,
+                error_message=error_message,
+                run_uuid=self._active_run_uuid,
+                output_file=self.current_raw_file,
+            )
+            self._db_terminal_recorded = True
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[DB]</b> "
+                f"Production lifecycle recorded: {html.escape(status)}.</span>"
+            )
+        except Exception as db_exc:
+            # Conversion completion and control recovery must not depend on DB
+            # availability. The error remains operator-visible for later repair.
+            self.log_console.append(
+                "<span style='color:red;'>[DB Error] Production 종료 상태를 "
+                f"기록하지 못했습니다: {html.escape(str(db_exc))}</span>"
+            )
 
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
+        self.handle_stdout()
+        self.handle_stderr()
+        self._consume_stderr(final=True)
+        self._run_active = False
         self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
-        if exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0:
+        process_succeeded = (
+            exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0
+        )
+        expected_root_exists = bool(
+            self.current_root_output
+            and os.path.isfile(self.current_root_output)
+        )
+        if self._cancel_requested:
+            db_status = "production_cancelled"
+        elif process_succeeded and (
+            not self.current_root_output or expected_root_exists
+        ):
+            db_status = "production_completed"
+        else:
+            db_status = "production_failed"
+        self._record_production_terminal(
+            db_status,
+            exitCode,
+            root_file=(self.current_root_output if expected_root_exists else None),
+            error_message=(
+                None if db_status == "production_completed"
+                else f"production exit code {exitCode}"
+            ),
+        )
+
+        conversion_succeeded = process_succeeded and (
+            not self.current_root_output or expected_root_exists
+        )
+        if conversion_succeeded:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("Completed")
             self.log_console.append(f"<span style='color:#5cb85c;'><b>[System] Conversion Successfully Finished!</b></span>")
-            if self.current_raw_file and self.last_stats:
-                self.db.update_production_summary(self.current_raw_file, self.last_stats)
-                self.log_console.append("<span style='color:#6f42c1;'><b>[DB] Production Summary pushed to database.</b></span>")
             if self.current_root_output:
                 if os.path.isfile(self.current_root_output):
                     self.rootOutputReady.emit(
@@ -391,4 +593,5 @@ class ProductionTab(QWidget):
                         f"{self.current_root_output}</span>"
                     )
         else:
+            self.progress_bar.setFormat(f"Failed (exit {exitCode})")
             self.log_console.append(f"<span style='color:red;'><b>[System] Conversion Exited with Code: {exitCode}</b></span>")

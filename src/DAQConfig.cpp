@@ -115,6 +115,19 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
         "SettlingTimeMs");
   }
 
+  const uint32_t minimum_free_mib = OptionalUnsigned(
+      config, "Storage", "MinimumFreeMiB", 1024, 64, 1048576);
+  const uint32_t stop_free_mib = OptionalUnsigned(
+      config, "Storage", "StopFreeMiB", 512, 32, 1048575);
+  if (stop_free_mib >= minimum_free_mib) {
+    throw std::runtime_error(
+        "[Storage] StopFreeMiB must be smaller than MinimumFreeMiB");
+  }
+  settings.storage.minimum_free_bytes =
+      static_cast<uint64_t>(minimum_free_mib) * 1024U * 1024U;
+  settings.storage.stop_free_bytes =
+      static_cast<uint64_t>(stop_free_mib) * 1024U * 1024U;
+
   const bool has_self_trigger_mask =
       HasValue(config, "Digitizer", "SelfTriggerMask");
   const bool has_pair_logic =

@@ -144,6 +144,11 @@ int main() {
           "trigger calibration settling default");
     Check(settings.trigger_calibration.settling_timeout_ms == 15000,
           "trigger calibration timeout default");
+    Check(settings.storage.minimum_free_bytes ==
+                  uint64_t{1024} * 1024U * 1024U &&
+              settings.storage.stop_free_bytes ==
+                  uint64_t{512} * 1024U * 1024U,
+          "storage safety defaults reserve 1 GiB and stop at 512 MiB");
     Check(settings.channels[1].trigger_threshold == 14615,
           "DAQ schema active-channel settings");
     Check(!settings.channels[1].threshold_is_relative_mv,
@@ -275,6 +280,16 @@ int main() {
     ConfigParser invalid_settling_parser(invalid_settling_path.string());
     CheckThrows([&]() { LoadDAQHardwareSettings(invalid_settling_parser); },
                 "must be greater", "settling timeout must exceed initial delay");
+
+    const auto invalid_storage_path = test_dir / "invalid_storage.conf";
+    std::string invalid_storage = valid_daq_config;
+    invalid_storage.append(
+        "[Storage]\nMinimumFreeMiB=512\nStopFreeMiB=512\n");
+    WriteFile(invalid_storage_path, invalid_storage);
+    ConfigParser invalid_storage_parser(invalid_storage_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(invalid_storage_parser); },
+                "must be smaller",
+                "runtime disk stop watermark must preserve a metadata reserve");
 
     const auto legacy_daq_path = test_dir / "legacy_daq.conf";
     WriteFile(legacy_daq_path,

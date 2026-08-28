@@ -39,6 +39,32 @@ def sample_report():
     }
 
 
+INPUT_IDENTITY = {
+    "device": 2049,
+    "inode": 123456,
+    "mode": 0o100440,
+    "size_bytes": 987654,
+    "mtime_seconds": 1700000000,
+    "mtime_nanoseconds": 123456789,
+    "ctime_seconds": 1700000001,
+    "ctime_nanoseconds": 987654321,
+}
+
+
+def envelope_report(*, max_events=None):
+    report = sample_report()
+    report["input"] = {
+        "path": "/data/run021_prod.root",
+        "max_events": max_events,
+        "identity_start": dict(INPUT_IDENTITY),
+    }
+    report["validator"] = {
+        "executable_path": "/opt/cpnr/root_validate_dt5730",
+        "executable_sha256": "a" * 64,
+    }
+    return report
+
+
 class RootValidationOutputTests(unittest.TestCase):
     def test_progress_parser_accepts_ansi_spacing_and_fractional_values(self):
         self.assertEqual(
@@ -118,15 +144,12 @@ class RootValidationOutputTests(unittest.TestCase):
         )
 
     def test_report_envelope_authenticates_input_and_validator(self):
-        report = sample_report()
-        report["input"] = {"path": "/data/run021_prod.root"}
-        report["validator"] = {
-            "executable_path": "/opt/cpnr/root_validate_dt5730",
-            "executable_sha256": "a" * 64,
-        }
+        report = envelope_report()
         validate_report_envelope(
             report,
             input_path="/data/run021_prod.root",
+            max_events=0,
+            input_identity_start=INPUT_IDENTITY,
             validator_path="/opt/cpnr/root_validate_dt5730",
             validator_sha256="a" * 64,
         )
@@ -141,9 +164,76 @@ class RootValidationOutputTests(unittest.TestCase):
                     validate_report_envelope(
                         changed,
                         input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
                         validator_path="/opt/cpnr/root_validate_dt5730",
                         validator_sha256="a" * 64,
                     )
+
+    def test_report_envelope_binds_exact_requested_max_events(self):
+        report = envelope_report(max_events=25000)
+        validate_report_envelope(
+            report,
+            input_path="/data/run021_prod.root",
+            max_events=25000,
+            input_identity_start=INPUT_IDENTITY,
+            validator_path="/opt/cpnr/root_validate_dt5730",
+            validator_sha256="a" * 64,
+        )
+
+        for reported_value in (None, 24999, False, 25000.0):
+            with self.subTest(reported=reported_value):
+                changed = json.loads(json.dumps(report))
+                changed["input"]["max_events"] = reported_value
+                with self.assertRaises(ValueError):
+                    validate_report_envelope(
+                        changed,
+                        input_path="/data/run021_prod.root",
+                        max_events=25000,
+                        input_identity_start=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+        missing = json.loads(json.dumps(report))
+        del missing["input"]["max_events"]
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                missing,
+                input_path="/data/run021_prod.root",
+                max_events=25000,
+                input_identity_start=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
+
+    def test_report_envelope_binds_every_input_start_identity_field(self):
+        report = envelope_report()
+        for field in INPUT_IDENTITY:
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(report))
+                changed["input"]["identity_start"][field] += 1
+                with self.assertRaisesRegex(ValueError, field):
+                    validate_report_envelope(
+                        changed,
+                        input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+        missing = json.loads(json.dumps(report))
+        del missing["input"]["identity_start"]
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                missing,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
 
 
 if __name__ == "__main__":

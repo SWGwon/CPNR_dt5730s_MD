@@ -3,7 +3,13 @@ project(CAEN_DT5730_3TIER_DAQ CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -Wall -Wextra -pthread -fPIC")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -Wextra -pthread")
+option(CPNR_NATIVE_OPTIMIZATION
+       "Build only for the configure host CPU (-march=native)" OFF)
+if(CPNR_NATIVE_OPTIMIZATION)
+  add_compile_options(-march=native)
+endif()
 
 # Re-run configure before a build whenever provenance-relevant source/config or
 # the current main ref/index changes. This keeps embedded commit/dirty stamps
@@ -33,6 +39,8 @@ option(BUILD_PRODUCTION_CONVERTER "Build the ROOT production converter" ON)
 option(BUILD_ROOT_VALIDATOR "Build the read-only production ROOT validator" ON)
 
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
   add_executable(config_parser_tests tests/config_parser_tests.cpp src/DAQConfig.cpp)
   target_include_directories(config_parser_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
   target_compile_definitions(config_parser_tests PRIVATE CPNR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -96,10 +104,10 @@ if(BUILD_TESTING)
       CPNR_BUILD_TIMESTAMP="hardware-free-test")
   set_target_properties(frontend_hardware_free_compile PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-  add_test(NAME frontend_rejects_zero_run_number
-      COMMAND frontend_hardware_free_compile -r 0)
-  set_tests_properties(frontend_rejects_zero_run_number
-      PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME frontend_cli_and_signal_regression
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_SOURCE_DIR}/tests/frontend_cli_test.py
+              $<TARGET_FILE:frontend_hardware_free_compile>)
 
   add_executable(sha256_tests tests/sha256_tests.cpp src/Sha256.cpp)
   target_include_directories(sha256_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -108,7 +116,13 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME sha256_regression COMMAND sha256_tests)
 
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  if(BUILD_DAQ_APPLICATIONS)
+    add_test(NAME raw_salvage_hardware_free_integration
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/raw_salvage_integration_test.py
+                $<TARGET_FILE:raw_salvage_dt5730>)
+  endif()
+
   add_test(NAME gui_runtime_path_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_runtime_paths.py)
   add_test(NAME gui_trigger_threshold_regression
@@ -118,10 +132,67 @@ if(BUILD_TESTING)
   add_test(NAME gui_root_validation_output_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v
               tests/test_root_validation_output.py)
+  add_test(NAME gui_database_manager_regression
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v
+              tests/test_database_manager.py)
   set_tests_properties(
       gui_runtime_path_regression gui_trigger_threshold_regression
       gui_process_output_regression gui_root_validation_output_regression
+      gui_database_manager_regression
       PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+  # The operator/lifecycle suites instantiate Qt widgets and, through
+  # MainWindow, the complete monitoring stack.  Prefer the same project-local
+  # venv used by bin/daq_gui, but do not turn a hardware-free/test-only CMake
+  # configure into a failure when optional GUI dependencies are absent.
+  set(_CPNR_GUI_TEST_PYTHON_CANDIDATES)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/build/venv/bin/python")
+    list(APPEND _CPNR_GUI_TEST_PYTHON_CANDIDATES
+         "${CMAKE_SOURCE_DIR}/build/venv/bin/python")
+  endif()
+  if(EXISTS "${CMAKE_BINARY_DIR}/venv/bin/python")
+    list(APPEND _CPNR_GUI_TEST_PYTHON_CANDIDATES
+         "${CMAKE_BINARY_DIR}/venv/bin/python")
+  endif()
+  list(APPEND _CPNR_GUI_TEST_PYTHON_CANDIDATES "${Python3_EXECUTABLE}")
+  list(REMOVE_DUPLICATES _CPNR_GUI_TEST_PYTHON_CANDIDATES)
+
+  unset(CPNR_GUI_TEST_PYTHON)
+  foreach(_CPNR_PYTHON_CANDIDATE IN LISTS _CPNR_GUI_TEST_PYTHON_CANDIDATES)
+    execute_process(
+        COMMAND "${_CPNR_PYTHON_CANDIDATE}" -c
+                "import PyQt6, numpy, pyqtgraph, zmq"
+        RESULT_VARIABLE _CPNR_GUI_IMPORT_RESULT
+        OUTPUT_QUIET ERROR_QUIET)
+    if(_CPNR_GUI_IMPORT_RESULT EQUAL 0)
+      set(CPNR_GUI_TEST_PYTHON "${_CPNR_PYTHON_CANDIDATE}")
+      break()
+    endif()
+  endforeach()
+
+  if(CPNR_GUI_TEST_PYTHON)
+    add_test(NAME gui_operator_safety_regression
+        COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
+                tests/test_gui_operator_safety.py)
+    add_test(NAME gui_process_lifecycle_regression
+        COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
+                tests/test_process_manager_lifecycle.py)
+    set_tests_properties(
+        gui_operator_safety_regression gui_process_lifecycle_regression
+        PROPERTIES
+          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+          ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+          TIMEOUT 60)
+    message(STATUS
+        "GUI operator/lifecycle tests: ${CPNR_GUI_TEST_PYTHON} (offscreen)")
+  else()
+    message(STATUS
+        "GUI operator/lifecycle tests not registered: install requirements.txt "
+        "in build/venv or configure with a Python containing the GUI stack")
+  endif()
+  unset(_CPNR_GUI_IMPORT_RESULT)
+  unset(_CPNR_PYTHON_CANDIDATE)
+  unset(_CPNR_GUI_TEST_PYTHON_CANDIDATES)
 endif()
 
 if(BUILD_DAQ_APPLICATIONS)
@@ -173,6 +244,20 @@ if(BUILD_DAQ_APPLICATIONS)
        FILES_MATCHING PATTERN "*.conf")
 
   # [Tier 1] Frontend
+  add_executable(raw_salvage_dt5730
+      src/raw_salvage_dt5730.cpp
+      src/DAQConfig.cpp
+      src/Sha256.cpp)
+  target_include_directories(raw_salvage_dt5730 PRIVATE include)
+  target_compile_options(raw_salvage_dt5730 PRIVATE -Wall -Wextra -Werror)
+  target_compile_definitions(raw_salvage_dt5730 PRIVATE
+      CPNR_GIT_COMMIT="${CPNR_GIT_COMMIT}"
+      CPNR_BUILD_TIMESTAMP="${CPNR_BUILD_TIMESTAMP}")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+     CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(raw_salvage_dt5730 PRIVATE stdc++fs)
+  endif()
+
   if(BUILD_DAQ_FRONTEND)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
@@ -330,8 +415,11 @@ if(BUILD_DAQ_APPLICATIONS)
         endif()
       endif()
     else()
-      message(WARNING
-          "ROOT framework not found. Skipping production/validation tools.")
+      message(FATAL_ERROR
+          "ROOT framework was requested but not found. Install ROOT or "
+          "explicitly configure -DBUILD_PRODUCTION_CONVERTER=OFF "
+          "-DBUILD_ROOT_VALIDATOR=OFF. A successful default build must not "
+          "silently omit production/validation executables and tests.")
     endif()
   endif()
 

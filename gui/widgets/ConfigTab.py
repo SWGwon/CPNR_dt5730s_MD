@@ -15,6 +15,7 @@ from core.trigger_settings import (
 
 class ConfigTab(QWidget):
     configPathChanged = pyqtSignal(str)
+    configDirtyChanged = pyqtSignal(str, bool)
 
     CONTROLLED_TABLE_KEYS = frozenset({
         ("Digitizer", "ChannelMask"),
@@ -36,10 +37,30 @@ class ConfigTab(QWidget):
         self.config = configparser.ConfigParser()
         self.config.optionxform = str
         self.trigger_controls_load_error = None
+        self._config_dirty = False
         self.setup_ui()
         self.load_settings()
         self.update_mask_calc()
         self.sync_threshold_controls_from_config()
+
+    def is_dirty(self):
+        return self._config_dirty
+
+    def _set_config_dirty(self, dirty):
+        dirty = bool(dirty)
+        changed = dirty != self._config_dirty
+        self._config_dirty = dirty
+        if self.current_config_path:
+            marker = " * UNSAVED" if dirty else ""
+            self.lbl_current_file.setText(
+                f"Current File: {os.path.basename(self.current_config_path)}{marker}"
+            )
+            self.lbl_current_file.setStyleSheet(
+                "color: #dc3545; font-weight: bold;"
+                if dirty else "color: #6c757d; font-weight: bold;"
+            )
+        if changed:
+            self.configDirtyChanged.emit(self.current_config_path, dirty)
 
     def sync_threshold_controls_from_config(self):
         """Reflect the loaded runtime-threshold schema in the calculator."""
@@ -386,6 +407,7 @@ class ConfigTab(QWidget):
 
         self.update_mask_calc()
         self.sync_threshold_controls_from_config()
+        self._set_config_dirty(False)
 
     def protect_controlled_row(self, row):
         section_item = self.table.item(row, 0)
@@ -434,6 +456,7 @@ class ConfigTab(QWidget):
         self.update_trigger_mask_calc()
 
     def on_table_cell_changed(self, row, _column):
+        self._set_config_dirty(True)
         section_item = self.table.item(row, 0)
         parameter_item = self.table.item(row, 1)
         if not section_item or not parameter_item:
@@ -993,5 +1016,18 @@ class ConfigTab(QWidget):
             if not self.config.has_section(sec): self.config.add_section(sec)
             self.config.set(sec, key, val)
             self.table.item(row, 2).setBackground(Qt.GlobalColor.white) 
-        with open(self.current_config_path, 'w') as configfile: self.config.write(configfile)
+        try:
+            with open(
+                self.current_config_path, 'w', encoding='utf-8'
+            ) as configfile:
+                self.config.write(configfile)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Save Failed",
+                "설정 파일을 저장하지 못했습니다. 변경사항은 저장되지 않은 "
+                f"상태로 유지됩니다.\n\n{exc}"
+            )
+            self._set_config_dirty(True)
+            return
+        self._set_config_dirty(False)
         self.configPathChanged.emit(os.path.abspath(self.current_config_path))

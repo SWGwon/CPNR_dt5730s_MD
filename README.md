@@ -34,6 +34,7 @@ CPNR_dt5730s/
 ├── src/                        # [Tier 1 & 2] 초고속 C++ 데이터 수집 및 오프라인 생산 엔진
 │   ├── DAQManager.cpp          # (Tier 1) 하드웨어 제어, ZMQ 스트리밍, 이진 기록 코어
 │   ├── frontend_dt5730.cpp     # (Tier 1) 프론트엔드 독립 실행 메인 프로그램
+│   ├── raw_salvage_dt5730.cpp  # 실패 run의 읽기 전용 .partial prefix 복구 도구
 │   ├── production_dt5730.cpp   # (Tier 2) 이진 데이터 ROOT 변환 및 Micro-Time(T0) 추출기
 │   └── RootValidator.cpp       # production ROOT 무결성/threshold/provenance 검증기
 │
@@ -254,6 +255,29 @@ SelfTriggerMode=0
 PairLogic=OR
 ```
 
+### 저장 공간 안전 여유
+
+DAQ는 출력 파일이 놓일 **실제 파일시스템**의 여유 공간을 hardware setup 전과 acquisition 직전에 각각 확인합니다. 이벤트 수 제한 run의 예상 raw 크기는 다음 식으로 정확히 계산하고, time-limit 또는 unlimited run에서는 안전 여유만 선점 조건으로 사용합니다.
+
+```text
+event_bytes = 24 + 2 * RecordLength * popcount(ChannelMask)
+expected_raw_bytes = event_bytes * MaxEvents
+```
+
+안전 여유는 config에서 조절할 수 있습니다.
+
+```ini
+[Storage]
+MinimumFreeMiB=1024
+StopFreeMiB=512
+```
+
+- 시작 조건: `free >= expected_raw_bytes + MinimumFreeMiB`
+- 실행 중 조건: 약 250 ms마다 확인한 여유 공간이 `StopFreeMiB`보다 작아지면 정상적인 파일 경계에서 수집을 실패 상태로 종료
+- `StopFreeMiB`는 `MinimumFreeMiB`보다 작아야 합니다. 기본값은 각각 512 MiB와 1024 MiB입니다.
+
+이 검사는 quota, 네트워크 파일시스템 장애 또는 장치 분리 자체를 없애지는 못합니다. 따라서 중요한 run은 로컬의 신뢰할 수 있는 파일시스템에 먼저 기록하고, terminal metadata가 `completed`인지 확인한 뒤 이동하십시오.
+
 ---
 
 ## 🖥️ Usage
@@ -272,14 +296,69 @@ GUI가 실행하는 hardware frontend의 고정 위치는 `./bin/frontend_dt5730
 
 GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui`와 다르면 실행을 차단합니다. Runtime JSON에는 binary/config 경로, git/build 정보, input range, ADC bits, polarity, DC offset, 채널별 measured baseline/threshold write/readback과 trigger routing readback이 저장되고, production 변환 시 JSON과 config 전체가 ROOT의 `RunMetadata`와 `RunConfig`로 들어갑니다.
 
-GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-events`를 생략하면 전체 tree를 검사하며, JSON 보고서는 stdout, 진행률/진단은 stderr로 분리됩니다. `--max-events` 표본 검사는 빠른 이상 탐지용이며 전체 파일에 대한 양성 판정은 `SKIP`으로 남습니다. 특히 metadata가 없는 구형 파일의 cutoff/상대 threshold 추론은 전수 검사에서만 제공합니다.
+### Raw 파일 finalization과 `.partial`
+
+요청한 출력이 `/data/run021.dat`이면 acquisition 중에는 `/data/run021.dat.partial`만 존재합니다. 기존 final, partial, config snapshot, metadata 또는 status snapshot과 경로가 겹치거나 이미 존재하면 덮어쓰지 않고 시작을 거부합니다.
+
+정상 종료 시 frontend는 다음 순서로 raw 파일을 확정합니다.
+
+1. 마지막으로 완전히 기록된 이벤트 경계까지 `fflush`와 `fsync`를 수행합니다.
+2. 열린 file descriptor에서 SHA-256을 다시 계산해 수집 중 streaming SHA-256과 비교하고, 같은 inode의 size/mtime/ctime이 hash 도중 바뀌지 않았는지 확인합니다.
+3. raw inode를 owner/group 읽기 전용(`0440`)으로 바꿉니다.
+4. final 이름을 **no-clobber** 방식으로 게시하고 디렉터리를 sync한 뒤, 같은 inode임이 확인된 `.partial` 이름만 제거합니다.
+5. 위 단계가 모두 성공한 뒤 terminal `<raw>.run.json`을 `acquisition_status=completed`로 게시합니다.
+
+쓰기, flush, 크기 또는 장비 오류가 발생하면 성공한 것처럼 final 이름으로 바꾸지 않습니다. 가능한 경우 마지막 완전 이벤트까지의 prefix를 `.partial`에 보존하고 descriptor SHA-256을 기록하며, terminal metadata는 `failed`와 실패 원인을 남깁니다. 갑작스러운 전원 차단은 이 절차를 완료할 수 없으므로 `.partial`과 status snapshot을 함께 보존하십시오.
+
+ZMQ는 모니터링용 보조 경로입니다. subscriber 지연이나 non-blocking publish 실패는 raw 기록을 중단시키지 않으며 `zmq_drops`/`zmq_send_errors`로 metadata와 GUI에 누적됩니다. 반대로 raw 파일 쓰기 실패는 데이터 유실을 숨기지 않도록 즉시 acquisition 실패로 처리됩니다.
+
+### 실패한 `.partial`의 읽기 전용 복구
+
+`raw_salvage_dt5730`은 원본을 수정하지 않고, config와 일치하는 완전하고 연속적인 이벤트 prefix만 새 파일로 복사하는 forensic recovery 도구입니다. DAQ가 생성한 **해당 run의 frozen config snapshot**을 `-c`로 지정하십시오.
+
+```bash
+./bin/raw_salvage_dt5730 \
+  -i /data/run021.dat.partial \
+  -o /data/recovery/run021_recovered.dat \
+  -c /data/run021.dat.config.conf
+```
+
+도구는 24-byte little-endian header, 0부터 연속인 `EventID`, config의 `RecordLength`/`ChannelMask`, payload 길이와 ADC bit 범위를 검사합니다. 첫 truncated/invalid event 직전에서 멈추며, 결과와 `<output>.recovery.json`을 둘 다 fsync한 뒤 no-clobber 방식으로 함께 게시합니다. manifest에는 원본·config의 device/inode/time/SHA-256, 복구 event/byte 수, 폐기한 tail, 도구 binary/git/build 정보가 들어갑니다. 출력이나 manifest가 이미 있으면 어느 것도 덮어쓰지 않습니다.
+
+복구 파일은 원래 run의 `completed` raw가 아닙니다. 기존 failed metadata를 고쳐서 completed로 가장하지 마십시오. Production converter가 `acquisition_status=completed`, raw size/SHA 및 config readback 일치를 요구하므로 recovered prefix의 분석·승격은 recovery manifest를 보존한 별도 검토 절차로 다뤄야 합니다.
+
+### Runtime provenance, health, relocation
+
+장비 설정 검증 직후와 acquisition 시작 직후 상태는 각각 `<raw>.run.json.status.hardware_verified_not_started.json`, `<raw>.run.json.status.running.json`에 불변 snapshot으로 남습니다. canonical `<raw>.run.json`은 `completed`, `failed` 또는 `cancelled` terminal 상태에서 한 번만 생성됩니다. 주요 감사 항목은 다음과 같습니다.
+
+- 요청/실제 raw·partial·config·metadata 경로, run number, 실행 binary 절대 경로, binary SHA-256, git commit, build timestamp
+- raw 크기/SHA-256/digest 방식, 기록·손실 event 수, 종료/실패 원인, 시작 전·후 파일시스템 여유 공간
+- input range, ADC bits, clock/sync, post-trigger, record/self-trigger mask, pair logic와 각 register readback
+- 채널별 DC offset/polarity, measured baseline, 요청 mV, delta ADC, threshold write/readback/effective mV
+- 실행 중 health/readout/ZMQ/config-check 횟수, channel별 최고 온도와 ZMQ send watermark
+
+Frontend는 시작 전과 종료 직전에 strict health/config readback을 수행하고, 실행 중에는 온도·board status·저장공간을 약 250 ms마다, 설정 불변성을 약 1초마다 검사합니다. 활성 채널 온도가 82 °C에 도달하거나 health/register 검증을 신뢰할 수 없으면 run을 실패 상태로 멈춥니다.
+
+run bundle을 다른 디스크나 호스트로 옮길 때는 raw, `<raw>.config.conf`, `<raw>.run.json`을 함께 복사하고 production에 세 경로를 명시하십시오.
+
+```bash
+./bin/production_dt5730 \
+  -i /archive/run021.dat \
+  -c /archive/run021.dat.config.conf \
+  -m /archive/run021.dat.run.json \
+  -r 21 -o /archive/run021_prod.root
+```
+
+기록 당시 절대 경로와 현재 선택 경로가 달라도 raw size/SHA-256, config SHA-256, run number 및 hardware/readback metadata가 모두 일치하면 relocation warning과 함께 변환할 수 있습니다. 생성된 ROOT에는 `RecordedRawOutputPath`/`ResolvedRawInputPath`, `RecordedConfigPath`/`ResolvedConfigPath`, `RecordedMetadataPath`/`ResolvedMetadataPath`를 모두 저장하고 선택한 metadata bytes의 `RunMetadataSha256`도 기록합니다. 경로가 같다는 이유만으로 신뢰하지 않으며, 내용 검증 실패 시 ROOT output을 게시하지 않습니다.
+
+GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-events`를 생략하면 전체 tree를 검사하며, JSON 보고서는 stdout, 진행률/진단은 stderr로 분리됩니다. `--max-events`로 제한하면 tree의 선두 event prefix만 검사해 빠른 이상 탐지를 제공합니다. 이 prefix 모드는 큰 ROOT/raw를 전부 읽지 않도록 전체 ROOT 및 외부 artifact SHA-256을 의도적으로 생략하고 identity/size만 확인하므로, 보고서는 `WARN`이며 전체 파일에 대한 양성 판정은 `SKIP`으로 남습니다. 특히 metadata가 없는 구형 파일의 cutoff/상대 threshold 추론은 전수 검사에서만 제공합니다.
 
 ```bash
 ./bin/root_validate_dt5730 -i /absolute/run021_prod.root \
   > run021_prod.root.validation.json
 ```
 
-메타데이터는 기존 파일을 덮어쓰지 않습니다. 장비 설정 검증 직후와 acquisition 시작 직후 상태는 각각 `<raw>.run.json.status.hardware_verified_not_started.json`, `<raw>.run.json.status.running.json`에 불변 스냅샷으로 남고, production이 사용하는 `<raw>.run.json`은 `completed` 또는 `failed` terminal 상태에서 한 번만 생성됩니다. 각 파일은 검증한 열린 inode를 no-clobber 방식으로 게시하므로 동시 경로 교체나 이전 run 산출물을 덮어쓰지 않습니다.
+메타데이터와 GUI에서 내보내는 ROOT validation JSON은 게시 시점에 경로가 없을 때만 원자적으로 생성되며, 사전 검사 이후 race로 생긴 경로도 덮어쓰지 않습니다. 새 경로에 저장하거나 기존 결과를 명시적으로 보관한 뒤 다시 검증하십시오. 위 CLI 예시의 `>`는 shell redirection이므로 별도로 `noclobber`를 설정하지 않으면 기존 파일을 덮어쓸 수 있습니다.
 
 **가벼운 CLI 모니터링 단독 실행 (X-Server 불필요):**
 메인 프로그램을 띄우지 않고 터미널 환경에서 가볍게 다중 채널 파형과 스펙트럼만 모니터링할 경우 아래 스크립트를 실행합니다.
@@ -293,7 +372,7 @@ GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-
 * **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
 * **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, Micro-Time(T0) 추출, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
-* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전수 또는 제한 event 수만 검사합니다. PASS/WARN/FAIL과 채널별 baseline/threshold/routing 지표를 표로 보여 주고, 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
+* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event를 검사하거나 제한 event 수의 선두 prefix를 검사합니다. PASS/WARN/FAIL과 채널별 baseline/threshold/routing 지표를 표로 보여 주고, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 
 ---

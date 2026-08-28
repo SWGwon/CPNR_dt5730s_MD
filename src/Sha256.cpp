@@ -158,10 +158,55 @@ class Sha256Context {
 
 }  // namespace
 
-std::string Sha256Hex(std::string_view data) {
+struct Sha256Accumulator::Impl {
   Sha256Context context;
-  context.Update(reinterpret_cast<const uint8_t*>(data.data()), data.size());
-  return context.FinalHex();
+  uint64_t size_bytes = 0U;
+  bool finalized = false;
+  std::string digest;
+};
+
+Sha256Accumulator::Sha256Accumulator() : impl_(std::make_unique<Impl>()) {}
+
+Sha256Accumulator::~Sha256Accumulator() = default;
+
+Sha256Accumulator::Sha256Accumulator(Sha256Accumulator&&) noexcept = default;
+
+Sha256Accumulator& Sha256Accumulator::operator=(
+    Sha256Accumulator&&) noexcept = default;
+
+void Sha256Accumulator::Update(const void* data, std::size_t size) {
+  if (!impl_) throw std::logic_error("SHA-256 accumulator was moved from");
+  if (impl_->finalized) {
+    throw std::logic_error("Cannot update a finalized SHA-256 accumulator");
+  }
+  if (size != 0U && data == nullptr) {
+    throw std::invalid_argument("Cannot hash a null non-empty buffer");
+  }
+  if (size == 0U) return;
+  if (size > std::numeric_limits<uint64_t>::max() - impl_->size_bytes) {
+    throw std::runtime_error("Input is too large for SHA-256");
+  }
+  impl_->context.Update(static_cast<const uint8_t*>(data), size);
+  impl_->size_bytes += static_cast<uint64_t>(size);
+}
+
+std::string Sha256Accumulator::FinalHex() {
+  if (!impl_) throw std::logic_error("SHA-256 accumulator was moved from");
+  if (!impl_->finalized) {
+    impl_->digest = impl_->context.FinalHex();
+    impl_->finalized = true;
+  }
+  return impl_->digest;
+}
+
+uint64_t Sha256Accumulator::SizeBytes() const noexcept {
+  return impl_ ? impl_->size_bytes : 0U;
+}
+
+std::string Sha256Hex(std::string_view data) {
+  Sha256Accumulator accumulator;
+  accumulator.Update(data.data(), data.size());
+  return accumulator.FinalHex();
 }
 
 std::string Sha256FileHex(const std::string& path) {

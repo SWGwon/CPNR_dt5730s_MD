@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +21,8 @@
 #include <ctime>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <zmq.h>
 
@@ -37,7 +40,11 @@ constexpr uint32_t kMajorityLevelMask = 0x07U << 24;
 constexpr uint32_t kExternalTriggerEnableMask = 1U << 30;
 constexpr uint32_t kSoftwareTriggerEnableMask = 1U << 31;
 constexpr uint32_t kExternalClockSelectMask = 1U << 6;
+constexpr uint32_t kAcquisitionStatusRegister = 0x8104;
+constexpr uint32_t kAcquisitionRunMask = 1U << 0;
 constexpr int kDppFirmwareMajorBase = 128;
+constexpr uint64_t kZmqQueueByteBudget = 64U * 1024U * 1024U;
+constexpr uint32_t kZmqMaximumHwmMessages = 5000U;
 
 class FatalAcquisitionError : public std::runtime_error {
  public:
@@ -101,6 +108,85 @@ std::string RequireAbsentFile(const std::string& path,
   return absolute;
 }
 
+uint32_t EnabledChannelCount(uint32_t mask) {
+  uint32_t count = 0U;
+  while (mask != 0U) {
+    count += mask & 1U;
+    mask >>= 1U;
+  }
+  return count;
+}
+
+uint64_t RawEventBytes(const DAQHardwareSettings& settings) {
+  const uint64_t waveform_bytes =
+      static_cast<uint64_t>(EnabledChannelCount(settings.channel_mask)) *
+      settings.record_length * sizeof(uint16_t);
+  if (waveform_bytes >
+      std::numeric_limits<uint64_t>::max() - sizeof(EventHeader)) {
+    throw std::runtime_error("Configured raw event size overflows uint64_t");
+  }
+  return sizeof(EventHeader) + waveform_bytes;
+}
+
+std::filesystem::path OutputParent(const std::string& path) {
+  const auto parent = std::filesystem::path(path).parent_path();
+  return parent.empty() ? std::filesystem::path(".") : parent;
+}
+
+uint64_t FilesystemFreeBytes(const std::string& output_path) {
+  const auto parent = OutputParent(output_path);
+  struct statvfs filesystem {};
+  if (::statvfs(parent.c_str(), &filesystem) != 0) {
+    throw std::runtime_error(
+        "Cannot inspect free space on output filesystem " +
+        parent.string() + " (" + std::strerror(errno) + ")");
+  }
+  if (filesystem.f_frsize != 0U &&
+      static_cast<uint64_t>(filesystem.f_bavail) >
+          std::numeric_limits<uint64_t>::max() /
+              static_cast<uint64_t>(filesystem.f_frsize)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return static_cast<uint64_t>(filesystem.f_bavail) *
+         static_cast<uint64_t>(filesystem.f_frsize);
+}
+
+uint64_t ExpectedRawBytes(const DAQHardwareSettings& settings,
+                          int max_events) {
+  if (max_events <= 0) return 0U;
+  const uint64_t event_bytes = RawEventBytes(settings);
+  if (static_cast<uint64_t>(max_events) >
+      std::numeric_limits<uint64_t>::max() / event_bytes) {
+    throw std::runtime_error("Requested event count overflows raw size estimate");
+  }
+  return event_bytes * static_cast<uint64_t>(max_events);
+}
+
+std::string PrepareWorkingOutputPath(
+    const std::string& final_output, const DAQHardwareSettings& settings,
+    int max_events, int run_time_sec) {
+  if (max_events < 0 || run_time_sec < 0) {
+    throw std::runtime_error("Event and time limits cannot be negative");
+  }
+  if (max_events > 0 && run_time_sec > 0) {
+    throw std::runtime_error(
+        "Event and time limits are mutually exclusive");
+  }
+  const std::string working =
+      RequireAbsentFile(final_output + ".partial", "Raw partial output");
+  const uint64_t available = FilesystemFreeBytes(working);
+  const uint64_t expected = ExpectedRawBytes(settings, max_events);
+  const uint64_t reserve = settings.storage.minimum_free_bytes;
+  if (available < reserve || expected > available - reserve) {
+    std::ostringstream message;
+    message << "Insufficient output-filesystem capacity: available="
+            << available << " bytes, expected_raw=" << expected
+            << " bytes, required_reserve=" << reserve << " bytes";
+    throw std::runtime_error(message.str());
+  }
+  return working;
+}
+
 std::string MetadataOutputPath(const std::string& output_file,
                                const std::string& metadata_file) {
   const std::string final_path = RequireAbsentFile(
@@ -122,10 +208,76 @@ std::string ConfigSnapshotPath(const std::string& config_file,
   return RequireAbsentFile(snapshot, "Runtime config snapshot");
 }
 
+std::string ConfigSnapshotPathAndValidateArtifacts(
+    const std::string& config_file, const std::string& output_file,
+    const std::string& working_output_file,
+    const std::string& metadata_file) {
+  const std::string snapshot =
+      ConfigSnapshotPath(config_file, output_file);
+  const std::array<std::pair<const char*, std::string>, 6> artifacts{{
+      {"raw output", output_file},
+      {"partial raw output", working_output_file},
+      {"runtime metadata", metadata_file},
+      {"runtime config snapshot", snapshot},
+      {"hardware-verified status",
+       metadata_file + ".status.hardware_verified_not_started.json"},
+      {"running status", metadata_file + ".status.running.json"},
+  }};
+
+  struct TargetKey {
+    uint64_t parent_device = 0;
+    uint64_t parent_inode = 0;
+    std::string filename;
+  };
+  const auto target_key = [](const std::string& target) {
+    const std::filesystem::path path(target);
+    const std::filesystem::path parent = path.parent_path().empty()
+                                             ? std::filesystem::path(".")
+                                             : path.parent_path();
+    const int descriptor =
+        ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0) {
+      throw std::runtime_error(
+          "Cannot open runtime artifact directory " + parent.string() +
+          " (" + std::strerror(errno) + ")");
+    }
+    struct stat status {};
+    const int stat_result = ::fstat(descriptor, &status);
+    const int stat_error = errno;
+    ::close(descriptor);
+    if (stat_result != 0 || !S_ISDIR(status.st_mode)) {
+      throw std::runtime_error(
+          "Cannot identify runtime artifact directory " + parent.string() +
+          " (" + std::strerror(stat_error) + ")");
+    }
+    return TargetKey{static_cast<uint64_t>(status.st_dev),
+                     static_cast<uint64_t>(status.st_ino),
+                     path.filename().string()};
+  };
+  std::array<TargetKey, 6> keys;
+  for (std::size_t index = 0; index < artifacts.size(); ++index) {
+    keys[index] = target_key(artifacts[index].second);
+  }
+  for (std::size_t left = 0; left < artifacts.size(); ++left) {
+    for (std::size_t right = left + 1U; right < artifacts.size(); ++right) {
+      if (keys[left].parent_device == keys[right].parent_device &&
+          keys[left].parent_inode == keys[right].parent_inode &&
+          keys[left].filename == keys[right].filename) {
+        throw std::runtime_error(
+            "Runtime artifact paths alias: " +
+            std::string(artifacts[left].first) + " and " +
+            artifacts[right].first + " both resolve to " +
+            artifacts[left].second);
+      }
+    }
+  }
+  return snapshot;
+}
+
 std::pair<int, FileIdentity> ReserveOutputFile(
     const std::string& output_file) {
   const int descriptor =
-      ::open(output_file.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+      ::open(output_file.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
   if (descriptor < 0) {
     throw std::runtime_error(
         "Cannot create raw output without overwriting an existing file: " +
@@ -135,10 +287,11 @@ std::pair<int, FileIdentity> ReserveOutputFile(
   if (::fstat(descriptor, &status) != 0) {
     const int status_error = errno;
     ::close(descriptor);
-    ::unlink(output_file.c_str());
     throw std::runtime_error("Cannot identify newly reserved raw output " +
                              output_file + " (" +
-                             std::strerror(status_error) + ")");
+                             std::strerror(status_error) +
+                             "); preserving the path because its identity "
+                             "could not be established");
   }
   return {descriptor,
           {static_cast<uint64_t>(status.st_dev),
@@ -153,9 +306,102 @@ bool PathMatchesIdentity(const std::string& path,
          static_cast<uint64_t>(status.st_ino) == identity.inode;
 }
 
+int RenameNoReplace(int old_directory, const char* old_path,
+                    int new_directory, const char* new_path) {
+#ifdef SYS_renameat2
+  constexpr unsigned int kRenameNoReplace = 1U;
+  return static_cast<int>(::syscall(SYS_renameat2, old_directory, old_path,
+                                    new_directory, new_path,
+                                    kRenameNoReplace));
+#else
+  (void)old_directory;
+  (void)old_path;
+  (void)new_directory;
+  (void)new_path;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
 bool RemoveIfSameFile(const std::string& path,
                       const FileIdentity& identity) {
-  return PathMatchesIdentity(path, identity) && ::unlink(path.c_str()) == 0;
+  // There is no POSIX unlink-by-inode operation.  Checking with lstat() and
+  // then unlinking the public pathname is unsafe because another process can
+  // replace the name between those calls.  Instead, atomically move whichever
+  // entry currently owns the public name into a freshly-created quarantine,
+  // inspect it through the pinned directory descriptor, and delete it only
+  // after the inode matches.  A mismatching entry is restored without
+  // overwrite; if the public name was concurrently reused, preserve the entry
+  // in quarantine rather than deleting either file.
+  const auto target_path = std::filesystem::path(path);
+  const auto parent = target_path.parent_path().empty()
+                          ? std::filesystem::path(".")
+                          : target_path.parent_path();
+  std::string quarantine_template =
+      (parent / ".cpnr-cleanup-XXXXXX").string();
+  std::vector<char> quarantine_buffer(quarantine_template.begin(),
+                                      quarantine_template.end());
+  quarantine_buffer.push_back('\0');
+  char* const quarantine_created = ::mkdtemp(quarantine_buffer.data());
+  if (quarantine_created == nullptr) return false;
+  const std::string quarantine_path(quarantine_created);
+
+  const int quarantine_descriptor =
+      ::open(quarantine_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (quarantine_descriptor < 0) {
+    ::rmdir(quarantine_path.c_str());
+    return false;
+  }
+
+  constexpr const char* kQuarantinedEntry = "candidate";
+  const auto close_empty_quarantine = [&]() {
+    ::close(quarantine_descriptor);
+    if (::rmdir(quarantine_path.c_str()) != 0 && errno != ENOENT) {
+      std::cerr << "[Run Provenance] Cannot remove empty cleanup quarantine: "
+                << quarantine_path << " (" << std::strerror(errno) << ")\n";
+    }
+  };
+  const auto preserve_or_restore = [&]() {
+    if (RenameNoReplace(quarantine_descriptor, kQuarantinedEntry, AT_FDCWD,
+                        path.c_str()) == 0) {
+      close_empty_quarantine();
+      return;
+    }
+    const int restore_error = errno;
+    ::close(quarantine_descriptor);
+    std::cerr << "[Run Provenance] Preserved a cleanup-race entry in "
+              << quarantine_path << "/" << kQuarantinedEntry
+              << " because its public name could not be restored without "
+                 "overwrite: "
+              << path << " (" << std::strerror(restore_error) << ")\n";
+  };
+
+  if (RenameNoReplace(AT_FDCWD, path.c_str(), quarantine_descriptor,
+                      kQuarantinedEntry) != 0) {
+    close_empty_quarantine();
+    return false;
+  }
+
+  struct stat quarantined_status {};
+  if (::fstatat(quarantine_descriptor, kQuarantinedEntry,
+                &quarantined_status, AT_SYMLINK_NOFOLLOW) != 0) {
+    preserve_or_restore();
+    return false;
+  }
+  const bool identity_matches =
+      static_cast<uint64_t>(quarantined_status.st_dev) == identity.device &&
+      static_cast<uint64_t>(quarantined_status.st_ino) == identity.inode;
+  if (!identity_matches) {
+    preserve_or_restore();
+    return false;
+  }
+
+  if (::unlinkat(quarantine_descriptor, kQuarantinedEntry, 0) != 0) {
+    preserve_or_restore();
+    return false;
+  }
+  close_empty_quarantine();
+  return true;
 }
 
 void LinkDescriptorNoReplace(int descriptor, const std::string& target,
@@ -233,10 +479,10 @@ FileIdentity WriteNewAtomicFile(const std::string& target,
   if (::fstat(descriptor, &temporary_status) != 0) {
     const int status_error = errno;
     ::close(descriptor);
-    ::unlink(temporary_path.c_str());
     throw std::runtime_error(
         "Cannot identify temporary runtime artifact " + temporary_path +
-        " (" + std::strerror(status_error) + ")");
+        " (" + std::strerror(status_error) +
+        "); preserving it because its identity could not be established");
   }
   const FileIdentity temporary_identity{
       static_cast<uint64_t>(temporary_status.st_dev),
@@ -346,16 +592,33 @@ std::string JsonEscape(const std::string& value) {
   return escaped.str();
 }
 
-double Median(std::vector<uint16_t>& values) {
-  if (values.empty()) {
-    throw std::runtime_error("Cannot calculate a baseline from zero ADC samples");
+double HistogramMedian(const std::vector<uint64_t>& histogram) {
+  const uint64_t sample_count =
+      std::accumulate(histogram.begin(), histogram.end(), uint64_t{0});
+  if (sample_count == 0U) {
+    throw std::runtime_error(
+        "Cannot calculate a baseline from zero ADC samples");
   }
-  const std::size_t middle = values.size() / 2;
-  std::nth_element(values.begin(), values.begin() + middle, values.end());
-  if ((values.size() & 1U) != 0U) return values[middle];
-  const uint16_t upper = values[middle];
-  const uint16_t lower = *std::max_element(values.begin(), values.begin() + middle);
-  return (static_cast<double>(lower) + static_cast<double>(upper)) / 2.0;
+  const uint64_t lower_rank = (sample_count - 1U) / 2U;
+  const uint64_t upper_rank = sample_count / 2U;
+  uint64_t cumulative = 0U;
+  uint32_t lower_value = 0U;
+  uint32_t upper_value = 0U;
+  bool lower_found = false;
+  for (std::size_t code = 0; code < histogram.size(); ++code) {
+    cumulative += histogram[code];
+    if (!lower_found && cumulative > lower_rank) {
+      lower_value = static_cast<uint32_t>(code);
+      lower_found = true;
+    }
+    if (cumulative > upper_rank) {
+      upper_value = static_cast<uint32_t>(code);
+      break;
+    }
+  }
+  return (static_cast<double>(lower_value) +
+          static_cast<double>(upper_value)) /
+         2.0;
 }
 
 int ParseFirmwareMajor(const char* release) {
@@ -442,54 +705,119 @@ DAQManager::DAQManager(const std::string &config_file,
       config_(ConfigParser::FromText(config_contents_, config_file_)),
       hardware_settings_(LoadDAQHardwareSettings(config_)),
       output_file_(RequireAbsentFile(output_file, "Raw output")),
+      working_output_file_(PrepareWorkingOutputPath(
+          output_file_, hardware_settings_, max_events, run_time_sec)),
       metadata_file_(MetadataOutputPath(output_file, metadata_file)),
-      config_snapshot_file_(ConfigSnapshotPath(config_file, output_file)),
+      config_snapshot_file_(ConfigSnapshotPathAndValidateArtifacts(
+          config_file_, output_file_, working_output_file_, metadata_file_)),
       executable_path_(executable_path.empty() ? "unknown" : executable_path),
       git_commit_(git_commit), build_timestamp_(build_timestamp),
       run_number_(PositiveRunNumber(run_number)), max_events_(max_events),
       run_time_sec_(run_time_sec), running_(false),
-      cancellation_flag_(cancellation_flag),
-      digitizer_(CAEN_DGTZ_USB, 0, 0, 0) {
+      cancellation_flag_(cancellation_flag) {
+  expected_raw_bytes_ = ExpectedRawBytes(hardware_settings_, max_events_);
+  output_free_bytes_at_start_ = FilesystemFreeBytes(working_output_file_);
+  std::cout << "\033[1;36m[Storage Preflight]\033[0m filesystem_free="
+            << output_free_bytes_at_start_ << " bytes, expected_raw="
+            << expected_raw_bytes_ << " bytes, reserve="
+            << hardware_settings_.storage.minimum_free_bytes
+            << " bytes, runtime_stop_watermark="
+            << hardware_settings_.storage.stop_free_bytes << " bytes\n";
   // Hash the inode the kernel is actually executing. Reopening argv[0] can
   // hash a replacement binary after an in-place rebuild.
   executable_sha256_ = Sha256FileHex("/proc/self/exe");
-  zmq_ctx_ = zmq_ctx_new();
-  if (!zmq_ctx_) throw std::runtime_error("Cannot create ZeroMQ context");
-  zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
-  if (!zmq_pub_) {
-    zmq_ctx_destroy(zmq_ctx_);
-    zmq_ctx_ = nullptr;
-    throw std::runtime_error("Cannot create ZeroMQ publisher socket");
-  }
-  int hwm = 5000;
-  zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm));
-  
-  int linger = 0;
-  zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger));
-  if (zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555") != 0) {
-    zmq_close(zmq_pub_);
-    zmq_ctx_destroy(zmq_ctx_);
-    zmq_pub_ = nullptr;
-    zmq_ctx_ = nullptr;
-    throw std::runtime_error("Cannot bind ZeroMQ publisher to tcp://127.0.0.1:5555");
-  }
 
   bool output_created = false;
   int output_descriptor = -1;
+  const auto cleanup_failed_construction = [&]() {
+    if (output_stream_) {
+      ::fclose(output_stream_);
+      output_stream_ = nullptr;
+    } else if (output_descriptor >= 0) {
+      ::close(output_descriptor);
+      output_descriptor = -1;
+    }
+    if (output_created) {
+      RemoveIfSameFile(working_output_file_,
+                       {output_device_, output_inode_});
+    }
+    if (zmq_pub_) zmq_close(zmq_pub_);
+    if (zmq_ctx_) zmq_ctx_destroy(zmq_ctx_);
+    zmq_pub_ = nullptr;
+    zmq_ctx_ = nullptr;
+  };
+  const auto record_failed_setup = [&](const std::string& reason) {
+    acquisition_status_ = "failed";
+    termination_reason_ = "setup_failure";
+    failure_reason_ = reason;
+    acquisition_end_unix_time_ = std::time(nullptr);
+    try {
+      WriteRuntimeArtifacts();
+    } catch (const std::exception& metadata_error) {
+      std::cerr << "[Run Provenance] Cannot record setup failure: "
+                << metadata_error.what() << "\n";
+    }
+  };
+  const auto record_cancelled_setup = [&]() {
+    acquisition_status_ = "cancelled";
+    termination_reason_ = "cancelled_during_setup";
+    failure_reason_.clear();
+    acquisition_end_unix_time_ = std::time(nullptr);
+    WriteRuntimeArtifacts();
+  };
   try {
+    zmq_ctx_ = zmq_ctx_new();
+    if (!zmq_ctx_) {
+      throw std::runtime_error("Cannot create ZeroMQ context");
+    }
+    zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
+    if (!zmq_pub_) {
+      throw std::runtime_error("Cannot create ZeroMQ publisher socket");
+    }
+    const uint64_t raw_event_bytes = RawEventBytes(hardware_settings_);
+    const uint64_t byte_limited_hwm =
+        std::max<uint64_t>(1U, kZmqQueueByteBudget / raw_event_bytes);
+    zmq_send_hwm_messages_ = static_cast<uint32_t>(
+        std::min<uint64_t>(kZmqMaximumHwmMessages, byte_limited_hwm));
+    zmq_send_hwm_approx_bytes_ =
+        raw_event_bytes * static_cast<uint64_t>(zmq_send_hwm_messages_);
+    const int hwm = static_cast<int>(zmq_send_hwm_messages_);
+    if (zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm)) != 0) {
+      throw std::runtime_error(
+          "Cannot configure ZeroMQ send watermark: " +
+          std::string(zmq_strerror(zmq_errno())));
+    }
+    int linger = 0;
+    if (zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger)) != 0) {
+      throw std::runtime_error("Cannot configure ZeroMQ linger: " +
+                               std::string(zmq_strerror(zmq_errno())));
+    }
+    if (zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555") != 0) {
+      throw std::runtime_error(
+          "Cannot bind ZeroMQ publisher to tcp://127.0.0.1:5555: " +
+          std::string(zmq_strerror(zmq_errno())));
+    }
+    std::cout << "\033[1;36m[ZeroMQ]\033[0m send_hwm="
+              << zmq_send_hwm_messages_ << " messages, approximate_queue="
+              << zmq_send_hwm_approx_bytes_ << "/" << kZmqQueueByteBudget
+              << " bytes\n";
+    digitizer_ =
+        std::make_unique<CaenDigitizer>(CAEN_DGTZ_USB, 0, 0, 0);
     SetupHardware();
-    const auto reservation = ReserveOutputFile(output_file_);
+    hardware_verified_unix_time_ = std::time(nullptr);
+    const auto reservation = ReserveOutputFile(working_output_file_);
     output_descriptor = reservation.first;
     output_device_ = reservation.second.device;
     output_inode_ = reservation.second.inode;
     output_created = true;
+    SyncParentDirectory(working_output_file_);
     output_stream_ = ::fdopen(output_descriptor, "w+b");
     if (!output_stream_) {
       const int stream_error = errno;
       ::close(output_descriptor);
       output_descriptor = -1;
       throw std::runtime_error("Cannot attach a stream to reserved output " +
-                               output_file_ + " (" +
+                               working_output_file_ + " (" +
                                std::strerror(stream_error) + ")");
     }
     output_descriptor = -1;
@@ -499,20 +827,29 @@ DAQManager::DAQManager(const std::string &config_file,
       throw std::runtime_error("Cannot configure raw-output write buffer");
     }
     WriteRuntimeArtifacts();
+  } catch (const DAQSetupCancelled&) {
+    try {
+      record_cancelled_setup();
+    } catch (const std::exception& metadata_error) {
+      cleanup_failed_construction();
+      throw std::runtime_error(
+          "Hardware setup was cancelled, but terminal metadata could not be "
+          "recorded: " + std::string(metadata_error.what()));
+    } catch (...) {
+      cleanup_failed_construction();
+      throw std::runtime_error(
+          "Hardware setup was cancelled, but terminal metadata failed with "
+          "an unknown non-standard exception");
+    }
+    cleanup_failed_construction();
+    throw;
+  } catch (const std::exception& error) {
+    record_failed_setup(error.what());
+    cleanup_failed_construction();
+    throw;
   } catch (...) {
-    if (output_stream_) {
-      ::fclose(output_stream_);
-      output_stream_ = nullptr;
-    } else if (output_descriptor >= 0) {
-      ::close(output_descriptor);
-    }
-    if (output_created) {
-      RemoveIfSameFile(output_file_, {output_device_, output_inode_});
-    }
-    zmq_close(zmq_pub_);
-    zmq_ctx_destroy(zmq_ctx_);
-    zmq_pub_ = nullptr;
-    zmq_ctx_ = nullptr;
+    record_failed_setup("unknown non-standard setup exception");
+    cleanup_failed_construction();
     throw;
   }
 }
@@ -530,7 +867,10 @@ DAQManager::~DAQManager() {
 void DAQManager::SetupHardware() {
   CheckSetupCancellation();
   std::cout << "\033[1;36m[DAQManager]\033[0m Configuring Hardware from Config...\n";
-  const int handle = digitizer_.GetHandle();
+  if (!digitizer_) {
+    throw std::logic_error("DAQ hardware object is not initialized");
+  }
+  const int handle = digitizer_->GetHandle();
 
   CAEN_DGTZ_BoardInfo_t board_info{};
   CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &board_info));
@@ -602,6 +942,14 @@ void DAQManager::SetupHardware() {
             << Hex32(channel_mask_readback_) << "\n";
   CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle,
                                           hardware_settings_.post_trigger));
+  CAEN_CHECK(CAEN_DGTZ_GetPostTriggerSize(handle,
+                                          &post_trigger_readback_));
+  if (post_trigger_readback_ != hardware_settings_.post_trigger) {
+    throw std::runtime_error(
+        "Post-trigger readback mismatch: requested " +
+        std::to_string(hardware_settings_.post_trigger) + ", read back " +
+        std::to_string(post_trigger_readback_));
+  }
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
   const auto requested_run_sync = static_cast<CAEN_DGTZ_RunSyncMode_t>(
       hardware_settings_.run_sync_mode);
@@ -634,7 +982,7 @@ void DAQManager::SetupHardware() {
   ConfigureInputRangeAndOffsets(handle);
   CheckSetupCancellation();
 
-  digitizer_.AllocateBuffers();
+  digitizer_->AllocateBuffers();
   const size_t max_safe_size =
       sizeof(EventHeader) +
       (record_length + 1024) * sizeof(uint16_t) * MAX_CH;
@@ -694,7 +1042,7 @@ void DAQManager::SetupHardware() {
 void DAQManager::CheckSetupCancellation() const {
   if (cancellation_flag_ != nullptr &&
       !cancellation_flag_->load(std::memory_order_relaxed)) {
-    throw std::runtime_error(
+    throw DAQSetupCancelled(
         "Hardware setup/baseline calibration cancelled by user");
   }
 }
@@ -761,7 +1109,14 @@ void DAQManager::ConfigureInputRangeAndOffsets(int handle) {
 
 std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
     int handle, std::chrono::steady_clock::time_point deadline) {
-  std::array<std::vector<uint16_t>, MAX_CH> samples;
+  const std::size_t adc_codes =
+      std::size_t{1} << hardware_settings_.adc_bits;
+  std::array<std::vector<uint64_t>, MAX_CH> histograms;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U) {
+      histograms[ch].assign(adc_codes, 0U);
+    }
+  }
   const uint32_t requested_events =
       hardware_settings_.trigger_calibration.measurement_events;
   uint32_t decoded_events = 0;
@@ -777,48 +1132,56 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
     CAEN_CHECK(CAEN_DGTZ_ClearData(handle));
     CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(handle));
     acquisition_started = true;
-    for (uint32_t event = 0; event < requested_events; ++event) {
-      CheckSetupCancellation();
-      if (std::chrono::steady_clock::now() >= deadline) break;
-      CAEN_CHECK(CAEN_DGTZ_SendSWtrigger(handle));
-      if (event + 1U < requested_events) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) break;
-        std::this_thread::sleep_until(
-            std::min(deadline, now + std::chrono::milliseconds(1)));
-      }
-    }
-
-    char* readout_buffer = digitizer_.GetReadoutBuffer();
-    auto* decoded_event = digitizer_.GetDecodedEvent();
+    char* readout_buffer = digitizer_->GetReadoutBuffer();
+    auto* decoded_event = digitizer_->GetDecodedEvent();
     while (decoded_events < requested_events &&
            std::chrono::steady_clock::now() < deadline) {
       CheckSetupCancellation();
-      uint32_t bytes_read = 0;
-      CAEN_CHECK(CAEN_DGTZ_ReadData(
-          handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT,
-          readout_buffer, &bytes_read));
-      if (std::chrono::steady_clock::now() >= deadline) {
-        break;
-      }
-      if (bytes_read == 0U) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
+      // Issue and drain one calibration trigger at a time.  Sending all
+      // MeasurementEvents before reading can overflow the digitizer FIFO at
+      // otherwise-valid high settings.
+      CAEN_CHECK(CAEN_DGTZ_SendSWtrigger(handle));
+      bool trigger_drained = false;
+      while (!trigger_drained &&
+             std::chrono::steady_clock::now() < deadline) {
+        CheckSetupCancellation();
+        uint32_t bytes_read = 0;
+        CAEN_CHECK(CAEN_DGTZ_ReadData(
+            handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT,
+            readout_buffer, &bytes_read));
+        if (bytes_read == 0U) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
 
-      uint32_t event_count = 0;
-      CAEN_CHECK(CAEN_DGTZ_GetNumEvents(
-          handle, readout_buffer, bytes_read, &event_count));
-      for (uint32_t event_index = 0;
-           event_index < event_count && decoded_events < requested_events;
-           ++event_index) {
+        uint32_t event_count = 0;
+        CAEN_CHECK(CAEN_DGTZ_GetNumEvents(
+            handle, readout_buffer, bytes_read, &event_count));
+        if (event_count == 0U) continue;
+        trigger_drained = true;
+        for (uint32_t event_index = 0;
+             event_index < event_count && decoded_events < requested_events;
+             ++event_index) {
         CAEN_DGTZ_EventInfo_t event_info{};
         char* event_pointer = nullptr;
         CAEN_CHECK(CAEN_DGTZ_GetEventInfo(
             handle, readout_buffer, bytes_read, event_index, &event_info,
             &event_pointer));
+        if (event_pointer == nullptr) {
+          throw std::runtime_error(
+              "Baseline event lookup returned a null event pointer");
+        }
         CAEN_CHECK(CAEN_DGTZ_DecodeEvent(
             handle, event_pointer, reinterpret_cast<void**>(&decoded_event)));
+        if (decoded_event == nullptr) {
+          throw std::runtime_error(
+              "Baseline event decode returned a null waveform object");
+        }
+        if (event_info.ChannelMask != hardware_settings_.channel_mask) {
+          throw std::runtime_error(
+              "Baseline event channel mask does not match the configured "
+              "readout mask");
+        }
 
         for (int ch = 0; ch < MAX_CH; ++ch) {
           if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U ||
@@ -827,10 +1190,24 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
           }
           const uint32_t trace_size = decoded_event->ChSize[ch];
           const uint16_t* trace = decoded_event->DataChannel[ch];
-          if (trace == nullptr || trace_size == 0U) continue;
-          samples[ch].insert(samples[ch].end(), trace, trace + trace_size);
+          if (trace == nullptr || trace_size == 0U ||
+              trace_size != hardware_settings_.record_length) {
+            throw std::runtime_error(
+                "Baseline event has a missing or malformed CH" +
+                std::to_string(ch) + " waveform");
+          }
+          for (uint32_t sample = 0; sample < trace_size; ++sample) {
+            const uint16_t code = trace[sample];
+            if (code >= adc_codes) {
+              throw std::runtime_error(
+                  "Baseline waveform contains an ADC code outside the "
+                  "configured resolution");
+            }
+            ++histograms[ch][code];
+          }
         }
         ++decoded_events;
+        }
       }
     }
     CAEN_CHECK(CAEN_DGTZ_SWStopAcquisition(handle));
@@ -852,7 +1229,7 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
   std::array<double, MAX_CH> baselines{};
   for (int ch = 0; ch < MAX_CH; ++ch) {
     if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
-    baselines[ch] = Median(samples[ch]);
+    baselines[ch] = HistogramMedian(histograms[ch]);
   }
   return baselines;
 }
@@ -884,16 +1261,19 @@ std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(int handle) {
   while (std::chrono::steady_clock::now() < deadline) {
     CheckSetupCancellation();
     measurements.push_back(MeasureBaselineBatch(handle, deadline));
-    std::cout << "\033[1;36m[Baseline]\033[0m measurement "
-              << measurements.size();
-    for (int ch = 0; ch < MAX_CH; ++ch) {
-      if (((calibration_mask >> ch) & 1U) != 0U) {
-        std::cout << " CH" << ch << "=" << std::fixed
-                  << std::setprecision(3) << measurements.back()[ch]
-                  << " ADC";
+    if (measurements.size() <= 10U ||
+        measurements.size() % 50U == 0U) {
+      std::cout << "\033[1;36m[Baseline]\033[0m measurement "
+                << measurements.size();
+      for (int ch = 0; ch < MAX_CH; ++ch) {
+        if (((calibration_mask >> ch) & 1U) != 0U) {
+          std::cout << " CH" << ch << "=" << std::fixed
+                    << std::setprecision(3) << measurements.back()[ch]
+                    << " ADC";
+        }
       }
+      std::cout << "\n";
     }
-    std::cout << "\n";
 
     if (measurements.size() >= calibration.stable_measurements) {
       try {
@@ -1093,6 +1473,221 @@ void DAQManager::ConfigureAndVerifyTriggerRouting(int handle) {
             << ".\n";
 }
 
+void DAQManager::VerifyRuntimeConfiguration(int handle) {
+  uint32_t record_length = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetRecordLength(handle, &record_length));
+  if (record_length != hardware_settings_.record_length) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: record length changed from " +
+        std::to_string(hardware_settings_.record_length) + " to " +
+        std::to_string(record_length));
+  }
+
+  uint32_t channel_mask = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetChannelEnableMask(handle, &channel_mask));
+  if (channel_mask != channel_mask_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: channel-enable mask changed from " +
+        Hex32(channel_mask_readback_) + " to " + Hex32(channel_mask));
+  }
+
+  uint32_t post_trigger = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetPostTriggerSize(handle, &post_trigger));
+  if (post_trigger != post_trigger_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: post-trigger percentage changed from " +
+        std::to_string(post_trigger_readback_) + " to " +
+        std::to_string(post_trigger));
+  }
+
+  const uint32_t clock_source =
+      (ReadRegister(handle, 0x8100U) & kExternalClockSelectMask) != 0U ? 1U
+                                                                      : 0U;
+  if (clock_source != clock_source_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: digitizer clock source changed");
+  }
+
+  CAEN_DGTZ_RunSyncMode_t run_sync_mode{};
+  CAEN_CHECK(CAEN_DGTZ_GetRunSynchronizationMode(handle, &run_sync_mode));
+  if (static_cast<int>(run_sync_mode) != run_sync_mode_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: run-synchronization mode changed");
+  }
+
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    const auto& runtime = runtime_channels_[ch];
+    if (!runtime.enabled) continue;
+    const uint32_t range =
+        ReadRegister(handle, runtime.input_range_register) & kInputRangeMask;
+    if (range != runtime.input_range_readback) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " input range register changed");
+    }
+    uint32_t dc_offset = 0U;
+    CAEN_CHECK(CAEN_DGTZ_GetChannelDCOffset(handle, ch, &dc_offset));
+    if (dc_offset != runtime.readback_dc_offset) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " DC offset changed");
+    }
+    CAEN_DGTZ_TriggerPolarity_t polarity{};
+    CAEN_CHECK(CAEN_DGTZ_GetTriggerPolarity(handle, ch, &polarity));
+    const int polarity_value =
+        polarity == CAEN_DGTZ_TriggerOnFallingEdge ? 1 : 0;
+    if (polarity_value != runtime.polarity_readback) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " trigger polarity changed");
+    }
+    if (runtime.threshold_programmed) {
+      uint32_t threshold = 0U;
+      CAEN_CHECK(CAEN_DGTZ_GetChannelTriggerThreshold(
+          handle, ch, &threshold));
+      if (threshold != runtime.readback_threshold_adc) {
+        throw FatalAcquisitionError(
+            "Runtime configuration drift: CH" + std::to_string(ch) +
+            " discriminator threshold changed");
+      }
+    }
+  }
+
+  const uint32_t global_trigger = ReadRegister(handle, kGlobalTriggerMaskRegister);
+  constexpr uint32_t kAuditedGlobalTriggerFields =
+      kPairTriggerRequestMask | kMajorityLevelMask |
+      kExternalTriggerEnableMask | kSoftwareTriggerEnableMask;
+  if ((global_trigger & kAuditedGlobalTriggerFields) !=
+      (global_trigger_mask_readback_ & kAuditedGlobalTriggerFields)) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: global trigger-routing register changed");
+  }
+  if (hardware_settings_.explicit_trigger_routing) {
+    for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+      if (((hardware_settings_.self_trigger_mask >> (pair * 2)) & 0x3U) ==
+          0U) {
+        continue;
+      }
+      const uint32_t observed =
+          ReadRegister(handle,
+                       kPairTriggerLogicBase + kPairRegisterStride * pair) &
+          kPairLogicFieldMask;
+      if (observed != pair_logic_readback_[pair]) {
+        throw FatalAcquisitionError(
+            "Runtime configuration drift: CH" + std::to_string(pair * 2) +
+            "/CH" + std::to_string(pair * 2 + 1) +
+            " pair-trigger logic changed");
+      }
+    }
+  }
+  ++runtime_configuration_checks_;
+}
+
+void DAQManager::VerifyAcquisitionStartCapacity() {
+  const uint64_t available = FilesystemFreeBytes(working_output_file_);
+  const uint64_t reserve = hardware_settings_.storage.minimum_free_bytes;
+  if (available < reserve ||
+      expected_raw_bytes_ > available - reserve) {
+    throw std::runtime_error(
+        "Output-filesystem capacity changed during hardware setup: "
+        "available=" + std::to_string(available) +
+        " bytes, expected_raw=" + std::to_string(expected_raw_bytes_) +
+        " bytes, required_reserve=" + std::to_string(reserve) + " bytes");
+  }
+  output_free_bytes_at_start_ = available;
+  std::cout << "\033[1;36m[Storage Start Check]\033[0m filesystem_free="
+            << available << " bytes, expected_raw=" << expected_raw_bytes_
+            << " bytes, reserve=" << reserve << " bytes\n";
+}
+
+void DAQManager::CheckRuntimeHealthAndStorage(int handle,
+                                              bool strict_readback,
+                                              bool require_running) {
+  ++health_check_count_;
+  bool health_read_ok = true;
+  float max_temperature = 0.0F;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
+    uint32_t temperature_register = 0U;
+    const uint32_t address = 0x10A8U + kChannelRegisterStride * ch;
+    if (CAEN_DGTZ_ReadRegister(handle, address, &temperature_register) !=
+        CAEN_DGTZ_Success) {
+      health_read_ok = false;
+      break;
+    }
+    const uint32_t temperature_code = temperature_register & 0xFFU;
+    const float temperature = static_cast<float>(temperature_code);
+    temperature_observed_[ch] = true;
+    max_temperature_c_[ch] =
+        std::max(max_temperature_c_[ch], temperature_code);
+    max_temperature = std::max(max_temperature, temperature);
+    if (temperature >= 82.0F) {
+      std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
+      throw FatalAcquisitionError(
+          "Digitizer CH" + std::to_string(ch) +
+          " temperature reached the 82 C software shutdown limit");
+    }
+  }
+
+  uint32_t status_register = 0U;
+  if (health_read_ok &&
+      CAEN_DGTZ_ReadRegister(handle, kAcquisitionStatusRegister,
+                             &status_register) !=
+          CAEN_DGTZ_Success) {
+    health_read_ok = false;
+  }
+  if (health_read_ok) {
+    consecutive_health_read_errors_ = 0U;
+    latest_status_register_ = status_register;
+    latest_max_temperature_c_ = max_temperature;
+    health_readback_available_ = true;
+    if (require_running &&
+        (status_register & kAcquisitionRunMask) == 0U) {
+      throw FatalAcquisitionError(
+          "Digitizer acquisition RUN status dropped while software still "
+          "expected the board to be recording");
+    }
+  } else {
+    ++consecutive_health_read_errors_;
+    ++health_read_error_count_;
+    std::cerr << "\n\033[1;33m[Warning] Runtime health-register read failed "
+              << consecutive_health_read_errors_
+              << (strict_readback ? "/1" : "/3")
+              << "; temperature protection cannot be verified\033[0m\n";
+    if (strict_readback || consecutive_health_read_errors_ >= 3U) {
+      throw FatalAcquisitionError(
+          "Runtime health-register communication failed; stopping because "
+          "temperature/status safety cannot be verified");
+    }
+  }
+
+  const uint64_t filesystem_free =
+      FilesystemFreeBytes(working_output_file_);
+  if (filesystem_free < hardware_settings_.storage.stop_free_bytes) {
+    throw FatalAcquisitionError(
+        "Output filesystem reached the configured safety watermark: free=" +
+        std::to_string(filesystem_free) + " bytes, stop_free=" +
+        std::to_string(hardware_settings_.storage.stop_free_bytes) +
+        " bytes");
+  }
+}
+
+void DAQManager::WaitForAcquisitionRunning(int handle) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(500);
+  uint32_t status_register = 0U;
+  do {
+    CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, kAcquisitionStatusRegister,
+                                      &status_register));
+    if ((status_register & kAcquisitionRunMask) != 0U) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  throw FatalAcquisitionError(
+      "Digitizer did not assert the acquisition RUN status within 500 ms "
+      "after SWStartAcquisition");
+}
+
 void DAQManager::WriteRuntimeArtifacts() {
   if (!config_snapshot_written_ && config_file_ != config_snapshot_file_) {
     WriteNewAtomicFile(config_snapshot_file_, config_contents_);
@@ -1111,7 +1706,8 @@ void DAQManager::WriteRuntimeArtifacts() {
   // exactly once for a terminal state, so no path-based replacement race can
   // substitute unvalidated bytes for an already published run record.
   const bool terminal_status =
-      acquisition_status_ == "completed" || acquisition_status_ == "failed";
+      acquisition_status_ == "completed" || acquisition_status_ == "failed" ||
+      acquisition_status_ == "cancelled";
   const std::string published_metadata_path =
       terminal_status
           ? metadata_file_
@@ -1126,13 +1722,58 @@ void DAQManager::WriteRuntimeArtifacts() {
            << "  \"run_number\": " << run_number_ << ",\n"
            << "  \"acquisition_status\": \""
            << JsonEscape(acquisition_status_) << "\",\n"
+           << "  \"termination_reason\": \""
+           << JsonEscape(termination_reason_) << "\",\n"
+           << "  \"requested_max_events\": " << max_events_ << ",\n"
+           << "  \"requested_run_time_sec\": " << run_time_sec_ << ",\n"
+           << "  \"hardware_verified_unix_time\": ";
+  if (hardware_verified_unix_time_ != 0) metadata << hardware_verified_unix_time_;
+  else metadata << "null";
+  metadata << ",\n  \"acquisition_start_unix_time\": ";
+  if (acquisition_start_unix_time_ != 0) metadata << acquisition_start_unix_time_;
+  else metadata << "null";
+  metadata << ",\n  \"acquisition_end_unix_time\": ";
+  if (acquisition_end_unix_time_ != 0) metadata << acquisition_end_unix_time_;
+  else metadata << "null";
+  metadata << ",\n"
+           << "  \"recorded_events\": " << recorded_events_ << ",\n"
+           << "  \"lost_events\": " << lost_events_ << ",\n"
            << "  \"failure_reason\": ";
   if (failure_reason_.empty()) metadata << "null";
   else metadata << "\"" << JsonEscape(failure_reason_) << "\"";
   metadata << ",\n"
            << "  \"created_unix_time\": " << timestamp << ",\n"
-           << "  \"raw_output_path\": \"" << JsonEscape(output_file_)
+           << "  \"raw_output_path\": \""
+           << JsonEscape(raw_output_published_ ? output_file_
+                                               : working_output_file_)
            << "\",\n"
+           << "  \"requested_raw_output_path\": \""
+           << JsonEscape(output_file_) << "\",\n"
+           << "  \"raw_output_published\": "
+           << (raw_output_published_ ? "true" : "false") << ",\n"
+           << "  \"raw_output_finalized\": "
+           << (raw_output_finalized_ ? "true" : "false") << ",\n"
+           << "  \"raw_finalization_error\": ";
+  if (raw_finalization_error_.empty()) metadata << "null";
+  else metadata << "\"" << JsonEscape(raw_finalization_error_) << "\"";
+  metadata << ",\n"
+           << "  \"raw_digest_method\": \""
+           << JsonEscape(raw_digest_method_) << "\",\n"
+           << "  \"raw_recovery_performed\": "
+           << (raw_recovery_performed_ ? "true" : "false") << ",\n"
+           << "  \"raw_events_before_recovery\": ";
+  if (raw_recovery_performed_) metadata << raw_events_before_recovery_;
+  else metadata << "null";
+  metadata << ",\n"
+           << "  \"lost_events_exact\": "
+           << (lost_events_exact_ ? "true" : "false") << ",\n"
+           << "  \"raw_format_version\": 1,\n"
+           << "  \"raw_event_header_bytes\": " << sizeof(EventHeader)
+           << ",\n"
+           << "  \"raw_event_bytes\": " << RawEventBytes(hardware_settings_)
+           << ",\n"
+           << "  \"last_complete_offset\": " << complete_raw_bytes_
+           << ",\n"
            << "  \"raw_output_size_bytes\": ";
   if (raw_output_finalized_) metadata << raw_output_size_bytes_;
   else metadata << "null";
@@ -1143,6 +1784,37 @@ void DAQManager::WriteRuntimeArtifacts() {
     metadata << "null";
   }
   metadata << ",\n"
+           << "  \"storage\": {\"free_bytes_at_start\": "
+           << output_free_bytes_at_start_
+           << ", \"free_bytes_at_end\": ";
+  if (output_free_bytes_at_end_known_) metadata << output_free_bytes_at_end_;
+  else metadata << "null";
+  metadata << ", \"expected_raw_bytes\": " << expected_raw_bytes_
+           << ", \"minimum_free_bytes\": "
+           << hardware_settings_.storage.minimum_free_bytes
+           << ", \"stop_free_bytes\": "
+           << hardware_settings_.storage.stop_free_bytes << "},\n"
+           << "  \"runtime_counters\": {\"readout_errors\": "
+           << readout_error_count_ << ", \"health_checks\": "
+           << health_check_count_ << ", \"health_read_errors\": "
+           << health_read_error_count_ << ", \"zmq_drops\": "
+           << zmq_drop_count_
+           << ", \"zmq_send_errors\": " << zmq_send_error_count_
+           << ", \"zmq_send_hwm_messages\": " << zmq_send_hwm_messages_
+           << ", \"zmq_send_hwm_approx_bytes\": "
+           << zmq_send_hwm_approx_bytes_
+           << ", \"runtime_configuration_checks\": "
+           << runtime_configuration_checks_
+           << ", \"max_temperature_c\": [";
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (ch != 0) metadata << ", ";
+    if (temperature_observed_[ch]) {
+      metadata << max_temperature_c_[ch];
+    } else {
+      metadata << "null";
+    }
+  }
+  metadata << "]},\n"
            << "  \"metadata_path\": \""
            << JsonEscape(published_metadata_path)
            << "\",\n"
@@ -1188,6 +1860,8 @@ void DAQManager::WriteRuntimeArtifacts() {
            << ",\n"
            << "    \"post_trigger_percent\": "
            << hardware_settings_.post_trigger << ",\n"
+           << "    \"post_trigger_readback_percent\": "
+           << post_trigger_readback_ << ",\n"
            << "    \"external_trigger_mode\": "
            << hardware_settings_.ext_trigger_mode << ",\n"
            << "    \"self_trigger_mode\": "
@@ -1266,54 +1940,318 @@ void DAQManager::WriteRuntimeArtifacts() {
             << ", run=" << run_number_ << "\n";
 }
 
+void DAQManager::FinalizeRawOutput(bool truncate_to_complete_prefix) {
+  if (raw_output_finalized_) return;
+  if (!output_stream_) {
+    throw FatalAcquisitionError(
+        "Raw output stream is unavailable during finalization");
+  }
+  if (raw_output_digest_.SizeBytes() != complete_raw_bytes_) {
+    throw FatalAcquisitionError(
+        "Streaming raw digest byte count differs from the last complete "
+        "event boundary");
+  }
+
+  const int stream_descriptor = ::fileno(output_stream_);
+  if (stream_descriptor < 0) {
+    throw FatalAcquisitionError(
+        "Cannot obtain the raw output descriptor during finalization");
+  }
+  const int finalization_descriptor = ::dup(stream_descriptor);
+  if (finalization_descriptor < 0) {
+    throw FatalAcquisitionError(
+        "Cannot preserve the raw output descriptor during finalization (" +
+        std::string(std::strerror(errno)) + ")");
+  }
+
+  bool descriptor_open = true;
+  try {
+    // Always attempt to drain the stdio buffer.  On failure, the descriptor's
+    // actual length decides the recoverable boundary; never extend a short
+    // file with zeroes to the intended byte count.
+    const int flush_result = ::fflush(output_stream_);
+    const int close_result = ::fclose(output_stream_);
+    output_stream_ = nullptr;
+
+    const bool stream_error = flush_result != 0 || close_result != 0;
+    struct stat pre_sync_status {};
+    if (::fstat(finalization_descriptor, &pre_sync_status) != 0 ||
+        pre_sync_status.st_size < 0 ||
+        static_cast<uint64_t>(pre_sync_status.st_dev) != output_device_ ||
+        static_cast<uint64_t>(pre_sync_status.st_ino) != output_inode_) {
+      throw FatalAcquisitionError(
+          "Cannot inspect the raw output after closing its write stream");
+    }
+
+    const uint64_t event_bytes = RawEventBytes(hardware_settings_);
+    const uint64_t observed_bytes =
+        static_cast<uint64_t>(pre_sync_status.st_size);
+    const uint64_t bounded_bytes =
+        std::min(observed_bytes, complete_raw_bytes_);
+    const uint64_t recoverable_bytes =
+        bounded_bytes - (bounded_bytes % event_bytes);
+    const bool size_recovery_needed =
+        observed_bytes != complete_raw_bytes_;
+    if (stream_error) {
+      raw_recovery_performed_ = true;
+      raw_events_before_recovery_ = recorded_events_;
+    }
+    if (size_recovery_needed) {
+      if (recoverable_bytes > observed_bytes) {
+        throw FatalAcquisitionError(
+            "Internal error: raw recovery would extend the output file");
+      }
+      if (::ftruncate(finalization_descriptor,
+                      static_cast<off_t>(recoverable_bytes)) != 0) {
+        throw FatalAcquisitionError(
+            "Cannot truncate failed raw output to its last complete event (" +
+            std::string(std::strerror(errno)) + ")");
+      }
+      raw_recovery_performed_ = true;
+      raw_events_before_recovery_ = recorded_events_;
+      complete_raw_bytes_ = recoverable_bytes;
+      recorded_events_ = recoverable_bytes / event_bytes;
+      // The running counter may include board-counter gaps observed only in
+      // events that could not be made durable.
+      lost_events_exact_ = false;
+    }
+
+    if (::fsync(finalization_descriptor) != 0) {
+      throw FatalAcquisitionError(
+          "Raw output sync failed; run is marked failed (" +
+          std::string(std::strerror(errno)) + ")");
+    }
+    // Once writing is complete, make accidental pathname-based modification
+    // fail before authenticating and publishing the inode.  The retained
+    // failed-run prefix remains readable by the owner/group for salvage.
+    if (::fchmod(finalization_descriptor, S_IRUSR | S_IRGRP) != 0 ||
+        ::fsync(finalization_descriptor) != 0) {
+      throw FatalAcquisitionError(
+          "Cannot make the finalized raw inode read-only and durable (" +
+          std::string(std::strerror(errno)) + ")");
+    }
+    if (!PathMatchesIdentity(working_output_file_,
+                             {output_device_, output_inode_})) {
+      throw FatalAcquisitionError(
+          "Raw output path changed during acquisition; run is marked failed");
+    }
+
+    struct stat raw_status {};
+    if (::fstat(finalization_descriptor, &raw_status) != 0 ||
+        raw_status.st_size < 0 ||
+        static_cast<uint64_t>(raw_status.st_dev) != output_device_ ||
+        static_cast<uint64_t>(raw_status.st_ino) != output_inode_) {
+      throw FatalAcquisitionError(
+          "Cannot verify the finalized raw output inode and size");
+    }
+    if (static_cast<uint64_t>(raw_status.st_size) != complete_raw_bytes_) {
+      throw FatalAcquisitionError(
+          "Finalized raw output size differs from the last complete event "
+          "boundary: expected " + std::to_string(complete_raw_bytes_) +
+          ", observed " + std::to_string(raw_status.st_size));
+    }
+
+    // Authenticate the exact synced inode, not merely the bytes submitted to
+    // stdio.  The streaming digest remains an independent in-process check;
+    // the descriptor digest also detects same-inode modification through the
+    // visible .partial pathname before publication.
+    raw_output_size_bytes_ = complete_raw_bytes_;
+    struct stat before_hash_status {};
+    if (::fstat(finalization_descriptor, &before_hash_status) != 0) {
+      throw FatalAcquisitionError(
+          "Cannot snapshot raw inode identity before descriptor hashing");
+    }
+    raw_output_sha256_ = Sha256FileDescriptorHex(
+        finalization_descriptor, raw_output_size_bytes_);
+    struct stat after_hash_status {};
+    if (::fstat(finalization_descriptor, &after_hash_status) != 0 ||
+        before_hash_status.st_dev != after_hash_status.st_dev ||
+        before_hash_status.st_ino != after_hash_status.st_ino ||
+        before_hash_status.st_size != after_hash_status.st_size ||
+        before_hash_status.st_mtim.tv_sec !=
+            after_hash_status.st_mtim.tv_sec ||
+        before_hash_status.st_mtim.tv_nsec !=
+            after_hash_status.st_mtim.tv_nsec ||
+        before_hash_status.st_ctim.tv_sec !=
+            after_hash_status.st_ctim.tv_sec ||
+        before_hash_status.st_ctim.tv_nsec !=
+            after_hash_status.st_ctim.tv_nsec ||
+        !PathMatchesIdentity(working_output_file_,
+                             {output_device_, output_inode_})) {
+      throw FatalAcquisitionError(
+          "Raw inode changed while its descriptor SHA-256 was computed");
+    }
+    if (raw_output_digest_.SizeBytes() == raw_output_size_bytes_) {
+      if (raw_output_sha256_ != raw_output_digest_.FinalHex()) {
+        throw FatalAcquisitionError(
+            "Final raw descriptor digest differs from the streaming write "
+            "digest");
+      }
+      raw_digest_method_ =
+          "streaming_sha256_verified_by_descriptor_sha256";
+    } else {
+      raw_digest_method_ = "recovered_descriptor_sha256";
+    }
+    SyncParentDirectory(working_output_file_);
+    output_free_bytes_at_end_ = FilesystemFreeBytes(working_output_file_);
+    output_free_bytes_at_end_known_ = true;
+
+    if (!truncate_to_complete_prefix && !stream_error &&
+        !size_recovery_needed) {
+      bool final_link_created = false;
+      try {
+        LinkDescriptorNoReplace(finalization_descriptor, output_file_,
+                                "final raw output");
+        final_link_created = true;
+        if (!PathMatchesIdentity(output_file_,
+                                 {output_device_, output_inode_})) {
+          throw FatalAcquisitionError(
+              "Published raw output identity differs from the acquired inode");
+        }
+        SyncParentDirectory(output_file_);
+        raw_output_published_ = true;
+      } catch (...) {
+        if (final_link_created) {
+          RemoveIfSameFile(output_file_, {output_device_, output_inode_});
+          try {
+            SyncParentDirectory(output_file_);
+          } catch (...) {
+          }
+        }
+        throw;
+      }
+
+      if (!RemoveIfSameFile(working_output_file_,
+                            {output_device_, output_inode_})) {
+        std::cerr << "[Run Provenance] Final raw output is durable, but the "
+                     "partial-name cleanup was unsafe or failed: "
+                  << working_output_file_ << "\n";
+      } else {
+        try {
+          SyncParentDirectory(output_file_);
+        } catch (const std::exception& cleanup_error) {
+          std::cerr << "[Run Provenance] Final raw output is durable, but "
+                       "partial-name cleanup sync failed: "
+                    << cleanup_error.what() << "\n";
+        }
+      }
+    }
+
+    if (::close(finalization_descriptor) != 0) {
+      std::cerr << "[Run Provenance] Raw bytes are synced, but closing the "
+                   "duplicate finalization descriptor failed: "
+                << std::strerror(errno) << "\n";
+    }
+    descriptor_open = false;
+    raw_output_finalized_ = true;
+    raw_finalization_error_.clear();
+    std::cout << "\n\033[1;32m[Run Provenance]\033[0m raw_size="
+              << raw_output_size_bytes_ << " bytes, raw_sha256="
+              << raw_output_sha256_ << ", events=" << recorded_events_
+              << ((truncate_to_complete_prefix || stream_error ||
+                   size_recovery_needed)
+                      ? " (failed-run prefix)"
+                      : "")
+              << "\n";
+    if (!truncate_to_complete_prefix &&
+        (stream_error || size_recovery_needed)) {
+      throw FatalAcquisitionError(
+          "Raw output flush/size verification failed; only the complete "
+          "descriptor prefix was recovered and authenticated");
+    }
+  } catch (...) {
+    if (output_stream_) {
+      ::fclose(output_stream_);
+      output_stream_ = nullptr;
+    }
+    if (descriptor_open) ::close(finalization_descriptor);
+    throw;
+  }
+}
+
 void DAQManager::Start(std::atomic<bool>& is_running) {
+  if (acquisition_status_ != "hardware_verified_not_started") {
+    throw std::logic_error(
+        "DAQManager::Start can be called exactly once after verified setup");
+  }
   std::cout << "\033[1;32m[DAQManager]\033[0m Starting Acquisition...\n";
   std::cout << " - Stop Condition : ";
   if (max_events_ > 0) std::cout << max_events_ << " Events\n";
   else if (run_time_sec_ > 0) std::cout << run_time_sec_ << " Seconds\n";
   else std::cout << "Unlimited (Manual Stop)\n";
 
+  const auto finalize_prestart_cancellation = [&]() {
+    termination_reason_ = "cancelled_before_start";
+    acquisition_status_ = "cancelled";
+    acquisition_end_unix_time_ = std::time(nullptr);
+    FinalizeRawOutput(true);
+    WriteRuntimeArtifacts();
+    std::cout << "\033[1;33m[DAQManager]\033[0m Acquisition was cancelled "
+                 "before the hardware start command.\n";
+  };
+  if (!is_running.load(std::memory_order_relaxed)) {
+    finalize_prestart_cancellation();
+    return;
+  }
+
   bool acquisition_started = false;
+  const auto record_failed_run = [&](const std::string& primary_error) {
+    running_ = false;
+    if (acquisition_started) {
+      CAEN_DGTZ_SWStopAcquisition(digitizer_->GetHandle());
+      acquisition_started = false;
+    }
+    termination_reason_ = "failure";
+    acquisition_end_unix_time_ = std::time(nullptr);
+    failure_reason_ = primary_error;
+    try {
+      FinalizeRawOutput(true);
+    } catch (const std::exception& finalization_error) {
+      raw_finalization_error_ = finalization_error.what();
+      failure_reason_ += "; raw prefix finalization also failed: " +
+                         raw_finalization_error_;
+    }
+    acquisition_status_ = "failed";
+    try {
+      WriteRuntimeArtifacts();
+    } catch (const std::exception& metadata_error) {
+      std::cerr << "\n[Run Provenance] Cannot record failed status: "
+                << metadata_error.what() << "\n";
+    }
+  };
   try {
-    CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_.GetHandle()));
+    VerifyAcquisitionStartCapacity();
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, false);
+    VerifyRuntimeConfiguration(digitizer_->GetHandle());
+    if (!is_running.load(std::memory_order_relaxed)) {
+      finalize_prestart_cancellation();
+      return;
+    }
+    CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_->GetHandle()));
     acquisition_started = true;
+    WaitForAcquisitionRunning(digitizer_->GetHandle());
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, true);
+    acquisition_start_unix_time_ = std::time(nullptr);
     running_ = true;
+    termination_reason_ = "running";
     acquisition_status_ = "running";
     failure_reason_.clear();
     WriteRuntimeArtifacts();
     AcquisitionLoop(is_running);
     acquisition_started = false;
     running_ = false;
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, false);
+    VerifyRuntimeConfiguration(digitizer_->GetHandle());
+    acquisition_end_unix_time_ = std::time(nullptr);
+    FinalizeRawOutput(false);
     acquisition_status_ = "completed";
     failure_reason_.clear();
     WriteRuntimeArtifacts();
   } catch (const std::exception& error) {
-    running_ = false;
-    if (acquisition_started) {
-      CAEN_DGTZ_SWStopAcquisition(digitizer_.GetHandle());
-    }
-    acquisition_status_ = "failed";
-    failure_reason_ = error.what();
-    try {
-      WriteRuntimeArtifacts();
-    } catch (const std::exception& metadata_error) {
-      std::cerr << "\n[Run Provenance] Cannot record failed status: "
-                << metadata_error.what() << "\n";
-    }
+    record_failed_run(error.what());
     throw;
   } catch (...) {
-    running_ = false;
-    if (acquisition_started) {
-      CAEN_DGTZ_SWStopAcquisition(digitizer_.GetHandle());
-    }
-    acquisition_status_ = "failed";
-    failure_reason_ = "unknown non-standard exception";
-    try {
-      WriteRuntimeArtifacts();
-    } catch (const std::exception& metadata_error) {
-      std::cerr << "\n[Run Provenance] Cannot record failed status: "
-                << metadata_error.what() << "\n";
-    }
+    record_failed_run("unknown non-standard exception");
     throw;
   }
 }
@@ -1323,59 +2261,113 @@ void DAQManager::Stop() {
 }
 
 void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
-  EventHeader *header = reinterpret_cast<EventHeader *>(raw_buffer_pool_.data());
-  uint16_t *wave_dest = reinterpret_cast<uint16_t *>(raw_buffer_pool_.data() + sizeof(EventHeader));
+  EventHeader header{};
   
-  int handle = digitizer_.GetHandle();
-  char *caen_buffer = digitizer_.GetReadoutBuffer();
-  CAEN_DGTZ_UINT16_EVENT_t *caen_event = digitizer_.GetDecodedEvent();
+  int handle = digitizer_->GetHandle();
+  char *caen_buffer = digitizer_->GetReadoutBuffer();
+  CAEN_DGTZ_UINT16_EVENT_t *caen_event = digitizer_->GetDecodedEvent();
   
-  uint32_t event_count = 0;
   const uint32_t TTT_MASK = 0x7FFFFFFF;
   
   bool is_first_event = true;
   uint32_t first_ttt = 0, current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
-  uint64_t ttt_rollovers = 0, lost_events = 0;
+  uint64_t ttt_rollovers = 0;
 
   auto start_time = std::chrono::steady_clock::now();
   auto last_log_time = start_time;
+  auto last_health_check = start_time;
+  auto last_configuration_check = start_time;
   uint32_t log_events = 0, zmq_drops = 0, loop_counter = 0;
   uint32_t consecutive_readout_errors = 0;
   size_t total_bytes_written = 0, last_bytes_written = 0; 
 
   while (is_running && running_) {
-    if (max_events_ > 0 && (int)event_count >= max_events_) break;
+    if (max_events_ > 0 &&
+        recorded_events_ >= static_cast<uint64_t>(max_events_)) {
+      termination_reason_ = "event_limit";
+      break;
+    }
     if (run_time_sec_ > 0) {
       auto now = std::chrono::steady_clock::now();
-      if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) break;
+      if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) {
+        termination_reason_ = "time_limit";
+        break;
+      }
     }
 
     uint32_t bsize = 0; 
 
     try {
       CAEN_CHECK(CAEN_DGTZ_ReadData(handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT, caen_buffer, &bsize));
-      
-      if (bsize > 0) {
+      consecutive_readout_errors = 0;
+    } catch (const std::exception& e) {
+      ++consecutive_readout_errors;
+      ++readout_error_count_;
+      std::cerr << "\n\033[1;33m[Warning] Readout error "
+                << consecutive_readout_errors << "/3: \033[0m"
+                << e.what() << "\n";
+      if (consecutive_readout_errors >= 3U) {
+        CAEN_DGTZ_SWStopAcquisition(handle);
+        throw FatalAcquisitionError(
+            "Persistent CAEN readout failure after 3 consecutive errors: " +
+            std::string(e.what()));
+      }
+      continue;
+    }
+
+    if (bsize == 0U) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    try {
+      if (bsize > 0U) {
         uint32_t num_events = 0;
         CAEN_CHECK(CAEN_DGTZ_GetNumEvents(handle, caen_buffer, bsize, &num_events));
+        if (num_events == 0U) {
+          throw FatalAcquisitionError(
+              "CAEN reported a non-empty readout block containing zero events");
+        }
 
         for (uint32_t i = 0; i < num_events; ++i) {
+          // A single CAEN transfer can contain many events.  Enforce every
+          // stop condition at the event boundary so -n N always produces
+          // exactly N complete records and operator stop does not drain a
+          // potentially large stale block.
+          if (!is_running.load(std::memory_order_relaxed) ||
+              !running_.load(std::memory_order_relaxed)) {
+            termination_reason_ = "operator_stop";
+            break;
+          }
+          if (max_events_ > 0 &&
+              recorded_events_ >= static_cast<uint64_t>(max_events_)) {
+            termination_reason_ = "event_limit";
+            break;
+          }
+          if (run_time_sec_ > 0 &&
+              std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now() - start_time).count() >=
+                  run_time_sec_) {
+            termination_reason_ = "time_limit";
+            break;
+          }
           CAEN_DGTZ_EventInfo_t evt_info;
           char *evt_ptr = nullptr;
           CAEN_CHECK(CAEN_DGTZ_GetEventInfo(handle, caen_buffer, bsize, i, &evt_info, &evt_ptr));
-          CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
-
-          current_ttt = evt_info.TriggerTimeTag & TTT_MASK;
-          uint32_t current_event_counter = ((uint32_t*)evt_ptr)[2] & 0xFFFFFF;
-
-          if (is_first_event) {
-              first_ttt = current_ttt; prev_ttt = current_ttt; prev_event_counter = current_event_counter; is_first_event = false;
-          } else {
-              if (current_ttt < prev_ttt) ttt_rollovers++;
-              uint32_t diff = (current_event_counter - prev_event_counter) & 0xFFFFFF;
-              if (diff > 1) lost_events += (diff - 1); 
+          if (evt_ptr == nullptr) {
+            throw FatalAcquisitionError(
+                "CAEN event lookup reported success but returned a null "
+                "event pointer");
           }
-          prev_ttt = current_ttt; prev_event_counter = current_event_counter;
+          CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
+          if (caen_event == nullptr) {
+            throw FatalAcquisitionError(
+                "CAEN decode reported success but returned a null event");
+          }
+
+          const uint32_t candidate_ttt =
+              evt_info.TriggerTimeTag & TTT_MASK;
+          const uint32_t current_event_counter =
+              evt_info.EventCounter & 0xFFFFFFU;
 
           uint32_t actual_trace_size = 0;
           for (int ch = 0; ch < MAX_CH; ++ch) {
@@ -1389,34 +2381,73 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                 "configured acquisition shape");
           }
           for (int ch = 0; ch < MAX_CH; ++ch) {
-            if (((evt_info.ChannelMask >> ch) & 1U) != 0U &&
-                caen_event->ChSize[ch] != actual_trace_size) {
+            if (((evt_info.ChannelMask >> ch) & 1U) == 0U) continue;
+            if (caen_event->ChSize[ch] != actual_trace_size) {
               throw FatalAcquisitionError(
                   "Decoded event has inconsistent active-channel trace sizes");
             }
+            if (caen_event->DataChannel[ch] == nullptr) {
+              throw FatalAcquisitionError(
+                  "Decoded active CH" + std::to_string(ch) +
+                  " waveform pointer is null");
+            }
           }
 
-          std::memset(header, 0, sizeof(EventHeader));
-          header->ExtendedTTT = (ttt_rollovers << 31) | current_ttt;
-          header->EventID = event_count++;
-          header->RecordLength = actual_trace_size; 
-          header->ChannelMask = evt_info.ChannelMask;
-          header->Pattern = evt_info.Pattern;
-          header->BoardEventCounter = current_event_counter;
+          if (recorded_events_ >
+              static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw FatalAcquisitionError(
+                "EventID reached the raw-format 32-bit limit; start a new "
+                "run before continuing acquisition");
+          }
+          uint64_t candidate_rollovers = ttt_rollovers;
+          uint64_t newly_lost_events = 0U;
+          if (!is_first_event) {
+            if (candidate_ttt < prev_ttt) ++candidate_rollovers;
+            const uint32_t counter_difference =
+                (current_event_counter - prev_event_counter) & 0xFFFFFFU;
+            if (counter_difference == 0U) {
+              throw FatalAcquisitionError(
+                  "Digitizer event counter repeated; refusing to record a "
+                  "duplicate or stale event");
+            }
+            if (counter_difference > 0x800000U) {
+              throw FatalAcquisitionError(
+                  "Digitizer event counter moved backwards or reset during "
+                  "acquisition");
+            }
+            if (counter_difference > 1U) {
+              newly_lost_events = counter_difference - 1U;
+              if (newly_lost_events >
+                  std::numeric_limits<uint64_t>::max() - lost_events_) {
+                throw FatalAcquisitionError(
+                    "Lost-event counter overflowed uint64_t");
+              }
+            }
+          }
+
+          header = {};
+          header.ExtendedTTT =
+              (candidate_rollovers << 31) | candidate_ttt;
+          header.EventID = static_cast<uint32_t>(recorded_events_);
+          header.RecordLength = actual_trace_size;
+          header.ChannelMask = evt_info.ChannelMask;
+          header.Pattern = evt_info.Pattern;
+          header.BoardEventCounter = current_event_counter;
+          std::memcpy(raw_buffer_pool_.data(), &header, sizeof(header));
 
           size_t payload_size = sizeof(EventHeader);
           for (int ch = 0; ch < MAX_CH; ++ch) {
-            if ((header->ChannelMask >> ch) & 1) {
+            if ((header.ChannelMask >> ch) & 1U) {
               uint16_t *wave_src = caen_event->DataChannel[ch];
               uint32_t trace_size = caen_event->ChSize[ch];
-              if (trace_size == 0) continue;
               if (payload_size + trace_size * sizeof(uint16_t) >
                   raw_buffer_pool_.size()) {
                 throw FatalAcquisitionError(
                     "Decoded event exceeds the reserved raw-output buffer");
               }
 
-              std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t), wave_src, trace_size * sizeof(uint16_t));
+              std::memcpy(raw_buffer_pool_.data() + payload_size, wave_src,
+                          trace_size * sizeof(uint16_t));
               payload_size += trace_size * sizeof(uint16_t);
             }
           }
@@ -1432,32 +2463,72 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                 "Raw output write failed; acquisition stopped to prevent "
                 "silent data loss");
           }
+          raw_output_digest_.Update(raw_buffer_pool_.data(), payload_size);
+          complete_raw_bytes_ += static_cast<uint64_t>(payload_size);
+          ++recorded_events_;
+          if (is_first_event) {
+            first_ttt = candidate_ttt;
+            is_first_event = false;
+          }
+          current_ttt = candidate_ttt;
+          prev_ttt = candidate_ttt;
+          prev_event_counter = current_event_counter;
+          ttt_rollovers = candidate_rollovers;
+          lost_events_ += newly_lost_events;
           total_bytes_written += payload_size;
-          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) { if (zmq_errno() == EAGAIN) zmq_drops++; }
+          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size,
+                       ZMQ_DONTWAIT) < 0) {
+            const int publish_error = zmq_errno();
+            if (publish_error != EAGAIN) {
+              ++zmq_send_error_count_;
+              if (zmq_send_error_count_ == 1U ||
+                  (zmq_send_error_count_ &
+                   (zmq_send_error_count_ - 1U)) == 0U) {
+                std::cerr
+                    << "\n\033[1;33m[Warning] ZeroMQ monitoring publish "
+                       "failed; raw acquisition continues independently "
+                    << "(count=" << zmq_send_error_count_ << ", error="
+                    << zmq_strerror(publish_error) << ")\033[0m\n";
+              }
+            }
+            ++zmq_drops;
+            ++zmq_drop_count_;
+          }
           log_events++;
         }
       }
-      consecutive_readout_errors = 0;
     } catch (const FatalAcquisitionError&) {
-        CAEN_DGTZ_SWStopAcquisition(handle);
-        throw;
+      CAEN_DGTZ_SWStopAcquisition(handle);
+      throw;
     } catch (const std::exception& e) {
-        ++consecutive_readout_errors;
-        std::cerr << "\n\033[1;33m[Warning] Readout error "
-                  << consecutive_readout_errors << "/3: \033[0m"
-                  << e.what() << "\n";
-        if (consecutive_readout_errors >= 3U) {
-          CAEN_DGTZ_SWStopAcquisition(handle);
-          throw FatalAcquisitionError(
-              "Persistent CAEN readout failure after 3 consecutive errors: " +
-              std::string(e.what()));
-        }
+      CAEN_DGTZ_SWStopAcquisition(handle);
+      throw FatalAcquisitionError(
+          "CAEN event-block decoding failed after data was read; the "
+          "remaining block was not silently skipped: " +
+          std::string(e.what()));
     }
 
-    if (bsize > 0 || ++loop_counter % 10000 == 0) {
+    if (bsize > 0 ||
+        std::chrono::steady_clock::now() - last_health_check >=
+            std::chrono::milliseconds(250) ||
+        ++loop_counter % 10000 == 0) {
         auto now = std::chrono::steady_clock::now();
         if (run_time_sec_ > 0) {
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) break;
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    now - start_time).count() >= run_time_sec_) {
+              termination_reason_ = "time_limit";
+              break;
+            }
+        }
+
+        if (now - last_health_check >= std::chrono::milliseconds(250)) {
+            CheckRuntimeHealthAndStorage(handle, false, true);
+            last_health_check = now;
+        }
+
+        if (now - last_configuration_check >= std::chrono::seconds(1)) {
+            VerifyRuntimeConfiguration(handle);
+            last_configuration_check = now;
         }
 
         double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
@@ -1470,25 +2541,18 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
             last_bytes_written = total_bytes_written;
 
-            uint32_t temp_reg = 0, status_reg = 0;
-            if (CAEN_DGTZ_ReadRegister(handle, 0x10A8, &temp_reg) == CAEN_DGTZ_Success) {
-                float temp_celsius = static_cast<float>(temp_reg & 0xFF);
-                if (temp_celsius >= 82.0) {
-                    std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
-                    throw FatalAcquisitionError(
-                        "Digitizer temperature reached the 82 C software "
-                        "shutdown limit");
-                }
-            }
-            
-            if (CAEN_DGTZ_ReadRegister(handle, 0x8104, &status_reg) == CAEN_DGTZ_Success) {
-                int run      = (status_reg >> 0) & 0x1; 
-                int drdy     = (status_reg >> 2) & 0x1; 
-                int busy     = (status_reg >> 3) & 0x1; 
-                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0; 
+            if (health_readback_available_) {
+                const uint32_t status_reg = latest_status_register_;
+                int run      = (status_reg >> 0) & 0x1;
+                int drdy     = (status_reg >> 2) & 0x1;
+                int busy     = (status_reg >> 3) & 0x1;
+                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0;
                 int trg      = (rate > 0.0) ? 1 : 0; 
                 int pll_byps = 0; 
 
+                std::cout << "[STATUS] TEMP: "
+                          << std::fixed << std::setprecision(1)
+                          << latest_max_temperature_c_ << std::endl;
                 std::cout << "[STATUS] LED: LOCK=" << pll_lock << ", BYPS=" << pll_byps
                           << ", RUN=" << run << ", TRG=" << trg << ", DRDY=" << drdy
                           << ", BUSY=" << busy << std::endl;
@@ -1498,7 +2562,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
             
             double hw_real_time_sec = total_ticks * 8e-9; 
-            double dead_time_sec = event_count * (record_length * 2e-9); 
+            double dead_time_sec = recorded_events_ * (record_length * 2e-9);
             double live_time_sec = hw_real_time_sec - dead_time_sec;
             if (live_time_sec < 0) live_time_sec = 0.0;
             
@@ -1510,7 +2574,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
                       << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
                       << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
                       << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " 
-                      << "Events: \033[1;33m" << event_count << "\033[0m | "
+                      << "Events: \033[1;33m" << recorded_events_ << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
                       << "Drops: " << zmq_drops
                       << std::flush;
@@ -1520,46 +2584,15 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
     }
   }
 
+  if (termination_reason_ == "running") {
+    termination_reason_ =
+        (!is_running.load(std::memory_order_relaxed) ||
+         !running_.load(std::memory_order_relaxed))
+            ? "operator_stop"
+            : "completed";
+  }
+
   CAEN_CHECK(CAEN_DGTZ_SWStopAcquisition(handle));
-  if (!output_stream_ || ::fflush(output_stream_) != 0 ||
-      ::ferror(output_stream_)) {
-    throw FatalAcquisitionError(
-        "Raw output flush failed; run is marked failed");
-  }
-  const int output_descriptor = ::fileno(output_stream_);
-  if (output_descriptor < 0 || ::fsync(output_descriptor) != 0) {
-    throw FatalAcquisitionError(
-        "Raw output sync failed; run is marked failed");
-  }
-  if (!PathMatchesIdentity(output_file_, {output_device_, output_inode_})) {
-    throw FatalAcquisitionError(
-        "Raw output path changed during acquisition; run is marked failed");
-  }
-  struct stat raw_before_hash {};
-  if (::fstat(output_descriptor, &raw_before_hash) != 0 ||
-      raw_before_hash.st_size < 0 ||
-      static_cast<uint64_t>(raw_before_hash.st_dev) != output_device_ ||
-      static_cast<uint64_t>(raw_before_hash.st_ino) != output_inode_) {
-    throw FatalAcquisitionError(
-        "Cannot verify the finalized raw output inode and size");
-  }
-  raw_output_size_bytes_ = static_cast<uint64_t>(raw_before_hash.st_size);
-  raw_output_sha256_ =
-      Sha256FileDescriptorHex(output_descriptor, raw_output_size_bytes_);
-  struct stat raw_after_hash {};
-  if (::fstat(output_descriptor, &raw_after_hash) != 0 ||
-      raw_after_hash.st_dev != raw_before_hash.st_dev ||
-      raw_after_hash.st_ino != raw_before_hash.st_ino ||
-      raw_after_hash.st_size != raw_before_hash.st_size ||
-      raw_after_hash.st_mtim.tv_sec != raw_before_hash.st_mtim.tv_sec ||
-      raw_after_hash.st_mtim.tv_nsec != raw_before_hash.st_mtim.tv_nsec) {
-    throw FatalAcquisitionError(
-        "Raw output changed while its SHA-256 was being finalized");
-  }
-  raw_output_finalized_ = true;
-  std::cout << "\n\033[1;32m[Run Provenance]\033[0m raw_size="
-            << raw_output_size_bytes_ << " bytes, raw_sha256="
-            << raw_output_sha256_ << "\n";
   std::cout << "\n\033[1;31m[DAQManager] Stopped Acquisition.\033[0m\n";
 
   auto t = std::time(nullptr);
@@ -1569,14 +2602,14 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   uint64_t final_total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
   
   double final_real_time_sec = final_total_ticks * 8e-9;
-  double final_dead_time_sec = event_count * (record_length * 2e-9);
+  double final_dead_time_sec = recorded_events_ * (record_length * 2e-9);
   double final_live_time_sec = final_real_time_sec - final_dead_time_sec;
   if (final_live_time_sec < 0) final_live_time_sec = 0.0;
   
   double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
   auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
-  double avg_rate = (final_real_time_sec > 0) ? (event_count / final_real_time_sec) : 0.0;
+  double avg_rate = (final_real_time_sec > 0) ? (recorded_events_ / final_real_time_sec) : 0.0;
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
@@ -1584,9 +2617,9 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             << " - HW Real Time    : " << std::fixed << std::setprecision(2) << final_real_time_sec << " seconds\n"
             << " - HW Live Time    : " << std::fixed << std::setprecision(2) << final_live_time_sec << " seconds\n"
             << " - True Dead Time  : " << std::fixed << std::setprecision(5) << final_dead_time_pct << " %\n"
-            << " - Total Events    : " << event_count << " events\n"
+            << " - Total Events    : " << recorded_events_ << " events\n"
             << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n" 
-            << " - Lost Events     : " << lost_events << " events (Buffer Full)\n"
+            << " - Lost Events     : " << lost_events_ << " events (Buffer Full)\n"
             << " - Data Size Saved : " << std::fixed << std::setprecision(2) << (total_bytes_written / (1024.0 * 1024.0)) << " MB\n"
             << "\033[1;36m=========================================\033[0m\n\n";
 }

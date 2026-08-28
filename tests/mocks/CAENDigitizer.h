@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <utility>
 #include <vector>
 
 typedef enum {
@@ -79,9 +80,18 @@ struct State {
   bool corrupt_adc_bits = false;
   bool readout_failure = false;
   bool corrupt_event_record_length = false;
+  int decode_failure_event_index = -1;
+  uint32_t current_event_index = 0;
+  bool runtime_health_read_failure = false;
+  uint32_t runtime_temperature_c = 25U;
+  bool null_active_waveform = false;
+  bool stop_acquisition_failure = false;
+  bool run_status_stuck_low = false;
+  bool force_zero_event_count = false;
   bool acquisition_running = false;
   uint32_t channel_mask = 0;
   uint32_t record_length = 512;
+  uint32_t post_trigger = 60;
   uint32_t pending_events = 0;
   uint32_t current_read_events = 0;
   uint32_t baseline_batch = 0;
@@ -95,6 +105,7 @@ struct State {
   CAEN_DGTZ_UINT16_EVENT_t decoded_event{};
   std::array<uint32_t, 4> event_words{};
   std::array<char, 4096> readout_buffer{};
+  std::vector<uint32_t> event_counter_sequence;
 
   void ResetHardware() {
     const bool preserve_unstable = unstable_baseline;
@@ -112,9 +123,11 @@ struct State {
 
   void BuildTraceBatch() {
     const uint16_t ch0_baseline = static_cast<uint16_t>(
-        unstable_baseline ? 15000U + 10U * baseline_batch : 16164U);
+        unstable_baseline ? 15000U + 10U * (baseline_batch % 100U)
+                          : 16164U);
     const uint16_t ch1_baseline = static_cast<uint16_t>(
-        unstable_baseline ? 15100U + 10U * baseline_batch : 16255U);
+        unstable_baseline ? 15100U + 10U * (baseline_batch % 100U)
+                          : 16255U);
     ++baseline_batch;
 
     for (std::size_t ch = 0; ch < traces.size(); ++ch) {
@@ -128,6 +141,9 @@ struct State {
       decoded_event.DataChannel[ch] = traces[ch].empty()
                                           ? nullptr
                                           : traces[ch].data();
+      if (null_active_waveform && ch == 0U) {
+        decoded_event.DataChannel[ch] = nullptr;
+      }
     }
   }
 };
@@ -175,6 +191,38 @@ inline void SetCorruptEventRecordLength(bool enabled) {
   state.corrupt_event_record_length = enabled;
 }
 
+inline void SetDecodeFailureEventIndex(int event_index) {
+  state.decode_failure_event_index = event_index;
+}
+
+inline void SetRuntimeHealthReadFailure(bool enabled) {
+  state.runtime_health_read_failure = enabled;
+}
+
+inline void SetRuntimeTemperature(uint32_t temperature_c) {
+  state.runtime_temperature_c = temperature_c;
+}
+
+inline void SetNullActiveWaveform(bool enabled) {
+  state.null_active_waveform = enabled;
+}
+
+inline void SetStopAcquisitionFailure(bool enabled) {
+  state.stop_acquisition_failure = enabled;
+}
+
+inline void SetRunStatusStuckLow(bool enabled) {
+  state.run_status_stuck_low = enabled;
+}
+
+inline void SetForceZeroEventCount(bool enabled) {
+  state.force_zero_event_count = enabled;
+}
+
+inline void SetEventCounterSequence(std::vector<uint32_t> counters) {
+  state.event_counter_sequence = std::move(counters);
+}
+
 }  // namespace caen_mock
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_OpenDigitizer2(
@@ -209,6 +257,17 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetInfo(
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadRegister(
     int, uint32_t address, uint32_t* value) {
+  const bool temperature_register =
+      address >= 0x10A8U && address <= 0x17A8U &&
+      ((address - 0x10A8U) % 0x100U) == 0U;
+  if (caen_mock::state.runtime_health_read_failure &&
+      (temperature_register || address == 0x8104U)) {
+    return CAEN_DGTZ_GenericError;
+  }
+  if (temperature_register) {
+    *value = caen_mock::state.runtime_temperature_c;
+    return CAEN_DGTZ_Success;
+  }
   *value = caen_mock::state.registers[address];
   if (address == 0x1084U &&
       caen_mock::state.corrupt_pair_logic_readback) {
@@ -246,7 +305,15 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetChannelEnableMask(
   return CAEN_DGTZ_Success;
 }
 
-inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetPostTriggerSize(int, uint32_t) {
+inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetPostTriggerSize(
+    int, uint32_t post_trigger) {
+  caen_mock::state.post_trigger = post_trigger;
+  return CAEN_DGTZ_Success;
+}
+
+inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetPostTriggerSize(
+    int, uint32_t* post_trigger) {
+  *post_trigger = caen_mock::state.post_trigger;
   return CAEN_DGTZ_Success;
 }
 
@@ -367,11 +434,18 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ClearData(int) {
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SWStartAcquisition(int) {
   caen_mock::state.acquisition_running = true;
+  if (!caen_mock::state.run_status_stuck_low) {
+    caen_mock::state.registers[0x8104U] |= 1U;
+  }
   return CAEN_DGTZ_Success;
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SWStopAcquisition(int) {
+  if (caen_mock::state.stop_acquisition_failure) {
+    return CAEN_DGTZ_GenericError;
+  }
   caen_mock::state.acquisition_running = false;
+  caen_mock::state.registers[0x8104U] &= ~1U;
   return CAEN_DGTZ_Success;
 }
 
@@ -398,7 +472,9 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadData(
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetNumEvents(
     int, char*, uint32_t, uint32_t* event_count) {
-  *event_count = caen_mock::state.current_read_events;
+  *event_count = caen_mock::state.force_zero_event_count
+                     ? 0U
+                     : caen_mock::state.current_read_events;
   return CAEN_DGTZ_Success;
 }
 
@@ -407,15 +483,24 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetEventInfo(
     CAEN_DGTZ_EventInfo_t* info, char** event_pointer) {
   *info = CAEN_DGTZ_EventInfo_t{};
   info->ChannelMask = caen_mock::state.channel_mask;
-  info->EventCounter = event_index;
+  info->EventCounter =
+      event_index < caen_mock::state.event_counter_sequence.size()
+          ? caen_mock::state.event_counter_sequence[event_index]
+          : event_index;
   info->TriggerTimeTag = event_index * 2U;
-  caen_mock::state.event_words[2] = event_index;
+  caen_mock::state.current_event_index = event_index;
+  caen_mock::state.event_words[2] = info->EventCounter;
   *event_pointer = reinterpret_cast<char*>(caen_mock::state.event_words.data());
   return CAEN_DGTZ_Success;
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_DecodeEvent(
     int, char*, void** event) {
+  if (caen_mock::state.decode_failure_event_index >= 0 &&
+      caen_mock::state.current_event_index ==
+          static_cast<uint32_t>(caen_mock::state.decode_failure_event_index)) {
+    return CAEN_DGTZ_GenericError;
+  }
   *event = &caen_mock::state.decoded_event;
   return CAEN_DGTZ_Success;
 }

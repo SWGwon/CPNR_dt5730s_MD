@@ -15,4 +15,7 @@ struct EventHeader {
 };
 #pragma pack(pop)
 
+static_assert(sizeof(EventHeader) == 24,
+              "Changing EventHeader layout would break the raw file format");
+
 #endif // EVENT_HEADER_H
