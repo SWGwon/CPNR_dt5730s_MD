@@ -112,8 +112,11 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_runtime_paths.py)
   add_test(NAME gui_trigger_threshold_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_trigger_settings.py)
+  add_test(NAME gui_process_output_regression
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_process_output.py)
   set_tests_properties(
       gui_runtime_path_regression gui_trigger_threshold_regression
+      gui_process_output_regression
       PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 

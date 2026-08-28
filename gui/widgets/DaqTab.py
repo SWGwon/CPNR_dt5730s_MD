@@ -11,6 +11,7 @@ from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
 
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
+from core.process_output import parse_drop_count
 from core.trigger_settings import millivolts_to_adc_delta
 from core.runtime_paths import (
     RuntimeValidationError,
@@ -495,7 +496,7 @@ class DaqTab(QWidget):
         except ValueError:
             pass
 
-        drops = int(stats.get('drops', stats.get('Drops', '0')))
+        drops = parse_drop_count(stats.get('drops', stats.get('Drops', '0')))
         self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
         self.val_drops.setText(str(drops))
 
