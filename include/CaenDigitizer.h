@@ -11,7 +11,9 @@
     do { \
         CAEN_DGTZ_ErrorCode err = (call); \
         if (err != CAEN_DGTZ_Success) { \
-            throw std::runtime_error(std::string("CAEN API Error Code: ") + std::to_string(err)); \
+            throw std::runtime_error(std::string("CAEN API call failed (") + \
+                                     #call + "): error code " + \
+                                     std::to_string(err)); \
         } \
     } while(0)
 
@@ -21,7 +23,16 @@ public:
       : handle_(-1), caen_buffer_(nullptr), caen_event_(nullptr) {
       uint32_t link_arg = static_cast<uint32_t>(linkNum);
       CAEN_CHECK(CAEN_DGTZ_OpenDigitizer2(linkType, &link_arg, conetNode, vmeBaseAddress, &handle_));
-      CAEN_CHECK(CAEN_DGTZ_Reset(handle_));
+      try {
+          CAEN_CHECK(CAEN_DGTZ_Reset(handle_));
+      } catch (...) {
+          // A throwing constructor never reaches ~CaenDigitizer().  Close the
+          // successfully opened device here so a reset failure cannot leak a
+          // CAEN handle or leave the USB device claimed by this process.
+          CAEN_DGTZ_CloseDigitizer(handle_);
+          handle_ = -1;
+          throw;
+      }
   }
 
   ~CaenDigitizer() {

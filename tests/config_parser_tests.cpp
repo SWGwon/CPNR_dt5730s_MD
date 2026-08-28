@@ -137,8 +137,144 @@ int main() {
           "split-trigger schema enables explicit hardware routing");
     Check(settings.pair_logic == DAQPairLogic::kAnd,
           "DAQ schema adjacent-pair logic");
+    Check(settings.input_range_mv == 2000,
+          "legacy DAQ schema defaults to the reset 2 Vpp range");
+    Check(settings.adc_bits == 14, "DT5730 ADC resolution is fixed at 14 bits");
+    Check(settings.trigger_calibration.settling_time_ms == 3000,
+          "trigger calibration settling default");
+    Check(settings.trigger_calibration.settling_timeout_ms == 15000,
+          "trigger calibration timeout default");
     Check(settings.channels[1].trigger_threshold == 14615,
           "DAQ schema active-channel settings");
+    Check(!settings.channels[1].threshold_is_relative_mv,
+          "legacy absolute threshold mode");
+
+    const auto relative_threshold_path = test_dir / "relative_threshold.conf";
+    WriteFile(relative_threshold_path,
+              "[Digitizer]\n"
+              "RecordLength=1024\n"
+              "ChannelMask=3\n"
+              "SelfTriggerMask=3\n"
+              "PostTrigger=70\n"
+              "InputRangeMv=2000\n"
+              "ADCBits=14\n"
+              "TriggerPolarity=1\n"
+              "ExtTriggerMode=0\n"
+              "SelfTriggerMode=1\n"
+              "[HardwareCoincidence]\n"
+              "PairLogic=AND\n"
+              "[TriggerCalibration]\n"
+              "SettlingTimeMs=3000\n"
+              "SettlingTimeoutMs=15000\n"
+              "MeasurementEvents=32\n"
+              "StabilityToleranceAdc=2.0\n"
+              "StableMeasurements=3\n"
+              "[Channel_0]\n"
+              "DCOffset=3276\n"
+              "TriggerThresholdMv=1.0\n"
+              "[Channel_1]\n"
+              "DCOffset=3276\n"
+              "TriggerThresholdMv=1.0\n");
+    ConfigParser relative_threshold_parser(relative_threshold_path.string());
+    const DAQHardwareSettings relative_settings =
+        LoadDAQHardwareSettings(relative_threshold_parser);
+    Check(relative_settings.channels[0].threshold_is_relative_mv,
+          "millivolt threshold selects measured-baseline mode");
+    Check(relative_settings.channels[0].trigger_threshold_mv == 1.0,
+          "millivolt threshold value is preserved");
+    Check(relative_settings.trigger_calibration.measurement_events == 32,
+          "baseline measurement event count");
+    Check(relative_settings.trigger_calibration.stability_tolerance_adc == 2.0,
+          "baseline stability tolerance");
+
+    const auto record_only_path = test_dir / "record_only_channels.conf";
+    WriteFile(record_only_path,
+              "[Digitizer]\nRecordLength=1024\nChannelMask=15\n"
+              "SelfTriggerMask=3\nPostTrigger=70\nInputRangeMv=2000\n"
+              "ADCBits=14\nTriggerPolarity=1\nExtTriggerMode=0\n"
+              "SelfTriggerMode=1\n[HardwareCoincidence]\nPairLogic=AND\n"
+              "[Channel_0]\nDCOffset=3276\nTriggerThresholdMv=1.0\n"
+              "[Channel_1]\nDCOffset=3276\nTriggerThresholdMv=1.0\n"
+              "[Channel_2]\nDCOffset=3276\n"
+              "[Channel_3]\nDCOffset=3276\n");
+    ConfigParser record_only_parser(record_only_path.string());
+    const auto record_only_settings =
+        LoadDAQHardwareSettings(record_only_parser);
+    Check(!record_only_settings.channels[2].has_trigger_threshold &&
+              !record_only_settings.channels[3].has_trigger_threshold,
+          "record-only channels do not require discriminator thresholds");
+
+    const auto sub_lsb_threshold_path = test_dir / "sub_lsb_threshold.conf";
+    std::string sub_lsb_threshold = valid_daq_config;
+    sub_lsb_threshold.replace(
+        sub_lsb_threshold.find("TriggerThreshold=8050"),
+        std::string("TriggerThreshold=8050").size(),
+        "TriggerThresholdMv=0.001");
+    WriteFile(sub_lsb_threshold_path, sub_lsb_threshold);
+    ConfigParser sub_lsb_threshold_parser(sub_lsb_threshold_path.string());
+    CheckThrows(
+        [&]() { LoadDAQHardwareSettings(sub_lsb_threshold_parser); },
+        "representable ADC delta",
+        "sub-LSB millivolt threshold fails before hardware is opened");
+
+    const auto duplicate_threshold_mode_path =
+        test_dir / "duplicate_threshold_mode.conf";
+    std::string duplicate_threshold_mode = valid_daq_config;
+    duplicate_threshold_mode.replace(
+        duplicate_threshold_mode.find("TriggerThreshold=8050"),
+        std::string("TriggerThreshold=8050").size(),
+        "TriggerThreshold=8050\nTriggerThresholdMv=1.0");
+    WriteFile(duplicate_threshold_mode_path, duplicate_threshold_mode);
+    ConfigParser duplicate_threshold_mode_parser(
+        duplicate_threshold_mode_path.string());
+    CheckThrows(
+        [&]() { LoadDAQHardwareSettings(duplicate_threshold_mode_parser); },
+        "mutually exclusive", "absolute and millivolt thresholds are mutually exclusive");
+
+    const auto missing_threshold_mode_path =
+        test_dir / "missing_threshold_mode.conf";
+    std::string missing_threshold_mode = valid_daq_config;
+    missing_threshold_mode.replace(
+        missing_threshold_mode.find("TriggerThreshold=8050\n"),
+        std::string("TriggerThreshold=8050\n").size(), "");
+    WriteFile(missing_threshold_mode_path, missing_threshold_mode);
+    ConfigParser missing_threshold_mode_parser(
+        missing_threshold_mode_path.string());
+    CheckThrows(
+        [&]() { LoadDAQHardwareSettings(missing_threshold_mode_parser); },
+        "requires", "each self-trigger channel requires one threshold mode");
+
+    const auto invalid_input_range_path = test_dir / "invalid_input_range.conf";
+    std::string invalid_input_range = valid_daq_config;
+    invalid_input_range.replace(
+        invalid_input_range.find("PostTrigger=70"),
+        std::string("PostTrigger=70").size(),
+        "PostTrigger=70\nInputRangeMv=750");
+    WriteFile(invalid_input_range_path, invalid_input_range);
+    ConfigParser invalid_input_range_parser(invalid_input_range_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(invalid_input_range_parser); },
+                "exactly 500 or 2000", "unsupported input range fails closed");
+
+    const auto invalid_adc_bits_path = test_dir / "invalid_adc_bits.conf";
+    std::string invalid_adc_bits = valid_daq_config;
+    invalid_adc_bits.replace(
+        invalid_adc_bits.find("PostTrigger=70"),
+        std::string("PostTrigger=70").size(),
+        "PostTrigger=70\nADCBits=12");
+    WriteFile(invalid_adc_bits_path, invalid_adc_bits);
+    ConfigParser invalid_adc_bits_parser(invalid_adc_bits_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(invalid_adc_bits_parser); },
+                "out of range", "non-14-bit ADC configuration fails closed");
+
+    const auto invalid_settling_path = test_dir / "invalid_settling.conf";
+    std::string invalid_settling = valid_daq_config;
+    invalid_settling.append(
+        "[TriggerCalibration]\nSettlingTimeMs=3000\n"
+        "SettlingTimeoutMs=3000\n");
+    WriteFile(invalid_settling_path, invalid_settling);
+    ConfigParser invalid_settling_parser(invalid_settling_path.string());
+    CheckThrows([&]() { LoadDAQHardwareSettings(invalid_settling_parser); },
+                "must be greater", "settling timeout must exceed initial delay");
 
     const auto legacy_daq_path = test_dir / "legacy_daq.conf";
     WriteFile(legacy_daq_path,
@@ -337,7 +473,12 @@ int main() {
       const auto config_path = source_dir / "config" / config_name;
       try {
         ConfigParser shipped_parser(config_path.string());
-        LoadDAQHardwareSettings(shipped_parser);
+        const auto shipped_settings = LoadDAQHardwareSettings(shipped_parser);
+        if (config_name == "dt5730s_ext_clock.conf") {
+          Check(shipped_settings.clock_source == 1 &&
+                    shipped_settings.run_sync_mode == 1,
+                "external-clock config preserves clock and run-sync mode");
+        }
       } catch (const std::exception& error) {
         Check(false, "shipped config rejected (" + config_name + "): " + error.what());
       }

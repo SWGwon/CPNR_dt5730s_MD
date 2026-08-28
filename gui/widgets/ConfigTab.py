@@ -1,13 +1,21 @@
 import os
 import configparser
+import math
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
                              QFileDialog, QCheckBox, QMessageBox, QComboBox)
-from PyQt6.QtCore import Qt, QSettings, pyqtSlot
+from PyQt6.QtCore import Qt, QSettings, pyqtSignal, pyqtSlot
+
+from core.trigger_settings import (
+    calculate_threshold_preview,
+    millivolts_to_adc_delta,
+)
 
 class ConfigTab(QWidget):
+    configPathChanged = pyqtSignal(str)
+
     CONTROLLED_TABLE_KEYS = frozenset({
         ("Digitizer", "ChannelMask"),
         ("Digitizer", "SelfTriggerMask"),
@@ -31,6 +39,50 @@ class ConfigTab(QWidget):
         self.setup_ui()
         self.load_settings()
         self.update_mask_calc()
+        self.sync_threshold_controls_from_config()
+
+    def sync_threshold_controls_from_config(self):
+        """Reflect the loaded runtime-threshold schema in the calculator."""
+
+        input_range = self.config.get(
+            "Digitizer", "InputRangeMv", fallback="2000"
+        ).strip()
+        if input_range in {"500", "2000"}:
+            self.combo_input_range.blockSignals(True)
+            self.combo_input_range.setCurrentText(input_range)
+            self.combo_input_range.blockSignals(False)
+            self.on_input_range_changed(input_range)
+
+        try:
+            self_trigger_mode = self.config.getint(
+                "Digitizer", "SelfTriggerMode", fallback=0
+            )
+            channel_mask = self.config.getint(
+                "Digitizer", "ChannelMask", fallback=0
+            )
+            trigger_mask = self.config.getint(
+                "Digitizer", "SelfTriggerMask",
+                fallback=channel_mask if self_trigger_mode else 0,
+            )
+        except (ValueError, configparser.Error):
+            return
+
+        requested_values = []
+        for ch in range(8):
+            if not ((trigger_mask >> ch) & 1):
+                continue
+            raw_value = self.config.get(
+                f"Channel_{ch}", "TriggerThresholdMv", fallback=""
+            ).strip()
+            try:
+                requested_values.append(float(raw_value))
+            except ValueError:
+                continue
+        if requested_values and all(
+            math.isclose(value, requested_values[0], rel_tol=0.0, abs_tol=1e-9)
+            for value in requested_values[1:]
+        ):
+            self.spin_trg_mv.setValue(requested_values[0])
         self.update_trigger_mask_calc()
         self.update_adc_simulator()
         self.update_time_simulator()
@@ -151,22 +203,32 @@ class ConfigTab(QWidget):
         time_group.setLayout(time_vbox)
         right_layout.addWidget(time_group)
 
-        sim_group = QGroupBox("ADC Parameter Simulator (14-bit, 2Vpp)")
+        sim_group = QGroupBox("Runtime Trigger Calibration (14-bit, per-channel baseline)")
         sim_vbox = QVBoxLayout()
         input_grid = QGridLayout()
-        input_grid.addWidget(QLabel("Target Baseline (%):"), 0, 0)
+        input_grid.addWidget(QLabel("Plot baseline preview only (%):"), 0, 0)
         self.spin_base_pct = QSpinBox(); self.spin_base_pct.setRange(10, 95); self.spin_base_pct.setValue(90)
         self.spin_base_pct.valueChanged.connect(self.update_adc_simulator)
         input_grid.addWidget(self.spin_base_pct, 0, 1)
-        input_grid.addWidget(QLabel("Trigger Depth (mV):"), 1, 0)
-        self.spin_trg_mv = QDoubleSpinBox(); self.spin_trg_mv.setRange(1.0, 2000.0); self.spin_trg_mv.setValue(15.0)
+        input_grid.addWidget(QLabel("Hardware threshold (mV):"), 1, 0)
+        self.spin_trg_mv = QDoubleSpinBox(); self.spin_trg_mv.setDecimals(3)
+        self.spin_trg_mv.setRange(0.001, 2000.0); self.spin_trg_mv.setValue(15.0)
         self.spin_trg_mv.valueChanged.connect(self.update_adc_simulator)
         input_grid.addWidget(self.spin_trg_mv, 1, 1)
+        input_grid.addWidget(QLabel("Input range (mVpp):"), 2, 0)
+        self.combo_input_range = QComboBox()
+        self.combo_input_range.addItems(["2000", "500"])
+        self.combo_input_range.currentTextChanged.connect(self.on_input_range_changed)
+        input_grid.addWidget(self.combo_input_range, 2, 1)
         sim_vbox.addLayout(input_grid)
         self.lbl_res_offset = QLabel(); self.lbl_res_trg = QLabel()
-        sim_vbox.addWidget(QLabel("Required DCOffset (16-bit DAC):")); sim_vbox.addWidget(self.lbl_res_offset)
-        sim_vbox.addWidget(QLabel("Required TriggerThreshold (14-bit ADC):")); sim_vbox.addWidget(self.lbl_res_trg)
-        self.btn_apply_adc = QPushButton("Apply ADC to Active Channels")
+        sim_vbox.addWidget(QLabel("DCOffset policy:")); sim_vbox.addWidget(self.lbl_res_offset)
+        sim_vbox.addWidget(QLabel("Runtime threshold request:")); sim_vbox.addWidget(self.lbl_res_trg)
+        self.btn_apply_adc = QPushButton("Store mV Threshold for Self-Trigger Channels")
+        self.btn_apply_adc.setToolTip(
+            "절대 ADC threshold를 계산하지 않습니다. 채널별 mV 요청값을 저장하며 "
+            "DAQ가 실제 baseline을 측정한 뒤 각 채널의 absolute threshold를 정합니다."
+        )
         self.btn_apply_adc.clicked.connect(self.apply_adc_to_table)
         sim_vbox.addWidget(self.btn_apply_adc)
 
@@ -249,6 +311,7 @@ class ConfigTab(QWidget):
         self.current_config_path = full_path
         self.settings.setValue("last_loaded_config", full_path)
         self.lbl_current_file.setText(f"Current File: {os.path.basename(full_path)}")
+        self.configPathChanged.emit(full_path)
         self.config = loaded_config
         self.table.blockSignals(True)
         try:
@@ -322,6 +385,7 @@ class ConfigTab(QWidget):
             )
 
         self.update_mask_calc()
+        self.sync_threshold_controls_from_config()
 
     def protect_controlled_row(self, row):
         section_item = self.table.item(row, 0)
@@ -512,18 +576,58 @@ class ConfigTab(QWidget):
             self.set_table_value("Digitizer", "PostTrigger", str(self.calculated_post_pct))
             self.set_table_value("SoftwareDSP", "BaselineSamples", str(self.calculated_pedestal))
 
+    def on_input_range_changed(self, value):
+        try:
+            input_range_mv = int(value)
+        except (TypeError, ValueError):
+            input_range_mv = 2000
+        minimum_mv = math.ceil(
+            ((input_range_mv / (1 << 14)) / 2.0) * 1000.0
+        ) / 1000.0
+        self.spin_trg_mv.setMinimum(minimum_mv)
+        self.spin_trg_mv.setMaximum(float(input_range_mv) - 0.001)
+        self.update_adc_simulator()
+
     def update_adc_simulator(self):
         base_pct = self.spin_base_pct.value() / 100.0
-        trg_mv = self.spin_trg_mv.value()
-        dac_offset = int((1.0 - base_pct) * 65535)
-        adc_baseline = int(base_pct * 16383)
-        adc_trg_drop = int(trg_mv / 0.12207) 
-        adc_trigger = adc_baseline - adc_trg_drop
-        
-        self.lbl_res_offset.setText(f"{dac_offset}  (Target: {self.spin_base_pct.value()}%)")
-        self.lbl_res_trg.setText(f"{adc_trigger}  (Baseline {adc_baseline} - Drop {adc_trg_drop})")
-        self.line_base.setValue(adc_baseline)
-        self.line_trg.setValue(adc_trigger)
+        requested_mv = self.spin_trg_mv.value()
+        input_range_mv = int(self.combo_input_range.currentText())
+        adc_bits = 14
+        adc_codes = 1 << adc_bits
+
+        # The green line is only a plot aid. The DAC has analogue
+        # tolerances/over-range, so this preview must never be reused as a
+        # measured baseline for an absolute discriminator threshold.
+        adc_baseline_preview = int(round(base_pct * (adc_codes - 1)))
+        polarity = 1
+        raw_polarity = self.optional_table_value("Digitizer", "TriggerPolarity")
+        if raw_polarity in {"0", "1"}:
+            polarity = int(raw_polarity)
+        direction = "falling: measured baseline - delta" if polarity else \
+            "rising: measured baseline + delta"
+        try:
+            preview = calculate_threshold_preview(
+                adc_baseline_preview, requested_mv, input_range_mv,
+                adc_bits, polarity
+            )
+        except ValueError as exc:
+            self.lbl_res_offset.setText(
+                "unchanged; runtime measures every channel after settling"
+            )
+            self.lbl_res_trg.setText(f"invalid request: {exc}")
+            self.line_base.setValue(adc_baseline_preview)
+            self.line_trg.setValue(adc_baseline_preview)
+            return
+
+        self.lbl_res_offset.setText(
+            "unchanged; runtime measures every channel after settling"
+        )
+        self.lbl_res_trg.setText(
+            f"request={requested_mv:.3f} mV, LSB={preview.lsb_mv:.6f} mV, "
+            f"delta={preview.delta_adc} ADC; runtime: {direction}"
+        )
+        self.line_base.setValue(adc_baseline_preview)
+        self.line_trg.setValue(preview.absolute_threshold_adc)
         
         # 베이스라인이 바뀔 때 스캔 영역의 경고 여부도 재평가
         if hasattr(self, 'scan_region') and self.scan_region.isVisible():
@@ -531,19 +635,97 @@ class ConfigTab(QWidget):
             self.update_scan_region(int(r[0]), int(r[1]))
 
     def apply_adc_to_table(self):
-        if self.table.rowCount() == 0: return
-        base_pct = self.spin_base_pct.value() / 100.0
-        trg_mv = self.spin_trg_mv.value()
-        calc_offset = str(int((1.0 - base_pct) * 65535))
-        calc_trg = str(int((base_pct * 16383) - (trg_mv / 0.12207)))
+        if self.table.rowCount() == 0:
+            return
+        try:
+            channel_mask = self.table_int_value("Digitizer", "ChannelMask")
+            self_trigger_mode = self.table_int_value(
+                "Digitizer", "SelfTriggerMode"
+            )
+            trigger_mask_raw = self.optional_table_value(
+                "Digitizer", "SelfTriggerMask"
+            )
+            trigger_mask = (
+                int(trigger_mask_raw, 10)
+                if trigger_mask_raw is not None
+                else channel_mask if self_trigger_mode else 0
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid Trigger Mask", str(exc))
+            return
+        if self_trigger_mode == 0 or trigger_mask == 0:
+            QMessageBox.warning(
+                self, "No Self-Trigger Channels",
+                "Self-trigger 채널이 없어 mV threshold를 적용하지 않았습니다."
+            )
+            return
+
+        requested_mv = self.spin_trg_mv.value()
+        input_range_mv = int(self.combo_input_range.currentText())
+        try:
+            millivolts_to_adc_delta(requested_mv, input_range_mv, 14)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid mV Threshold", str(exc))
+            return
+        self.set_table_value("Digitizer", "InputRangeMv", str(input_range_mv))
+        self.set_table_value("Digitizer", "ADCBits", "14")
+        calibration_defaults = {
+            "SettlingTimeMs": "3000",
+            "SettlingTimeoutMs": "15000",
+            "MeasurementEvents": "32",
+            "StabilityToleranceAdc": "2.0",
+            "StableMeasurements": "3",
+        }
+        for key, default_value in calibration_defaults.items():
+            if self.optional_table_value("TriggerCalibration", key) is None:
+                self.set_table_value("TriggerCalibration", key, default_value)
+
+        value_text = f"{requested_mv:.6f}".rstrip("0").rstrip(".")
+        for ch in range(8):
+            if (trigger_mask >> ch) & 1:
+                self.replace_channel_threshold_with_mv(ch, value_text)
+
+        channels = ", ".join(
+            f"CH{ch}" for ch in range(8) if (trigger_mask >> ch) & 1
+        )
+        QMessageBox.information(
+            self, "Runtime Threshold Stored",
+            f"{channels}에 TriggerThresholdMv={value_text}를 저장할 준비가 됐습니다.\n"
+            "절대 ADC threshold는 DAQ가 채널별 안정 baseline을 측정한 뒤 계산합니다.\n"
+            "설정 파일에 반영하려면 Save .conf를 누르세요."
+        )
+
+    def replace_channel_threshold_with_mv(self, channel, value):
+        section = f"Channel_{channel}"
+        matching_rows = []
+        preferred_row = None
         for row in range(self.table.rowCount()):
-            section = self.table.item(row, 0).text()
-            param = self.table.item(row, 1).text()
-            if section.startswith("Channel_"):
-                if param == "DCOffset" or param == "TriggerThreshold":
-                    val = calc_offset if param == "DCOffset" else calc_trg
-                    self.table.setItem(row, 2, QTableWidgetItem(val))
-                    self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
+            section_item = self.table.item(row, 0)
+            parameter_item = self.table.item(row, 1)
+            if not section_item or not parameter_item:
+                continue
+            if section_item.text() != section:
+                continue
+            if parameter_item.text() in {"TriggerThreshold", "TriggerThresholdMv"}:
+                matching_rows.append(row)
+                if parameter_item.text() == "TriggerThresholdMv":
+                    preferred_row = row
+
+        if preferred_row is None and matching_rows:
+            preferred_row = matching_rows[0]
+            parameter_item = QTableWidgetItem("TriggerThresholdMv")
+            self.table.setItem(preferred_row, 1, parameter_item)
+        if preferred_row is None:
+            self.set_table_value(section, "TriggerThresholdMv", value)
+            return
+
+        self.table.setItem(preferred_row, 2, QTableWidgetItem(value))
+        self.table.item(preferred_row, 2).setBackground(Qt.GlobalColor.yellow)
+        self.protect_controlled_row(preferred_row)
+        for row in sorted(
+            (row for row in matching_rows if row != preferred_row), reverse=True
+        ):
+            self.table.removeRow(row)
 
     def set_table_value(self, target_section, target_param, value):
         for row in range(self.table.rowCount()):
@@ -669,6 +851,131 @@ class ConfigTab(QWidget):
             self_trigger
         )
 
+        uses_mv_threshold = False
+        for ch in range(8):
+            if not ((channel_mask >> ch) & 1):
+                continue
+            section = f"Channel_{ch}"
+            raw_offset = self.table_value(section, "DCOffset")
+            try:
+                offset = int(raw_offset, 10)
+            except ValueError as exc:
+                raise ValueError(
+                    f"정수가 아닌 설정값입니다: [{section}] DCOffset={raw_offset}"
+                ) from exc
+            if not 0 <= offset <= 65535:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] DCOffset={offset} (허용 0..65535)"
+                )
+
+            raw_absolute = self.optional_table_value(
+                section, "TriggerThreshold"
+            )
+            raw_mv = self.optional_table_value(section, "TriggerThresholdMv")
+            participates_in_trigger = bool(
+                self_trigger and ((trigger_mask >> ch) & 1)
+            )
+            if raw_absolute is not None and raw_mv is not None:
+                raise ValueError(
+                    f"[{section}] TriggerThreshold(legacy)와 TriggerThresholdMv 중 "
+                    "하나만 설정해야 합니다."
+                )
+            if participates_in_trigger and raw_absolute is None and raw_mv is None:
+                raise ValueError(
+                    f"[{section}] self-trigger 채널에는 TriggerThreshold 또는 "
+                    "TriggerThresholdMv가 필요합니다."
+                )
+            if raw_absolute is None and raw_mv is None:
+                continue
+            if raw_mv is not None:
+                uses_mv_threshold = (
+                    uses_mv_threshold or participates_in_trigger
+                )
+                try:
+                    requested_mv = float(raw_mv)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"실수가 아닌 설정값입니다: [{section}] "
+                        f"TriggerThresholdMv={raw_mv}"
+                    ) from exc
+                if not math.isfinite(requested_mv) or requested_mv <= 0:
+                    raise ValueError(
+                        f"[{section}] TriggerThresholdMv는 유한한 양수여야 합니다."
+                    )
+            else:
+                try:
+                    absolute = int(raw_absolute, 10)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"정수가 아닌 설정값입니다: [{section}] "
+                        f"TriggerThreshold={raw_absolute}"
+                    ) from exc
+                if not 0 <= absolute <= 16383:
+                    raise ValueError(
+                        f"[{section}] TriggerThreshold={absolute} (허용 0..16383)"
+                    )
+
+        if uses_mv_threshold:
+            input_range_raw = self.table_value("Digitizer", "InputRangeMv")
+            adc_bits_raw = self.table_value("Digitizer", "ADCBits")
+            try:
+                input_range_mv = int(input_range_raw, 10)
+                adc_bits = int(adc_bits_raw, 10)
+            except ValueError as exc:
+                raise ValueError("InputRangeMv와 ADCBits는 정수여야 합니다.") from exc
+            if input_range_mv not in (500, 2000):
+                raise ValueError("[Digitizer] InputRangeMv는 500 또는 2000이어야 합니다.")
+            if adc_bits != 14:
+                raise ValueError("[Digitizer] ADCBits는 DT5730S의 14여야 합니다.")
+
+            for ch in range(8):
+                raw_mv = self.optional_table_value(
+                    f"Channel_{ch}", "TriggerThresholdMv"
+                )
+                if raw_mv is not None:
+                    try:
+                        millivolts_to_adc_delta(
+                            float(raw_mv), input_range_mv, adc_bits
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"[Channel_{ch}] TriggerThresholdMv={raw_mv}: {exc}"
+                        ) from exc
+
+            calibration_values = {
+                key: self.table_value("TriggerCalibration", key)
+                for key in (
+                    "SettlingTimeMs", "SettlingTimeoutMs", "MeasurementEvents",
+                    "StabilityToleranceAdc", "StableMeasurements",
+                )
+            }
+            try:
+                settling_ms = int(calibration_values["SettlingTimeMs"], 10)
+                timeout_ms = int(calibration_values["SettlingTimeoutMs"], 10)
+                measurement_events = int(
+                    calibration_values["MeasurementEvents"], 10
+                )
+                tolerance_adc = float(
+                    calibration_values["StabilityToleranceAdc"]
+                )
+                stable_measurements = int(
+                    calibration_values["StableMeasurements"], 10
+                )
+            except ValueError as exc:
+                raise ValueError("TriggerCalibration 설정 형식이 잘못됐습니다.") from exc
+            if settling_ms < 0 or timeout_ms <= settling_ms:
+                raise ValueError(
+                    "SettlingTimeoutMs는 SettlingTimeMs보다 커야 합니다."
+                )
+            if not 1 <= measurement_events <= 10000:
+                raise ValueError(
+                    "MeasurementEvents는 1..10000이어야 합니다."
+                )
+            if not 2 <= stable_measurements <= 100:
+                raise ValueError("StableMeasurements는 2..100이어야 합니다.")
+            if not math.isfinite(tolerance_adc) or tolerance_adc <= 0:
+                raise ValueError("StabilityToleranceAdc는 유한한 양수여야 합니다.")
+
     def save_config(self):
         if not self.current_config_path: return
         try:
@@ -687,3 +994,4 @@ class ConfigTab(QWidget):
             self.config.set(sec, key, val)
             self.table.item(row, 2).setBackground(Qt.GlobalColor.white) 
         with open(self.current_config_path, 'w') as configfile: self.config.write(configfile)
+        self.configPathChanged.emit(os.path.abspath(self.current_config_path))

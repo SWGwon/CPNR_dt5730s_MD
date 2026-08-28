@@ -1,6 +1,9 @@
 import subprocess
 import re
+import shlex
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from core.runtime_paths import verify_expected_hashes, verify_paths_absent
 
 class ProcessManager(QThread):
     log_signal = pyqtSignal(str)
@@ -11,10 +14,13 @@ class ProcessManager(QThread):
     led_signal = pyqtSignal(dict)
     fatal_signal = pyqtSignal(str) # Soft-kill 이벤트 감지 시그널
 
-    def __init__(self, cmd, cwd=None):
+    def __init__(self, cmd, cwd=None, expected_hashes=None,
+                 expected_absent_paths=None):
         super().__init__()
-        self.cmd = cmd
+        self.cmd = list(cmd)
         self.cwd = cwd
+        self.expected_hashes = dict(expected_hashes or {})
+        self.expected_absent_paths = list(expected_absent_paths or [])
         self.process = None
         self.is_running = False
         
@@ -25,6 +31,9 @@ class ProcessManager(QThread):
     def run(self):
         self.is_running = True
         try:
+            verify_expected_hashes(self.expected_hashes)
+            verify_paths_absent(self.expected_absent_paths)
+            self.log_signal.emit(f"[Launch] {shlex.join(self.cmd)}")
             self.process = subprocess.Popen(
                 self.cmd,
                 cwd=self.cwd,
@@ -95,6 +104,9 @@ class ProcessManager(QThread):
             self.log_signal.emit("[System] Sending SIGINT to gracefully stop the process...")
             self.process.send_signal(2)
             try:
-                self.process.wait(timeout=3)
+                self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
+                self.log_signal.emit(
+                    "[System] Graceful stop exceeded 15 s; forcing process exit."
+                )
                 self.process.kill()

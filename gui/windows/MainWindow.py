@@ -35,6 +35,10 @@ class MainWindow(QMainWindow):
         self.daq_tab.hardware_led_signal.connect(self.update_led_dashboard)
         self.daq_tab.hardware_temp_signal.connect(self.monitor_tab.update_temperature)
         self.daq_tab.daq_finished_signal.connect(self.reset_led_dashboard)
+        self.daq_tab.runContextReady.connect(self.production_tab.set_run_context)
+        self.config_tab.configPathChanged.connect(self.daq_tab.set_config_path)
+        if self.config_tab.current_config_path:
+            self.daq_tab.set_config_path(self.config_tab.current_config_path)
 
         # =========================================================================
         # [신규 추가] DAQ Control 탭과 Hardware Config 탭의 스캔 범위 시각화 파이프라인

@@ -5,15 +5,26 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSlot, QSettings, QProcess
 from core.DatabaseManager import DatabaseManager
+from core.runtime_paths import (
+    RuntimeValidationError,
+    build_production_arguments,
+    file_identity,
+    find_project_root,
+    identity_summary,
+    production_sources,
+    require_file,
+    resolve_path,
+    verify_binary_fresh,
+    verify_deployed_gui,
+    verify_expected_hashes,
+)
 
 class ProductionTab(QWidget):
     def __init__(self):
         super().__init__()
         
-        curr = os.path.abspath(os.path.dirname(__file__))
-        while curr != '/' and not os.path.exists(os.path.join(curr, 'CMakeLists.txt')):
-            curr = os.path.dirname(curr)
-        self.proj_dir = curr if curr != '/' else os.getcwd()
+        self.proj_dir = str(find_project_root(__file__))
+        self.runtime_gui_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         self.bin_dir = os.path.join(self.proj_dir, "bin")
         self.data_dir = os.path.join(self.proj_dir, "data")
@@ -28,6 +39,7 @@ class ProductionTab(QWidget):
         self.process.finished.connect(self.handle_finished)
         
         self.last_stats = {}; self.current_raw_file = ""
+        self.completed_run_context = None
         self.init_ui()
         self.load_settings()
         self.log_pattern = re.compile(r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)")
@@ -46,6 +58,35 @@ class ProductionTab(QWidget):
         self.btn_browse_out.clicked.connect(self.browse_output)
         io_layout.addWidget(QLabel("Input Raw (.dat):"), 0, 0); io_layout.addWidget(self.input_edit, 0, 1); io_layout.addWidget(self.btn_browse_in, 0, 2)
         io_layout.addWidget(QLabel("Output ROOT (.root):"), 1, 0); io_layout.addWidget(self.output_edit, 1, 1); io_layout.addWidget(self.btn_browse_out, 1, 2)
+
+        self.config_edit = QLineEdit()
+        self.config_edit.setPlaceholderText("Exact run snapshot (*.dat.config.conf)")
+        self.btn_browse_config = QPushButton("Browse Config")
+        self.btn_browse_config.clicked.connect(self.browse_config)
+        io_layout.addWidget(QLabel("Run Config (.conf):"), 2, 0)
+        io_layout.addWidget(self.config_edit, 2, 1)
+        io_layout.addWidget(self.btn_browse_config, 2, 2)
+
+        self.metadata_edit = QLineEdit()
+        self.metadata_edit.setPlaceholderText("Exact runtime metadata (*.dat.run.json)")
+        self.btn_browse_metadata = QPushButton("Browse Metadata")
+        self.btn_browse_metadata.clicked.connect(self.browse_metadata)
+        io_layout.addWidget(QLabel("Run Metadata (.json):"), 3, 0)
+        io_layout.addWidget(self.metadata_edit, 3, 1)
+        io_layout.addWidget(self.btn_browse_metadata, 3, 2)
+
+        self.spin_run_number = QSpinBox()
+        self.spin_run_number.setRange(1, 99999)
+        io_layout.addWidget(QLabel("Run Number:"), 4, 0)
+        io_layout.addWidget(self.spin_run_number, 4, 1)
+
+        self.lbl_production_identity = QLabel()
+        self.lbl_production_identity.setWordWrap(True)
+        self.lbl_production_identity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        io_layout.addWidget(QLabel("Resolved production:"), 5, 0)
+        io_layout.addWidget(self.lbl_production_identity, 5, 1, 1, 2)
         io_group.setLayout(io_layout); layout.addWidget(io_group)
 
         opt_group = QGroupBox("Conversion Options & Time-Machine Debugger")
@@ -101,12 +142,35 @@ class ProductionTab(QWidget):
     def load_settings(self):
         self.input_edit.setText(self.settings.value("last_prod_input", ""))
         self.output_edit.setText(self.settings.value("last_prod_output", ""))
+        self.config_edit.setText(self.settings.value("last_prod_config", ""))
+        self.metadata_edit.setText(self.settings.value("last_prod_metadata", ""))
+        self.spin_run_number.setValue(
+            int(self.settings.value("last_prod_run_number", 1))
+        )
         self.chk_save_waveforms.setChecked(self.settings.value("last_save_wave", False, type=bool))
+        self.refresh_runtime_identity()
 
     def save_settings(self):
         self.settings.setValue("last_prod_input", self.input_edit.text())
         self.settings.setValue("last_prod_output", self.output_edit.text())
+        self.settings.setValue("last_prod_config", self.config_edit.text())
+        self.settings.setValue("last_prod_metadata", self.metadata_edit.text())
+        self.settings.setValue("last_prod_run_number", self.spin_run_number.value())
         self.settings.setValue("last_save_wave", self.chk_save_waveforms.isChecked())
+
+    def refresh_runtime_identity(self):
+        executable = os.path.join(self.bin_dir, "production_dt5730")
+        try:
+            identity = file_identity(executable)
+            self.lbl_production_identity.setText(identity_summary(identity))
+            self.lbl_production_identity.setStyleSheet("color: #495057;")
+        except OSError as exc:
+            self.lbl_production_identity.setText(
+                f"UNAVAILABLE: {executable} ({exc})"
+            )
+            self.lbl_production_identity.setStyleSheet(
+                "color: #dc3545; font-weight: bold;"
+            )
 
     def browse_input(self):
         last_dir = os.path.dirname(os.path.join(self.proj_dir, self.input_edit.text())) if self.input_edit.text() else self.data_dir
@@ -118,37 +182,154 @@ class ProductionTab(QWidget):
         fname, _ = QFileDialog.getSaveFileName(self, "Save ROOT Data", last_dir, "ROOT Files (*.root)")
         if fname: self.output_edit.setText(os.path.relpath(fname, self.proj_dir)); self.save_settings()
 
+    def browse_config(self):
+        last_dir = (
+            os.path.dirname(str(resolve_path(self.proj_dir, self.config_edit.text())))
+            if self.config_edit.text().strip() else self.data_dir
+        )
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Open Exact Run Config", last_dir, "Config Files (*.conf);;All Files (*)"
+        )
+        if fname:
+            self.config_edit.setText(os.path.abspath(fname))
+            self.save_settings()
+
+    def browse_metadata(self):
+        last_dir = (
+            os.path.dirname(str(resolve_path(self.proj_dir, self.metadata_edit.text())))
+            if self.metadata_edit.text().strip() else self.data_dir
+        )
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Open Runtime Metadata", last_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if fname:
+            self.metadata_edit.setText(os.path.abspath(fname))
+            self.save_settings()
+
+    @pyqtSlot(dict)
+    def set_run_context(self, context):
+        """Populate conversion provenance from a successfully completed DAQ run."""
+
+        self.completed_run_context = dict(context)
+        self.input_edit.setText(context.get("raw_file", ""))
+        self.config_edit.setText(context.get("config_path", ""))
+        self.metadata_edit.setText(context.get("metadata_path", ""))
+        run_number = int(context.get("run_number", 1))
+        self.spin_run_number.setValue(max(1, run_number))
+        self.output_edit.clear()
+        self.save_settings()
+        metadata_note = "ready" if context.get("metadata_exists") else "MISSING"
+        self.log_console.append(
+            "<b>[Run Context]</b> Completed DAQ context loaded: "
+            f"run={run_number}, metadata={metadata_note}"
+        )
+
     def run_conversion(self):
         self.save_settings()
-        self.current_raw_file = self.input_edit.text().strip(); out_file = self.output_edit.text().strip()
-        if not self.current_raw_file:
-            self.log_console.append("<span style='color:red;'>[Error] Please select input file!</span>"); return
-        if out_file:
-            out_file_full = os.path.abspath(os.path.join(self.proj_dir, out_file))
-            os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
-            
-        args = ["-i", self.current_raw_file]
-        if out_file: args.extend(["-o", out_file])
-        if self.chk_save_waveforms.isChecked(): args.append("-w")
-        is_debug_mode = self.chk_debug_mode.isChecked()
-        if is_debug_mode: args.extend(["-d", str(self.spin_debug_start.value())])
-            
+        raw_value = self.input_edit.text().strip()
+        config_value = self.config_edit.text().strip()
+        metadata_value = self.metadata_edit.text().strip()
+        output_value = self.output_edit.text().strip()
+        if not raw_value or not config_value or not metadata_value:
+            self.log_console.append(
+                "<span style='color:red;'>[Error] Raw input, exact run config, "
+                "and runtime metadata are all required.</span>"
+            )
+            return
+
+        try:
+            verify_deployed_gui(self.runtime_gui_dir, self.proj_dir)
+            raw_path = require_file(
+                resolve_path(self.proj_dir, raw_value), description="raw 입력 파일"
+            )
+            config_path = require_file(
+                resolve_path(self.proj_dir, config_value), description="run config snapshot"
+            )
+            metadata_path = require_file(
+                resolve_path(self.proj_dir, metadata_value), description="runtime metadata"
+            )
+            executable = os.path.join(self.bin_dir, "production_dt5730")
+            executable_identity = verify_binary_fresh(
+                executable, production_sources(self.proj_dir)
+            )
+            config_identity = file_identity(config_path)
+            metadata_identity = file_identity(metadata_path)
+            context = self.completed_run_context or {}
+            context_raw = context.get("raw_file")
+            if context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
+                expected_config = resolve_path(
+                    self.proj_dir, context.get("config_path", "")
+                )
+                expected_metadata = resolve_path(
+                    self.proj_dir, context.get("metadata_path", "")
+                )
+                if expected_config != config_path or expected_metadata != metadata_path:
+                    raise RuntimeValidationError(
+                        "완료된 DAQ context의 config/metadata 경로와 현재 선택이 "
+                        "다릅니다."
+                    )
+                if (context.get("config_sha256") and
+                        context["config_sha256"] != config_identity["sha256"]):
+                    raise RuntimeValidationError(
+                        "DAQ 완료 후 config snapshot 내용이 변경되었습니다."
+                    )
+                if (context.get("metadata_sha256") and
+                        context["metadata_sha256"] != metadata_identity["sha256"]):
+                    raise RuntimeValidationError(
+                        "DAQ 완료 후 runtime metadata 내용이 변경되었습니다."
+                    )
+            output_path = (
+                resolve_path(self.proj_dir, output_value)
+                if output_value else None
+            )
+            if output_path:
+                os.makedirs(output_path.parent, exist_ok=True)
+            is_debug_mode = self.chk_debug_mode.isChecked()
+            args = build_production_arguments(
+                raw_path,
+                config_path,
+                self.spin_run_number.value(),
+                metadata_path,
+                root_output=output_path,
+                save_waveforms=self.chk_save_waveforms.isChecked(),
+                debug_event_id=(
+                    self.spin_debug_start.value() if is_debug_mode else None
+                ),
+            )
+            verify_expected_hashes({
+                executable: executable_identity["sha256"],
+                str(config_path): config_identity["sha256"],
+                str(metadata_path): metadata_identity["sha256"],
+            })
+        except (OSError, RuntimeValidationError) as exc:
+            self.log_console.append(
+                f"<span style='color:red;'>[Error] Conversion launch blocked: "
+                f"{exc}</span>"
+            )
+            return
+
+        self.current_raw_file = str(raw_path)
         self.progress_bar.setValue(0); self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
         self.log_console.clear(); self.last_stats = {}
-        
-        exe_path = os.path.join(self.bin_dir, "production_dt5730")
-        if not os.path.exists(exe_path):
-            self.log_console.append(f"<span style='color:red;'>[Error] Executable not found at: {exe_path}. Did you run 'make'?</span>"); return
-
+        self.lbl_production_identity.setText(identity_summary(executable_identity))
         self.btn_run.setEnabled(False); self.set_debug_controls_enabled(is_debug_mode)
-        self.log_console.append(f"<b>[System] Starting:</b> {exe_path} {' '.join(args)}")
+        self.log_console.append(
+            f"<b>[Runtime] Production:</b> {identity_summary(executable_identity)}"
+        )
+        self.log_console.append(
+            f"<b>[Runtime] Config:</b> {identity_summary(config_identity)}"
+        )
+        self.log_console.append(
+            f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
+        )
+        self.log_console.append(f"<b>[System] Starting:</b> {executable} {' '.join(args)}")
         self.process.setWorkingDirectory(self.proj_dir)
-        self.process.start(exe_path, args)
+        self.process.start(str(executable), args)
 
     def stop_all(self):
         if self.process.state() == QProcess.ProcessState.Running:
             self.process.terminate()
-            self.process.waitForFinished(1000)
+            self.process.waitForFinished(15000)
             if self.process.state() == QProcess.ProcessState.Running: self.process.kill()
             self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
             self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)

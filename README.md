@@ -67,13 +67,12 @@ CPNR_dt5730s/
 
 ### 2. Hardware Config & Master Architect Calculator
 ![Hardware Config](docs/images/config_tab.png)
-> 장비 조준경(DCOffset, Threshold 등)을 표에서 즉시 편집합니다. 16-bit 역방향 DAC 오프셋, 14-bit ADC 트리거 깊이, 그리고 가변 레코드 길이에 따른 최적의 페데스탈(Baseline) 샘플 수를 마우스만으로 역산출하여 `.conf`에 주입하는 궁극의 시뮬레이터가 탑재되어 있습니다.
+> DCOffset과 threshold 등을 표에서 편집합니다. mV threshold는 이론 baseline으로 absolute ADC 값을 만들지 않고 `.conf`에 요청값으로 저장되며, frontend가 DCOffset 적용·settling 뒤 software-trigger 파형에서 채널별 baseline을 측정해 실제 discriminator 값을 계산하고 readback합니다.
 
 ### 3. Live Monitor (Auto Multi-Channel Overlay)
 ![Live Monitor](docs/images/monitor_tab.png)
 > 사용자가 타겟 채널을 고를 필요 없이, 켜져 있는 모든 채널을 자동 감지하여 파형(Waveform)과 에너지 스펙트럼(Q-Long)을 각기 다른 색상으로 한 캔버스에 투명하게 오버레이(Overlay) 합니다. 최대 누적 이벤트 수를 동적으로 조절하여 시인성을 확보합니다.
 
-### 4. Offline Production (Micro-Time Extraction)
 ### 4. Offline Production (Micro-Time Extraction)
 ![Offline Production](docs/images/production_tab.png)
 ![Offline Production ROOT](docs/images/Prod_root.png)
@@ -183,6 +182,30 @@ PairLogic=AND
 
 이 경우 CH2와 CH3의 임계값은 트리거 결정에 관여하지 않습니다. 다만 readout-only 채널도 연속으로 독립 기록되는 것은 아니며, CH0/CH1 coincidence로 global trigger가 승인될 때 같은 이벤트 시간 구간이 함께 저장됩니다.
 
+### Baseline-relative mV threshold
+
+DT5730S의 waveform ADC와 discriminator code는 14-bit이지만 DC offset을 만드는 별도 DAC 제어값은 16-bit입니다. DAC code만으로 실제 baseline을 정확히 예측하지 말고, 다음처럼 mV 요청값을 저장합니다.
+
+```ini
+[Digitizer]
+InputRangeMv=2000
+ADCBits=14
+TriggerPolarity=1
+
+[TriggerCalibration]
+SettlingTimeMs=3000
+SettlingTimeoutMs=15000
+MeasurementEvents=32
+StabilityToleranceAdc=2.0
+StableMeasurements=3
+
+[Channel_0]
+DCOffset=6554
+TriggerThresholdMv=1.0
+```
+
+2 Vpp/14-bit에서는 1 LSB가 `2000/16384 = 0.1220703125 mV`이므로 1 mV는 반올림해 8 ADC입니다. Falling edge라면 frontend가 `round(measured_baseline[ch]) - 8`, rising edge라면 `+ 8`을 채널별로 기록합니다. 범위·DCOffset·polarity·threshold 및 pair/global trigger register readback이 하나라도 요청값과 다르면 physics acquisition을 시작하지 않습니다. 기존 `TriggerThreshold=<absolute ADC>` 설정도 호환되지만 이 모드에서는 실측 baseline-relative 보정이 적용되지 않습니다.
+
 전면 패널 `TRG-IN`만 사용하는 외부 트리거 전용 구성은 다음처럼 self-trigger 참여 마스크를 0으로 둡니다. 이 모드에서는 `PairLogic`을 하드웨어에 적용하지 않으며, 외부 트리거가 들어올 때 `ChannelMask`에 포함된 채널이 기록됩니다.
 
 ```ini
@@ -205,6 +228,17 @@ PairLogic=OR
 ./bin/daq_gui
 ```
 
+GUI가 실행하는 hardware frontend의 고정 위치는 `./bin/frontend_dt5730`입니다. 각 run에서는 선택한 source config를 `<raw>.config.conf`로 원자적으로 snapshot한 뒤 다음과 같은 절대 경로 명령을 실행합니다.
+
+```bash
+./bin/frontend_dt5730 -c /absolute/run.dat.config.conf \
+  -o /absolute/run.dat -r 21 -m /absolute/run.dat.run.json
+```
+
+GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui`와 다르면 실행을 차단합니다. Runtime JSON에는 binary/config 경로, git/build 정보, input range, ADC bits, polarity, DC offset, 채널별 measured baseline/threshold write/readback과 trigger routing readback이 저장되고, production 변환 시 JSON과 config 전체가 ROOT의 `RunMetadata`와 `RunConfig`로 들어갑니다.
+
+메타데이터는 기존 파일을 덮어쓰지 않습니다. 장비 설정 검증 직후와 acquisition 시작 직후 상태는 각각 `<raw>.run.json.status.hardware_verified_not_started.json`, `<raw>.run.json.status.running.json`에 불변 스냅샷으로 남고, production이 사용하는 `<raw>.run.json`은 `completed` 또는 `failed` terminal 상태에서 한 번만 생성됩니다. 각 파일은 검증한 열린 inode를 no-clobber 방식으로 게시하므로 동시 경로 교체나 이전 run 산출물을 덮어쓰지 않습니다.
+
 **가벼운 CLI 모니터링 단독 실행 (X-Server 불필요):**
 메인 프로그램을 띄우지 않고 터미널 환경에서 가볍게 다중 채널 파형과 스펙트럼만 모니터링할 경우 아래 스크립트를 실행합니다.
 ./bin/frontend_dt5730 실행시
@@ -214,9 +248,9 @@ PairLogic=OR
 
 ### GUI 탭(Tab)별 기능 명세서
 * **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, ZMQ Drops 등) 및 컬러 파싱 터미널 창 제공.
-* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, Threshold, RecordLength 등을 GUI에서 편집하고 `.conf`에 반영합니다. **Time & DSP / ADC Simulator**를 통한 파라미터 산출도 지원합니다.
+* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
-* **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Micro-Time(T0) 추출, 파형 강제 저장(-w) 옵션, 변환 시간(ETA) 출력 기능 및 특정 Event ID 하드코어 팝업 디버깅(-d).
+* **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, Micro-Time(T0) 추출, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 
 ---
