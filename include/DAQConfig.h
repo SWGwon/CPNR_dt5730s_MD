@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <string>
 
+inline constexpr double kMinimumSoftwareRandomTriggerRateHz = 0.001;
+inline constexpr double kMaximumSoftwareRandomTriggerRateHz = 100000.0;
+
 struct DAQConnectionSettings {
   std::string type = "USB";
   int link = 0;
@@ -69,6 +72,8 @@ struct DAQHardwareSettings {
   int trigger_polarity = 0;
   int ext_trigger_mode = 0;
   int self_trigger_mode = 0;
+  int software_random_trigger_mode = 0;
+  double software_random_trigger_rate_hz = 0.0;
   int clock_source = 0;
   int run_sync_mode = 0;
   bool explicit_trigger_routing = false;
@@ -80,7 +85,32 @@ struct DAQHardwareSettings {
   std::array<DAQChannelSettings, MAX_CH> channels{};
 };
 
+enum class DAQRecordLengthContract {
+  // Hardware acquisition contract for DT5730/x730 standard waveform firmware.
+  kCurrentX730,
+  // Authenticated artifacts written by older releases used an 8-sample
+  // software contract. This mode is for offline replay/validation only.
+  kLegacyMultipleOf8,
+  // Recovery scans may receive either kind of frozen config and never touch
+  // hardware, so they can safely accept the union of both contracts.
+  kLegacyOrCurrent,
+};
+
+enum class DAQWaveformDspContract {
+  // Current acquisition/ROOT schema 3: charge uses the fixed peak-centered
+  // window. The configurable threshold/gates are retained only as provenance.
+  kPeakCentered,
+  // ROOT schemas 1/2: threshold crossing and configurable gates determine the
+  // stored charge, so their historical bounds remain mandatory.
+  kLegacyThresholdGates,
+};
+
 // CAEN 장비를 열기 전에 호출할 수 있도록 표준 C++에만 의존합니다.
-DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config);
+DAQHardwareSettings LoadDAQHardwareSettings(
+    const ConfigParser& config,
+    DAQRecordLengthContract record_length_contract =
+        DAQRecordLengthContract::kCurrentX730,
+    DAQWaveformDspContract waveform_dsp_contract =
+        DAQWaveformDspContract::kPeakCentered);
 
 #endif  // DAQ_CONFIG_H

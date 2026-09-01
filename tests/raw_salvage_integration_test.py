@@ -17,6 +17,7 @@ import time
 
 HEADER = struct.Struct("<QIIHHI")
 RECORD_LENGTH = 256
+CURRENT_ONLY_RECORD_LENGTH = 260
 CHANNEL_MASK = 1
 ADC_BITS = 14
 
@@ -25,10 +26,11 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def config_text(identity_marker: str = "A") -> str:
+def config_text(identity_marker: str = "A", *,
+                record_length: int = RECORD_LENGTH) -> str:
     return f"""# identity marker {identity_marker}
 [Digitizer]
-RecordLength={RECORD_LENGTH}
+RecordLength={record_length}
 ChannelMask={CHANNEL_MASK}
 SelfTriggerMask=1
 PostTrigger=60
@@ -56,7 +58,7 @@ TriggerThresholdMv=1.0
 
 def event(event_id: int, *, sample: int = 100, record_length: int = RECORD_LENGTH,
           channel_mask: int = CHANNEL_MASK) -> bytes:
-    channels = channel_mask.bit_count()
+    channels = bin(channel_mask).count("1")
     header = HEADER.pack(1000 + event_id, event_id, record_length, channel_mask,
                          0x1234, event_id & 0xFFFFFF)
     return header + struct.pack(f"<{record_length * channels}H",
@@ -190,6 +192,25 @@ def test_clean_and_provenance(executable: str, directory: Path) -> None:
         fail("manifest source identity is incorrect")
     if not manifest.get("git_commit") or not manifest.get("build_timestamp"):
         fail("manifest omits build provenance")
+
+
+def test_current_only_record_length(executable: str, directory: Path) -> None:
+    config = directory / "current-only.conf"
+    config.write_text(
+        config_text(record_length=CURRENT_ONLY_RECORD_LENGTH), encoding="utf-8")
+    source = directory / "current-only.dat.partial"
+    original = event(0, record_length=CURRENT_ONLY_RECORD_LENGTH)
+    source.write_bytes(original)
+    output = directory / "current-only-recovered.dat"
+
+    require_success(invoke(executable, source, output, config))
+    if output.read_bytes() != original:
+        fail("current-only 10-sample-grid recovery changed source bytes")
+    manifest = json.loads(Path(f"{output}.recovery.json").read_text())
+    if (manifest["record_length"] != CURRENT_ONLY_RECORD_LENGTH or
+            manifest["recovered_events"] != 1 or
+            manifest["stop_reason"] != "clean_end"):
+        fail(f"unexpected current-only recovery manifest: {manifest}")
 
 
 def test_truncated_prefix(executable: str, directory: Path) -> None:
@@ -373,6 +394,7 @@ def main() -> int:
         directory = Path(temp)
         test_cli(executable, directory)
         test_clean_and_provenance(executable, directory)
+        test_current_only_record_length(executable, directory)
         test_truncated_prefix(executable, directory)
         test_corruption_boundaries(executable, directory)
         test_no_valid_event(executable, directory)

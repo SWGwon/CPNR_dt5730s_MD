@@ -1,5 +1,6 @@
 #include "ConfigParser.h"
 #include "DAQConfig.h"
+#include "DT5730Constraints.h"
 #include "EventHeader.h"
 #include "RaceSafeCleanup.h"
 #include "Sha256.h"
@@ -499,9 +500,15 @@ ScanResult ScanAndCopy(int input_descriptor, int output_descriptor,
       DrainInput(input_descriptor, &source_digest);
       break;
     }
+    const bool supported_legacy_or_current_length =
+        header.RecordLength % 8U == 0U ||
+        dt5730_constraints::IsSupportedRecordLength(header.RecordLength);
     if (header.RecordLength != settings.record_length ||
-        header.RecordLength < 128U || header.RecordLength > 102400U ||
-        header.RecordLength % 8U != 0U ||
+        header.RecordLength <
+            dt5730_constraints::kMinimumRecordLengthSamples ||
+        header.RecordLength >
+            dt5730_constraints::kMaximumRecordLengthSamples ||
+        !supported_legacy_or_current_length ||
         header.ChannelMask != settings.channel_mask ||
         header.ChannelMask == 0U ||
         (header.ChannelMask & ~((uint16_t{1} << MAX_CH) - 1U)) != 0U) {
@@ -705,7 +712,8 @@ int Run(const Options& options) {
       config_input.Get(), config_path, &config_sha256, config_identity);
   const ConfigParser config =
       ConfigParser::FromText(config_contents, config_path);
-  const DAQHardwareSettings settings = LoadDAQHardwareSettings(config);
+  const DAQHardwareSettings settings = LoadDAQHardwareSettings(
+      config, DAQRecordLengthContract::kLegacyOrCurrent);
 
   FileIdentity source_identity;
   UniqueFd input = OpenImmutableInput(input_path, &source_identity);

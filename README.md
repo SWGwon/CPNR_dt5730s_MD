@@ -74,12 +74,12 @@ CPNR_dt5730s/
 
 ### 3. Live Monitor (Auto Multi-Channel Overlay)
 ![Live Monitor](docs/images/monitor_tab.png)
-> 사용자가 타겟 채널을 고를 필요 없이, 켜져 있는 모든 채널을 자동 감지하여 파형(Waveform)과 에너지 스펙트럼(Q-Long)을 각기 다른 색상으로 한 캔버스에 투명하게 오버레이(Overlay) 합니다. 최대 누적 이벤트 수를 동적으로 조절하여 시인성을 확보합니다.
+> 사용자가 타겟 채널을 고를 필요 없이, 켜져 있는 모든 채널을 자동 감지하여 파형(Waveform)과 baseline-subtracted full-waveform signed charge 스펙트럼을 각기 다른 색상으로 한 캔버스에 투명하게 오버레이(Overlay) 합니다. 기본 100,000개 또는 명시적 Unlimited 누적 history를 선택할 수 있습니다.
 
 ### 4. Offline Production (Micro-Time Extraction)
 ![Offline Production](docs/images/production_tab.png)
 ![Offline Production ROOT](docs/images/Prod_root.png)
-> 이진 데이터(`.dat`)의 ROOT 변환을 전담합니다. 변환 예상 시간(ETA) 출력 기능과 함께, 파형 내부의 정밀 펄스 시작 시간(T0) 추출 기능, 파형 강제 저장(-w) 옵션, 그리고 특정 이벤트를 팝업으로 띄우는 하드코어 디버깅(-d) 모드를 지원합니다.
+> 이진 데이터(`.dat`)의 ROOT 변환을 전담합니다. 변환 예상 시간(ETA) 출력 기능과 함께, schema 3에서는 polarity-corrected peak 시각을 T0로 기록하고, 파형 강제 저장(-w) 옵션과 특정 이벤트를 팝업으로 띄우는 하드코어 디버깅(-d) 모드를 지원합니다.
 
 ### 5. Production ROOT Validation
 > ROOT 구조와 branch type, EventID/TTT 연속성, event mask/record length, summary 통계, 채널별 finite/range/sentinel, baseline 안정화, threshold 실효값, AND/OR routing 증거를 읽기 전용으로 검사합니다. 최신 파일은 내장 config/metadata와 SHA-256까지 대조하며, 구형 파일은 데이터 무결성과 추적 불가(provenance)를 분리해 표시합니다.
@@ -111,7 +111,7 @@ CPNR_dt5730s/
 
 ## ✨ Key Features
 
-* **Software Coincidence DSP (Micro-Time Extraction):** 오프라인 변환기(Tier 2)가 파형 내부에서 펄스가 하강을 시작한 **정밀 상대 시간(T0, Micro-Time)**을 ns 단위로 추출하여, ROOT 분석 단계에서 사용자가 정한 시간차 조건을 적용할 수 있습니다.
+* **Software Coincidence DSP (Micro-Time Extraction):** 오프라인 변환기(Tier 2)가 polarity를 보정한 파형의 최대 높이 시각을 **정밀 상대 시간(T0, Micro-Time)**으로 ns 단위로 기록하여, ROOT 분석 단계에서 사용자가 정한 시간차 조건을 적용할 수 있습니다.
 * **Automated Threshold Scan Engine:** 단일 광자(Single Photon) 캘리브레이션 및 노이즈 플로어 탐색을 위해, 지정된 스텝(Step) 크기만큼 하드웨어 임계값을 실시간으로 변화시키며 무한 루프를 도는 자동 획득 제어 기능을 탑재했습니다. (`_th14500.dat` 형식으로 분할 저장)
 * **Auto Multi-Channel Edge Computing Monitor:** Python 워커 스레드가 수신된 ZMQ 패킷의 `ChannelMask`를 실시간으로 역산출하여, 켜져 있는 모든 채널을 자동으로 감지하고 다중 오버레이(Multi-Overlay) 스펙트럼 적분을 수행합니다.
 * **Continuous / Batch Mode:** 단일 구동뿐만 아니라, 지정된 이벤트 수(-n)나 시간(-t) 단위로 파일 번호를 자동 증가(`_part01`)시키며 분할 저장하는 무한 백그라운드 배치 모드를 지원합니다.
@@ -187,7 +187,7 @@ cmake --build build-test
 ctest --test-dir build-test --output-on-failure
 ```
 
-DAQ 시작 전 설정 검증은 `RecordLength` 128–102400(8의 배수), 1개 이상의 활성 채널,
+DAQ 시작 전 설정 검증은 `RecordLength` 130–102400(10의 배수), 1개 이상의 활성 채널,
 최소 160 ns의 pre-trigger 구간 및 활성 채널별 DAC/threshold 범위를 요구합니다.
 검증에 실패하면 디지타이저를 열지 않고 실행을 중단합니다.
 
@@ -247,11 +247,23 @@ TriggerThresholdMv=1.0
 
 2 Vpp/14-bit에서는 1 LSB가 `2000/16384 = 0.1220703125 mV`이므로 1 mV는 반올림해 8 ADC입니다. Falling edge라면 frontend가 `round(measured_baseline[ch]) - 8`, rising edge라면 `+ 8`을 채널별로 기록합니다. 범위·DCOffset·polarity·threshold 및 pair/global trigger register readback이 하나라도 요청값과 다르면 physics acquisition을 시작하지 않습니다. 기존 `TriggerThreshold=<absolute ADC>` 설정도 호환되지만 이 모드에서는 실측 baseline-relative 보정이 적용되지 않습니다.
 
-`[SoftwareDSP]`의 `BaselineSamples`, `ShortGate`, `LongGate`와
-`PulseStartThresholdAdc`는 production 변환기가 실제로 사용하는 값입니다. ROOT에는
-적용한 DSP schema와 설정을 기록하고 `ShortCharge_CH*`, `Charge_CH*`, baseline,
-pulse height, T0를 같은 공통 알고리즘으로 생성합니다. 설정한 gate가 pre/post-trigger
-범위를 벗어나거나 `ShortGate > LongGate`이면 변환 전에 거부합니다.
+현재 production DSP schema 3은 `[SoftwareDSP] BaselineSamples`로 baseline을 구한 뒤
+polarity를 보정한 파형에서 높이가 가장 큰 샘플을 찾습니다. `Charge_CH*`는 그 peak를
+기준으로 **[-20 ns, +40 ns)**, 즉 2 ns/sample에서 `[peak-10, peak+20)` 구간을
+파형 경계 안으로 잘라 signed 합한 값입니다. 양·음 성분을 모두 더해 노이즈가
+상쇄되며 최종 음수 값도 0으로 자르지 않습니다. `ShortCharge_CH*`는 schema 3에서
+`Charge_CH*`와 같은 값이고, `PulseStart_T0_CH*`에는 threshold crossing이 아니라
+peak 시각이 기록됩니다.
+
+`ShortGate`, `LongGate`, `PulseStartThresholdAdc`는 현재 schema 3의 charge 적분에는
+사용하지 않습니다. 이 값들은 기존 schema 1/2 파일의 재현과 설정 provenance를 위해
+계속 저장·검증되며, schema 1/2에서만 threshold 기준 고정 gate를 정의합니다.
+
+GUI의 **Time & DSP Calculator**는 `RecordLength`를 x730의 10-sample 단위로 올림
+정규화하고, 하드웨어 `PostTrigger` quantization readback을 예측한 뒤 그
+pre/post 구간에 맞춰 `RecordLength`, `PostTrigger`, `BaselineSamples`,
+`ShortGate`, `LongGate`를 함께 반영합니다. 여기서 gate 두 값은 schema 1/2 호환성과
+provenance를 위한 legacy 설정이며 schema 3의 peak-centered window를 바꾸지 않습니다.
 
 전면 패널 `TRG-IN`만 사용하는 외부 트리거 전용 구성은 다음처럼 self-trigger 참여 마스크를 0으로 둡니다. 이 모드에서는 `PairLogic`을 하드웨어에 적용하지 않으며, 외부 트리거가 들어올 때 `ChannelMask`에 포함된 채널이 기록됩니다.
 
@@ -265,6 +277,34 @@ SelfTriggerMode=0
 [HardwareCoincidence]
 PairLogic=OR
 ```
+
+### 소프트웨어 랜덤 트리거
+
+GUI의 **Hardware Config → Trigger source → Software Random**을 선택하면
+`ExtTriggerMode`, `SelfTriggerMode`, `SelfTriggerMask`가 모두 0으로 자동
+맞춰집니다. **Random mean rate (Hz)**에 원하는 평균 발생률을 입력하고 설정을
+저장하면 됩니다. 간격은 고정 주기가 아니라 지수분포에서 뽑으므로 트리거 시각은
+지정한 평균 rate를 갖는 Poisson 과정입니다.
+
+```ini
+[Digitizer]
+ChannelMask=15
+SelfTriggerMask=0
+ExtTriggerMode=0
+SelfTriggerMode=0
+SoftwareRandomTriggerMode=1
+SoftwareRandomTriggerRateHz=100
+
+[HardwareCoincidence]
+PairLogic=OR
+```
+
+허용 범위는 `0.001 <= rate <= 100000 Hz`이며 랜덤 모드는 self/external trigger와
+동시에 사용할 수 없습니다. 호스트나 readout이 늦어진 경우 밀린 트리거를 한꺼번에
+보내지 않으므로 실제 유효 rate는 요청값보다 낮아질 수 있습니다. 요청 rate, 난수
+seed, 송신 횟수, 유효 rate는 run metadata에 기록됩니다. 장비 처리량보다 지나치게
+높은 rate를 지정해 event memory가 FULL이 되면 기존 무결성 보호 로직이 run을
+중단합니다.
 
 ### 저장 공간 안전 여유
 
@@ -380,7 +420,7 @@ run bundle을 다른 디스크나 호스트로 옮길 때는 raw, `<raw>.config.
 
 GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-events`를 생략하면 전체 tree를 검사하며, JSON 보고서는 stdout, 진행률/진단은 stderr로 분리됩니다. `--max-events`로 제한하면 tree의 선두 event prefix만 검사해 빠른 이상 탐지를 제공합니다. 이 prefix 모드는 큰 ROOT/raw를 전부 읽지 않도록 전체 ROOT 및 외부 artifact SHA-256을 의도적으로 생략하고 identity/size만 확인하므로, 보고서는 `WARN`이며 전체 파일에 대한 양성 판정은 `SKIP`으로 남습니다. 특히 metadata가 없는 구형 파일의 cutoff/상대 threshold 추론은 전수 검사에서만 제공합니다.
 
-가장 강한 변환 검증이 필요하면 전체 검사에 `--raw-fidelity`를 추가합니다. GUI에서는 **Full RAW→ROOT conversion fidelity**를 선택하면 scan limit가 자동으로 `All events`로 고정됩니다. 검증기는 ROOT에 기록된 `ResolvedRawInputPath`만 `O_NOFOLLOW` 읽기 전용 descriptor로 고정하고 metadata의 size/SHA-256으로 전부 인증합니다. 실제 비교 패스가 소비한 바이트도 독립 SHA-256으로 다시 결박합니다. 이어서 모든 RAW `EventHeader`를 ROOT의 EventID/TTT/shape/pattern/board counter와 비교하고, 파형이 저장된 ROOT는 모든 ADC sample을 정확히 대조합니다. 파형을 저장하지 않은 ROOT는 RAW payload에서 production과 같은 DSP를 다시 계산해 baseline/QShort/QLong/pulse height/T0를 대조하되 ROOT waveform sample 일치를 주장하지 않습니다. malformed/truncated/검사 중 변경된 RAW는 FAIL입니다.
+가장 강한 변환 검증이 필요하면 전체 검사에 `--raw-fidelity`를 추가합니다. GUI에서는 **Full RAW→ROOT conversion fidelity**를 선택하면 scan limit가 자동으로 `All events`로 고정됩니다. 검증기는 ROOT에 기록된 `ResolvedRawInputPath`만 `O_NOFOLLOW` 읽기 전용 descriptor로 고정하고 metadata의 size/SHA-256으로 전부 인증합니다. 실제 비교 패스가 소비한 바이트도 독립 SHA-256으로 다시 결박합니다. 이어서 모든 RAW `EventHeader`를 ROOT의 EventID/TTT/shape/pattern/board counter와 비교하고, 파형이 저장된 ROOT는 모든 ADC sample을 정확히 대조합니다. 파형을 저장하지 않은 ROOT는 RAW payload에서 기록된 DSP schema와 같은 알고리즘을 다시 계산해 baseline/ShortCharge/Charge/pulse height/T0를 대조하되 ROOT waveform sample 일치를 주장하지 않습니다. malformed/truncated/검사 중 변경된 RAW는 FAIL입니다.
 
 ```bash
 ./bin/root_validate_dt5730 -i /absolute/run021_prod.root \
@@ -399,10 +439,10 @@ GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-
 
 ### GUI 탭(Tab)별 기능 명세서
 * **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, publish API failure 등) 및 컬러 파싱 터미널 창 제공.
-* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
-* **📈 Live Monitor:** ZMQ 소켓 실시간 파형(Waveform) 모니터링 및 에너지 전하량(Q-Long) 동적 적분 스펙트럼. 활성 채널 자동 감지 오버레이 및 누적 히스토리 사이즈 조절 지원.
-* **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, Micro-Time(T0) 추출, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
-* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event 또는 제한 prefix를 검사합니다. file identity/SHA-256, ROOT recovery/schema/branch, EventID/TTT/counter/shape, summary, finite/range/saturation, baseline settling, threshold 실효값, routing, embedded config/metadata/binary provenance를 영역별 PASS/WARN/FAIL로 표시합니다. 선택적으로 모든 RAW header·sample·DSP 결과와 ROOT를 정확히 대조하며, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
+* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, self/external/software-random 소스와 평균 rate, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
+* **📈 Live Monitor:** ZMQ 소켓 실시간 파형과 baseline-subtracted full-waveform signed charge 스펙트럼을 표시합니다. 활성 채널 자동 감지 오버레이와 기본 100,000개/Unlimited history를 지원하며, 이 preview 적분은 production ROOT schema 3의 peak-centered charge와 별개입니다.
+* **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, schema 3 polarity-corrected peak T0 기록, `[-20 ns,+40 ns)` signed charge, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
+* **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event 또는 제한 prefix를 검사합니다. file identity/SHA-256, ROOT recovery/schema/branch, EventID/TTT/counter/shape, summary, finite/range/saturation, baseline settling, threshold 실효값, routing, embedded config/metadata/binary provenance를 영역별 PASS/WARN/FAIL로 표시합니다. 검증 결과에는 production `Charge_CHn`의 채널별 히스토그램과 full/prefix/stride 표본 범위도 함께 표시됩니다. 선택적으로 모든 RAW header·sample·DSP 결과와 ROOT를 정확히 대조하며, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 
 ---

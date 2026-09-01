@@ -21,14 +21,17 @@ from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
 
 import numpy as np
 
+from core.dt5730_constraints import (
+    MAX_RECORD_LENGTH,
+    MIN_RECORD_LENGTH,
+    RECORD_LENGTH_GRANULARITY,
+)
+
 
 EVENT_HEADER_FORMAT = "<QIIHHI"
 EVENT_HEADER_BYTES = struct.calcsize(EVENT_HEADER_FORMAT)
 MAX_CHANNELS = 8
 SUPPORTED_CHANNEL_MASK = (1 << MAX_CHANNELS) - 1
-MIN_RECORD_LENGTH = 128
-MAX_RECORD_LENGTH = 102400
-RECORD_LENGTH_GRANULARITY = 8
 ADC_BITS = 14
 ADC_MAX_CODE = (1 << ADC_BITS) - 1
 MAX_MONITOR_FRAME_BYTES = (
@@ -180,14 +183,15 @@ def decode_monitor_frame(frame: bytes) -> DecodedMonitorFrame:
         )
     if not MIN_RECORD_LENGTH <= header.record_length <= MAX_RECORD_LENGTH:
         raise MonitorFrameError(
-            "RecordLength is outside the supported 128..102400 range"
+            "RecordLength is outside the supported 130..102400 range"
         )
     if header.record_length % RECORD_LENGTH_GRANULARITY:
-        raise MonitorFrameError("RecordLength must be a multiple of 8")
+        raise MonitorFrameError("RecordLength must be a multiple of 10")
     if header.board_event_counter > 0xFFFFFF:
         raise MonitorFrameError("BoardEventCounter exceeds the hardware 24-bit range")
 
-    active_channels = header.channel_mask.bit_count()
+    # Python 3.9 is still supported by the deployed GUI launcher.
+    active_channels = bin(header.channel_mask).count("1")
     sample_count = header.record_length * active_channels
     expected_size = EVENT_HEADER_BYTES + sample_count * 2
     if frame_size < expected_size:
@@ -443,7 +447,7 @@ def analyze_monitor_waveform(
     waveform: Sequence[int] | np.ndarray,
     polarity: str,
 ) -> MonitorDspResult:
-    """Compute monitor-only charge/height in the configured pulse direction."""
+    """Compute signed monitor charge and height in the pulse direction."""
 
     if polarity not in ("falling", "rising"):
         raise ValueError("polarity must be 'falling' or 'rising'")
@@ -475,7 +479,9 @@ def analyze_monitor_waveform(
     else:
         directed = samples - baseline
         pulse_height = max(0.0, maximum - baseline)
-    charge = float(np.maximum(directed, 0.0).sum(dtype=np.float64))
+    # Keep both signs after baseline subtraction. Opposite-polarity noise then
+    # cancels statistically instead of accumulating a positive rectifier bias.
+    charge = float(directed.sum(dtype=np.float64))
 
     return MonitorDspResult(
         baseline=baseline,

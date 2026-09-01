@@ -14,6 +14,7 @@ from core.root_validation_output import (  # noqa: E402
     parse_validation_output,
     parse_validation_progress,
     status_counts,
+    validated_charge_histograms,
     validate_report_envelope,
 )
 
@@ -75,7 +76,118 @@ def envelope_report(*, max_events=None, raw_fidelity=False):
     return report
 
 
+def charge_histogram(
+    *,
+    available=True,
+    edges=None,
+    counts=None,
+    values_sampled=3,
+    events_scanned=3,
+    sample_stride=1,
+    sampled=False,
+    coverage="full_scan",
+):
+    return {
+        "available": available,
+        "source_branch": "Charge_CH0",
+        "unit": "ADC.sample",
+        "binning": "linear",
+        "bin_edges": [0.0, 10.0, 20.0] if edges is None else edges,
+        "counts": [1, 2] if counts is None else counts,
+        "values_sampled": values_sampled,
+        "events_scanned": events_scanned,
+        "sample_stride": sample_stride,
+        "sampled": sampled,
+        "coverage": coverage,
+    }
+
+
 class RootValidationOutputTests(unittest.TestCase):
+    def test_charge_histogram_schema_is_validated_and_channel_sorted(self):
+        channel_two = charge_histogram(
+            edges=[10.0, 20.0],
+            counts=[2],
+            values_sampled=2,
+            events_scanned=4,
+            sample_stride=2,
+            sampled=True,
+            coverage="stride_sampled_full_scan",
+        )
+        channel_two["source_branch"] = "Charge_CH2"
+        unavailable = charge_histogram(
+            available=False,
+            edges=[],
+            counts=[],
+            values_sampled=2,
+            events_scanned=2,
+        )
+        unavailable["source_branch"] = "Charge_CH1"
+        channels = [
+            {"channel": 2, "charge_histogram": channel_two},
+            {"channel": 1, "charge_histogram": unavailable},
+            {"channel": 0, "charge_histogram": charge_histogram()},
+        ]
+
+        histograms = validated_charge_histograms(channels)
+
+        self.assertEqual(sorted(histograms), [0, 1, 2])
+        self.assertEqual(histograms[0]["bin_edges"], [0.0, 10.0, 20.0])
+        self.assertEqual(histograms[0]["counts"], [1, 2])
+        self.assertEqual(histograms[0]["values_sampled"], 3)
+        self.assertFalse(histograms[1]["available"])
+        self.assertEqual(histograms[1]["bin_edges"], [])
+        self.assertEqual(histograms[1]["counts"], [])
+        self.assertEqual(histograms[1]["values_sampled"], 2)
+        self.assertTrue(histograms[2]["sampled"])
+        self.assertEqual(histograms[2]["sample_stride"], 2)
+
+    def test_charge_histogram_schema_is_optional_for_legacy_reports(self):
+        self.assertEqual(
+            validated_charge_histograms(sample_report()["channels"]), {}
+        )
+
+    def test_charge_histogram_schema_rejects_corrupt_bin_invariants(self):
+        corrupt_payloads = {
+            "edge_count_mismatch": charge_histogram(
+                edges=[0.0, 10.0], counts=[1, 2]
+            ),
+            "nonfinite_edge": charge_histogram(
+                edges=[0.0, float("inf"), 20.0]
+            ),
+            "nonincreasing_edges": charge_histogram(
+                edges=[0.0, 10.0, 10.0]
+            ),
+            "negative_count": charge_histogram(counts=[1, -1]),
+            "boolean_count": charge_histogram(counts=[True, 2]),
+            "fractional_count": charge_histogram(counts=[1.5, 2]),
+            "count_sum_mismatch": charge_histogram(
+                counts=[1, 1], values_sampled=3
+            ),
+        }
+        for label, payload in corrupt_payloads.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    validated_charge_histograms(
+                        [{"channel": 0, "charge_histogram": payload}]
+                    )
+
+    def test_report_envelope_rejects_a_present_malformed_histogram(self):
+        report = envelope_report()
+        report["channels"][0]["charge_histogram"] = charge_histogram(
+            counts=[1, -1]
+        )
+
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                report,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
+
     def test_progress_parser_accepts_ansi_spacing_and_fractional_values(self):
         self.assertEqual(
             parse_validation_progress(

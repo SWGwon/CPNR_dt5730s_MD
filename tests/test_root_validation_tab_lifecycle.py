@@ -73,6 +73,48 @@ FAKE_VALIDATOR = textwrap.dedent(
             "FAIL": "FAIL",
             "CANCELLED": "WARN",
         }[status]
+        events_scanned = 2 if completed else 1
+        channels = [{
+            "channel": 0,
+            "active": True,
+            "trigger_enabled": True,
+            "threshold": {"requested_mv": 1.0, "delta_adc": 8},
+            "metrics": {"events": events_scanned},
+        }, {
+            "channel": 1,
+            "active": True,
+            "trigger_enabled": True,
+            "threshold": {"requested_mv": 2.0, "delta_adc": 16},
+            "metrics": {"events": events_scanned},
+        }]
+        if mode != "legacy-no-hist":
+            coverage = "full_scan" if completed else "cancelled_prefix"
+            channels[0]["charge_histogram"] = {
+                "available": True,
+                "source_branch": "Charge_CH0",
+                "unit": "ADC.sample",
+                "binning": "linear",
+                "bin_edges": [0.0, 64.0, 128.0],
+                "counts": [1, 1] if completed else [1, 0],
+                "values_sampled": events_scanned,
+                "events_scanned": events_scanned,
+                "sample_stride": 1,
+                "sampled": False,
+                "coverage": coverage,
+            }
+            channels[1]["charge_histogram"] = {
+                "available": True,
+                "source_branch": "Charge_CH1",
+                "unit": "ADC.sample",
+                "binning": "linear",
+                "bin_edges": [-0.5, 0.5],
+                "counts": [events_scanned],
+                "values_sampled": events_scanned,
+                "events_scanned": events_scanned,
+                "sample_stride": 1,
+                "sampled": False,
+                "coverage": coverage,
+            }
         return {
             "schema_version": 1,
             "overall_status": status,
@@ -96,10 +138,14 @@ FAKE_VALIDATOR = textwrap.dedent(
                 "completed": completed,
                 "cancelled": status == "CANCELLED",
                 "events_total": 2,
-                "events_scanned": 1 if not completed else 2,
+                "events_scanned": events_scanned,
                 "sampled": not completed,
             },
-            "summary": {"entries": 2, "run_number": 42},
+            "summary": {
+                "entries": 2,
+                "run_number": 42,
+                "waveform_dsp_schema": 2,
+            },
             "domain_status": {
                 "data_integrity": check_status,
                 "provenance": "SKIP",
@@ -119,13 +165,7 @@ FAKE_VALIDATOR = textwrap.dedent(
                 "expected": "authenticated envelope",
                 "detail": "hardware-free Qt lifecycle fixture",
             }],
-            "channels": [{
-                "channel": 0,
-                "active": True,
-                "trigger_enabled": True,
-                "threshold": {"requested_mv": 1.0, "delta_adc": 8},
-                "metrics": {"events": 2},
-            }],
+            "channels": channels,
         }
 
     def emit(status="PASS", completed=True, mismatch=False):
@@ -141,6 +181,8 @@ FAKE_VALIDATOR = textwrap.dedent(
     if mode == "success":
         print("[ValidationProgress] 25% | schema", file=sys.stderr, flush=True)
         print("[ValidationProgress] 80% | events", file=sys.stderr, flush=True)
+        emit()
+    elif mode == "legacy-no-hist":
         emit()
     elif mode == "warn":
         emit("WARN")
@@ -331,6 +373,39 @@ class RootValidationTabLifecycleTests(unittest.TestCase):
         self.assertIn("Validation complete", tab.progress_bar.text())
         self.assertEqual(tab.checks_table.rowCount(), 1)
         self.assertGreaterEqual(tab.channels_table.rowCount(), 2)
+        rendered_metric_names = {
+            tab.channels_table.item(row, 3).text()
+            for row in range(tab.channels_table.rowCount())
+        }
+        self.assertFalse(
+            any(
+                name.startswith("charge_histogram")
+                for name in rendered_metric_names
+            )
+        )
+        self.assertEqual(list(tab._charge_histograms), [0, 1])
+        self.assertTrue(tab.charge_hist_channel.isEnabled())
+        self.assertEqual(
+            [
+                tab.charge_hist_channel.itemData(index)
+                for index in range(tab.charge_hist_channel.count())
+            ],
+            [None, 0, 1],
+        )
+        self.assertEqual(len(tab.charge_hist_plot.listDataItems()), 2)
+        channel_one_index = tab.charge_hist_channel.findData(1)
+        self.assertGreaterEqual(channel_one_index, 0)
+        tab.charge_hist_channel.setCurrentIndex(channel_one_index)
+        self.app.processEvents()
+        channel_one_curves = tab.charge_hist_plot.listDataItems()
+        self.assertEqual(len(channel_one_curves), 1)
+        self.assertEqual(channel_one_curves[0].name(), "CH1")
+        x_values, y_values = channel_one_curves[0].getData()
+        self.assertEqual(x_values.tolist(), [-0.5, 0.5])
+        self.assertEqual(y_values.tolist(), [2])
+        self.assertIn("CH1", tab.lbl_charge_hist_info.text())
+        self.assertIn("2/2", tab.lbl_charge_hist_info.text())
+        self.assertIn("signed schema 2", tab.lbl_charge_hist_info.text())
         self.assertTrue(tab.btn_export.isEnabled())
         self.assertTrue(tab._result_identity_timer.isActive())
         self.assertIn("Report received", tab.log_console.toPlainText())
@@ -343,6 +418,18 @@ class RootValidationTabLifecycleTests(unittest.TestCase):
             str(self.validator.resolve()),
         )
         self.assert_controls_recovered(tab)
+
+    def test_legacy_report_without_charge_histograms_stays_usable(self):
+        root_path = self.make_input("legacy-no-hist.root", "legacy-no-hist")
+        tab = self.make_tab(root_path)
+
+        self.run_success(tab)
+
+        self.assertEqual(tab.lbl_overall.text(), "PASS")
+        self.assertEqual(tab._charge_histograms, {})
+        self.assertFalse(tab.charge_hist_channel.isEnabled())
+        self.assertEqual(tab.charge_hist_plot.listDataItems(), [])
+        self.assertTrue(tab.btn_export.isEnabled())
 
     def test_nonzero_warn_and_fail_exit_codes_render_exportable_reports(self):
         for mode, expected_status in (("warn", "WARN"), ("fail", "FAIL")):
@@ -582,6 +669,9 @@ class RootValidationTabLifecycleTests(unittest.TestCase):
         self.assertEqual(tab.lbl_overall.text(), "NOT RUN")
         self.assertEqual(tab.checks_table.rowCount(), 0)
         self.assertEqual(tab.channels_table.rowCount(), 0)
+        self.assertEqual(tab._charge_histograms, {})
+        self.assertFalse(tab.charge_hist_channel.isEnabled())
+        self.assertEqual(tab.charge_hist_plot.listDataItems(), [])
         self.assertEqual(tab.progress_bar.text(), "Idle")
         self.assertIn("launch blocked", tab.log_console.toPlainText())
         self.assert_controls_recovered(tab)

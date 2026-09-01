@@ -55,7 +55,7 @@ Fixture ValidFixture() {
   Fixture fixture;
   fixture.header.ExtendedTTT = 1000U;
   fixture.header.EventID = 0U;
-  fixture.header.RecordLength = 128U;
+  fixture.header.RecordLength = 130U;
   fixture.header.ChannelMask = 1U;
   fixture.header.Pattern = 7U;
   fixture.header.BoardEventCounter = 55U;
@@ -78,21 +78,43 @@ void WriteFixture(const fs::path& path, const Fixture& fixture) {
   if (!output) throw std::runtime_error("Cannot finish test RAW");
 }
 
-cpnr::RawRootFidelitySettings Settings(const fs::path& path) {
+cpnr::WaveformDspSettings DspSettings(std::uint32_t schema) {
+  cpnr::WaveformDspSettings settings;
+  settings.baseline_samples = 32U;
+  settings.short_gate_samples = 2U;
+  settings.long_gate_samples = 4U;
+  settings.pulse_start_threshold_adc = 30.0;
+  settings.integrate_from_pulse_start = true;
+  settings.legacy_adaptive_baseline = false;
+  settings.preserve_signed_charge =
+      schema != cpnr::kWaveformDspSchemaClampedCharge;
+  settings.integration_mode =
+      schema == cpnr::kWaveformDspSchemaPeakCenteredCharge
+          ? cpnr::WaveformDspIntegrationMode::kPeakCenteredWindow
+          : cpnr::WaveformDspIntegrationMode::kThresholdAnchoredGates;
+  return settings;
+}
+
+cpnr::RawRootFidelitySettings Settings(
+    const fs::path& path,
+    std::uint32_t schema = cpnr::kWaveformDspCurrentSchema) {
   cpnr::RawRootFidelitySettings settings;
   settings.resolved_raw_path = fs::absolute(path).string();
   settings.expected_size_bytes = fs::file_size(path);
   settings.expected_sha256 = Sha256FileHex(path.string());
   settings.expected_events = 1U;
-  settings.expected_record_length = 128U;
+  settings.expected_record_length = 130U;
   settings.expected_channel_mask = 1U;
   settings.falling_polarity = true;
+  settings.waveform_dsp = DspSettings(schema);
   settings.compare_short_charge = true;
   return settings;
 }
 
 cpnr::RawRootEventView View(const Fixture& fixture,
-                            bool include_waveform = true) {
+                            bool include_waveform = true,
+                            std::uint32_t schema =
+                                cpnr::kWaveformDspCurrentSchema) {
   cpnr::RawRootEventView view;
   view.entry = 0U;
   view.sync_time_ttt = fixture.header.ExtendedTTT;
@@ -103,7 +125,8 @@ cpnr::RawRootEventView View(const Fixture& fixture,
   view.board_event_counter = fixture.header.BoardEventCounter;
   view.pulse_start_ns.fill(-1.0);
   const cpnr::WaveformDspValues dsp = cpnr::ComputeWaveformDsp(
-      fixture.waveform.data(), fixture.waveform.size(), true);
+      fixture.waveform.data(), fixture.waveform.size(), true,
+      DspSettings(schema));
   view.baseline[0] = dsp.baseline;
   view.short_charge[0] = dsp.short_charge;
   view.charge[0] = dsp.charge;
@@ -112,6 +135,65 @@ cpnr::RawRootEventView View(const Fixture& fixture,
   view.waveforms_saved = include_waveform;
   if (include_waveform) view.waveforms[0] = &fixture.waveform;
   return view;
+}
+
+void Expect(bool condition, const std::string& detail);
+
+void TestWaveformDspSchemaDispatch(const fs::path& directory) {
+  Fixture fixture = ValidFixture();
+  fixture.waveform.assign(fixture.header.RecordLength, 1000U);
+  fixture.waveform[64U] = 960U;  // First legacy threshold crossing: +40 ADC.
+  fixture.waveform[65U] = 1020U;
+  fixture.waveform[66U] = 1020U;
+  fixture.waveform[67U] = 1020U;
+  fixture.waveform[75U] = 950U;  // Largest directed peak: +50 ADC.
+  const fs::path raw = directory / "dsp-schema-dispatch.dat";
+  WriteFixture(raw, fixture);
+
+  const cpnr::RawRootEventView schema1 = View(
+      fixture, false, cpnr::kWaveformDspSchemaClampedCharge);
+  Expect(schema1.short_charge[0] == 20.0,
+         "Schema 1 did not use the threshold-anchored ShortGate");
+  Expect(schema1.charge[0] == 0.0,
+         "Schema 1 did not clamp the negative threshold-gate integral");
+  Expect(schema1.pulse_start_ns[0] == 128.0,
+         "Schema 1 T0 did not retain threshold-crossing semantics");
+
+  const cpnr::RawRootEventView schema2 = View(
+      fixture, false, cpnr::kWaveformDspSchemaSignedCharge);
+  Expect(schema2.short_charge[0] == 20.0,
+         "Schema 2 did not use the threshold-anchored ShortGate");
+  Expect(schema2.charge[0] == -20.0,
+         "Schema 2 did not preserve the signed threshold-gate integral");
+  Expect(schema2.pulse_start_ns[0] == 128.0,
+         "Schema 2 T0 did not retain threshold-crossing semantics");
+
+  const cpnr::RawRootEventView schema3 = View(
+      fixture, false, cpnr::kWaveformDspSchemaPeakCenteredCharge);
+  Expect(schema3.short_charge[0] == -10.0 &&
+             schema3.charge[0] == -10.0,
+         "Schema 3 did not use the signed peak-centered window/alias");
+  Expect(schema3.pulse_height[0] == 50.0 &&
+             schema3.pulse_start_ns[0] == 150.0,
+         "Schema 3 did not anchor height and T0 at the largest peak");
+
+  for (const std::uint32_t schema : {
+           cpnr::kWaveformDspSchemaClampedCharge,
+           cpnr::kWaveformDspSchemaSignedCharge,
+           cpnr::kWaveformDspSchemaPeakCenteredCharge}) {
+    cpnr::RawRootFidelityVerifier verifier(Settings(raw, schema));
+    verifier.CompareEvent(View(fixture, true, schema));
+    Expect(verifier.Finish().ExactMatch(),
+           "RAW fidelity rejected matching waveform DSP schema " +
+               std::to_string(schema));
+  }
+
+  cpnr::RawRootFidelityVerifier mismatched_verifier(
+      Settings(raw, cpnr::kWaveformDspSchemaPeakCenteredCharge));
+  mismatched_verifier.CompareEvent(
+      View(fixture, false, cpnr::kWaveformDspSchemaSignedCharge));
+  Expect(!mismatched_verifier.Finish().ExactMatch(),
+         "RAW fidelity accepted schema-2 scalars under schema-3 settings");
 }
 
 void Expect(bool condition, const std::string& detail) {
@@ -141,7 +223,7 @@ void TestExactWaveformAndScalarModes(const fs::path& directory) {
   Expect(waveform_result.compared_bytes_sha256 ==
              waveform_result.authenticated_sha256,
          "Comparison pass bytes were not bound to the authenticated digest");
-  Expect(waveform_result.waveform_samples_compared == 128U,
+  Expect(waveform_result.waveform_samples_compared == 130U,
          "Waveform comparison did not cover every sample");
 
   cpnr::RawRootFidelityVerifier scalar_verifier(Settings(raw));
@@ -153,6 +235,25 @@ void TestExactWaveformAndScalarModes(const fs::path& directory) {
          "Scalar comparison pass bytes were not digest-bound");
   Expect(!scalar_result.waveforms_compared,
          "Scalar-only fixture unexpectedly claimed waveform comparison");
+}
+
+void TestLegacyEightSampleGranularity(const fs::path& directory) {
+  Fixture fixture = ValidFixture();
+  fixture.header.RecordLength = 128U;
+  fixture.waveform.resize(fixture.header.RecordLength);
+  const fs::path raw = directory / "legacy-granularity-8.dat";
+  WriteFixture(raw, fixture);
+
+  cpnr::RawRootFidelitySettings settings = Settings(raw);
+  settings.expected_record_length = fixture.header.RecordLength;
+  settings.expected_record_length_granularity = 8U;
+  cpnr::RawRootFidelityVerifier verifier(settings);
+  verifier.CompareEvent(View(fixture, true));
+  const cpnr::RawRootFidelityResult result = verifier.Finish();
+  Expect(result.ExactMatch(),
+         "Authenticated legacy 8-sample fixture mismatched");
+  Expect(result.waveform_samples_compared == fixture.header.RecordLength,
+         "Legacy comparison did not cover every waveform sample");
 }
 
 void TestContentMismatchAccounting(const fs::path& directory) {
@@ -187,7 +288,7 @@ void TestContentMismatchAccounting(const fs::path& directory) {
 void TestMalformedHeaderFailsClosed(const fs::path& directory) {
   Fixture fixture = ValidFixture();
   fixture.header.RecordLength = 120U;
-  // Preserve the expected 280-byte event size so authentication succeeds and
+  // Preserve the expected 284-byte event size so authentication succeeds and
   // the malformed EventHeader is rejected by the streaming parser itself.
   const fs::path raw = directory / "malformed.dat";
   WriteFixture(raw, fixture);
@@ -255,6 +356,8 @@ int main() {
   try {
     TemporaryDirectory temporary;
     TestExactWaveformAndScalarModes(temporary.path());
+    TestWaveformDspSchemaDispatch(temporary.path());
+    TestLegacyEightSampleGranularity(temporary.path());
     TestContentMismatchAccounting(temporary.path());
     TestMalformedHeaderFailsClosed(temporary.path());
     TestInPlaceChangeFailsIdentityCheck(temporary.path());

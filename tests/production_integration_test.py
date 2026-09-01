@@ -49,6 +49,7 @@ def metadata_for(
     config: Path = CONFIG,
     polarity: str = "falling",
     schema_version: int = 2,
+    waveform_dsp_schema: int = 2,
 ) -> dict:
     parsed_config = configparser.ConfigParser()
     parsed_config.optionxform = str
@@ -75,7 +76,7 @@ def metadata_for(
     coincidence_window = parsed_config.getint(
         "SoftwareDSP", "CoincidenceWindow", fallback=20
     )
-    event_bytes = 24 + 4 * 512 * 2
+    event_bytes = 24 + 4 * 520 * 2
     raw_size = raw.stat().st_size
     structurally_complete = raw_size % event_bytes == 0
     recorded_events = raw_size // event_bytes if structurally_complete else 0
@@ -104,7 +105,7 @@ def metadata_for(
         if first_ttt is not None and last_ttt is not None
         else None
     )
-    window_sum = recorded_events * 512 * 2.0e-9
+    window_sum = recorded_events * 520 * 2.0e-9
     window_ratio = (
         100.0 * window_sum / elapsed if elapsed is not None and elapsed > 0
         else None
@@ -235,7 +236,7 @@ def metadata_for(
             "dc_offset_dac_bits": 16,
             "latest_acquisition_status_register": 384,
             "latest_board_failure_status_register": 0,
-            "waveform_dsp_schema": 1,
+            "waveform_dsp_schema": waveform_dsp_schema,
             "dsp_baseline_samples": dsp_baseline,
             "dsp_short_gate_samples": dsp_short,
             "dsp_long_gate_samples": dsp_long,
@@ -255,7 +256,8 @@ def metadata_for(
             "trigger_polarity": polarity,
             "record_mask": 15,
             "record_mask_readback": 15,
-            "record_length": 512,
+            "record_length_granularity_samples": 10,
+            "record_length": 520,
             "post_trigger_percent": 60,
             "post_trigger_readback_percent": 60,
             "external_trigger_mode": 0,
@@ -268,6 +270,15 @@ def metadata_for(
         },
         "channels": channels,
     }
+    if schema_version >= 2 and waveform_dsp_schema == 3:
+        result["hardware"].update({
+            "dsp_charge_anchor": "polarity_corrected_peak",
+            "dsp_charge_window_pre_ns": 20,
+            "dsp_charge_window_post_ns": 40,
+            "dsp_charge_window_samples": 30,
+            "dsp_short_charge_semantics": "alias_of_charge",
+            "dsp_pulse_time_semantics": "polarity_corrected_peak_sample",
+        })
     if schema_version == 1:
         for key in (
             "termination_reason",
@@ -316,6 +327,7 @@ def metadata_for(
             "dsp_long_gate_samples",
             "dsp_pulse_start_threshold_adc",
             "software_coincidence_window_ns",
+            "record_length_granularity_samples",
         ):
             result["hardware"].pop(key)
     return result
@@ -347,8 +359,9 @@ def write_polarity_fixture(
     polarity: str,
     *,
     board_counters: tuple[int, int] = (100, 101),
+    opposite_record_only_pulse: bool = False,
 ) -> None:
-    record_length = 512
+    record_length = 520
     baselines = (16164, 16255, 8192, 8192)
     pulse_delta = -64 if polarity == "falling" else 64
     patterns = (0xA55A, 0x5AA5)
@@ -367,6 +380,8 @@ def write_polarity_fixture(
                 waveform = [baseline] * record_length
                 if channel in (0, 1):
                     waveform[200:208] = [baseline + pulse_delta] * 8
+                elif channel == 2 and opposite_record_only_pulse:
+                    waveform[200:208] = [baseline - pulse_delta] * 8
                 stream.write(struct.pack(
                     f"<{record_length}H", *waveform
                 ))
@@ -376,7 +391,7 @@ class ProductionIntegrationTests(unittest.TestCase):
     def test_event_id_ttt_and_loss_policy_fail_closed(self):
         with tempfile.TemporaryDirectory(prefix="cpnr_semantic_raw_test_") as temp:
             directory = Path(temp)
-            event_bytes = struct.calcsize("<QIIHHI") + 4 * 512 * 2
+            event_bytes = struct.calcsize("<QIIHHI") + 4 * 520 * 2
 
             for label, mutate, expected in (
                 (
@@ -524,6 +539,194 @@ auto *baseline = dynamic_cast<TParameter<int>*>(f.Get("DspBaselineSamples"));
 auto *short_gate = dynamic_cast<TParameter<int>*>(f.Get("DspShortGateSamples"));
 auto *long_gate = dynamic_cast<TParameter<int>*>(f.Get("DspLongGateSamples"));
 if (!baseline || baseline->GetVal() != 100 || !short_gate || short_gate->GetVal() != 4 || !long_gate || long_gate->GetVal() != 6) gSystem->Exit(3);
+'''
+            root_check = subprocess.run(
+                [str(ROOT), "-l", "-b", "-q", "-e", expression],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                root_check.returncode,
+                0,
+                root_check.stdout + root_check.stderr,
+            )
+
+    def test_charge_schema_preserves_signed_record_only_integrals(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_signed_charge_") as temp:
+            directory = Path(temp)
+            raw = directory / "opposite_record_only.dat"
+            write_polarity_fixture(
+                raw,
+                "falling",
+                opposite_record_only_pulse=True,
+            )
+
+            cases = (
+                # With BaselineSamples=163 and no falling-pulse T0 on CH2,
+                # ShortGate=40 sees three +64-ADC opposite-polarity samples;
+                # LongGate=200 sees all eight.
+                ("signed-v2", 2, 2, 2, -192.0, -512.0),
+                ("clamped-v2", 2, 1, 1, 0.0, 0.0),
+                # Runtime metadata v1 predates hardware.waveform_dsp_schema
+                # and therefore retains the schema-1 clamped contract.
+                ("legacy-runtime-v1", 1, 2, 1, 0.0, 0.0),
+            )
+            for (
+                label,
+                runtime_schema,
+                requested_dsp_schema,
+                expected_root_schema,
+                expected_short,
+                expected_long,
+            ) in cases:
+                with self.subTest(label=label):
+                    run_number = {
+                        "signed-v2": 81,
+                        "clamped-v2": 82,
+                        "legacy-runtime-v1": 83,
+                    }[label]
+                    metadata = directory / f"{label}.run.json"
+                    metadata.write_text(
+                        json.dumps(
+                            metadata_for(
+                                raw,
+                                metadata,
+                                run_number,
+                                schema_version=runtime_schema,
+                                waveform_dsp_schema=requested_dsp_schema,
+                            ),
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    output = directory / f"{label}.root"
+                    result = run_converter(
+                        raw,
+                        metadata,
+                        output,
+                        run_number,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+
+                    expression = f'''
+TFile f({json.dumps(str(output))});
+auto *tree = dynamic_cast<TTree*>(f.Get("phys_tree"));
+auto *schema = dynamic_cast<TParameter<int>*>(f.Get("WaveformDspSchema"));
+Double_t short0 = 0.0, long0 = 0.0;
+Double_t short2 = 0.0, long2 = 0.0;
+Double_t pulse2 = 0.0, t0_2 = 0.0;
+if (!tree || !schema || schema->GetVal() != {expected_root_schema}) gSystem->Exit(1);
+if (tree->SetBranchAddress("ShortCharge_CH0", &short0) < 0 || tree->SetBranchAddress("Charge_CH0", &long0) < 0) gSystem->Exit(2);
+if (tree->SetBranchAddress("ShortCharge_CH2", &short2) < 0 || tree->SetBranchAddress("Charge_CH2", &long2) < 0) gSystem->Exit(3);
+if (tree->SetBranchAddress("PulseHeight_CH2", &pulse2) < 0 || tree->SetBranchAddress("PulseStart_T0_CH2", &t0_2) < 0) gSystem->Exit(4);
+tree->GetEntry(0);
+if (short0 != 512.0 || long0 != 512.0) gSystem->Exit(5);
+if (short2 != {expected_short} || long2 != {expected_long}) gSystem->Exit(6);
+if (pulse2 != 0.0 || t0_2 != -1.0) gSystem->Exit(7);
+'''
+                    root_check = subprocess.run(
+                        [str(ROOT), "-l", "-b", "-q", "-e", expression],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        root_check.returncode,
+                        0,
+                        root_check.stdout + root_check.stderr,
+                    )
+
+    def test_schema3_charge_uses_peak_centered_window_not_threshold_or_gates(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_peak_charge_") as temp:
+            directory = Path(temp)
+            config_text = CONFIG.read_text(encoding="utf-8")
+            for key, value in (("ShortGate", 2000), ("LongGate", 1500)):
+                pattern = rf"(?m)^(\s*{key}\s*=\s*)[^#\n]+?(\s*(?:#.*)?)$"
+                config_text, replacements = re.subn(
+                    pattern, rf"\g<1>{value}\2", config_text, count=1
+                )
+                self.assertEqual(replacements, 1)
+            threshold_pattern = (
+                r"(?m)^(\s*PulseStartThresholdAdc\s*=\s*)"
+                r"[^#\n]+?(\s*(?:#.*)?)$"
+            )
+            config_text, replacements = re.subn(
+                threshold_pattern, r"\g<1>0\2", config_text, count=1
+            )
+            if replacements == 0:
+                # Keep the optional key inside [SoftwareDSP]; appending it to
+                # the file would accidentally place it in the final channel
+                # section of the INI-style config.
+                config_text, replacements = re.subn(
+                    r"(?m)^(\s*LongGate\s*=\s*1500\s*(?:#.*)?)$",
+                    r"\1\nPulseStartThresholdAdc = 0",
+                    config_text,
+                    count=1,
+                )
+            self.assertEqual(replacements, 1)
+            config = directory / "peak.conf"
+            config.write_text(config_text, encoding="utf-8")
+
+            record_length = 520
+            baselines = (16164, 16255, 8192, 8192)
+            raw = directory / "peak.dat"
+            with raw.open("wb") as stream:
+                stream.write(struct.pack(
+                    "<QIIHHI", 0, 0, record_length, 0xF, 0, 100
+                ))
+                for channel, baseline in enumerate(baselines):
+                    waveform = [baseline] * record_length
+                    if channel == 0:
+                        waveform[189] = baseline - 10
+                        waveform[190] = baseline - 5
+                        waveform[200] = baseline - 20
+                        waveform[201] = baseline + 4
+                        waveform[219] = baseline - 7
+                        waveform[220] = baseline - 15
+                    stream.write(struct.pack(
+                        f"<{record_length}H", *waveform
+                    ))
+
+            metadata = directory / "peak.run.json"
+            metadata.write_text(
+                json.dumps(
+                    metadata_for(
+                        raw, metadata, 84, config=config,
+                        waveform_dsp_schema=3,
+                    ),
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "peak.root"
+            result = run_converter(raw, metadata, output, 84, config=config)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            expression = f'''
+TFile f({json.dumps(str(output))});
+auto *tree = dynamic_cast<TTree*>(f.Get("phys_tree"));
+auto *schema = dynamic_cast<TParameter<int>*>(f.Get("WaveformDspSchema"));
+auto *pre = dynamic_cast<TParameter<int>*>(f.Get("DspChargeWindowPreNs"));
+auto *post = dynamic_cast<TParameter<int>*>(f.Get("DspChargeWindowPostNs"));
+auto *samples = dynamic_cast<TParameter<int>*>(f.Get("DspChargeWindowSamples"));
+auto *anchor = dynamic_cast<TObjString*>(f.Get("DspChargeAnchor"));
+Double_t qshort = 0.0, charge = 0.0, height = 0.0, peak_time = -1.0;
+if (!tree || !schema || schema->GetVal() != 3) gSystem->Exit(1);
+if (!pre || pre->GetVal() != 20 || !post || post->GetVal() != 40 || !samples || samples->GetVal() != 30) gSystem->Exit(2);
+if (!anchor || TString(anchor->GetString()) != "polarity_corrected_peak") gSystem->Exit(3);
+tree->SetBranchAddress("ShortCharge_CH0", &qshort);
+tree->SetBranchAddress("Charge_CH0", &charge);
+tree->SetBranchAddress("PulseHeight_CH0", &height);
+tree->SetBranchAddress("PulseStart_T0_CH0", &peak_time);
+tree->GetEntry(0);
+if (qshort != 28.0 || charge != 28.0) gSystem->Exit(4);
+if (height != 20.0 || peak_time != 400.0) gSystem->Exit(5);
 '''
             root_check = subprocess.run(
                 [str(ROOT), "-l", "-b", "-q", "-e", expression],
@@ -881,8 +1084,8 @@ if (!timing_schema || timing_schema->GetVal() != 2) gSystem->Exit(12);
 if (!ttt_lsb || ttt_lsb->GetVal() != 8.0) gSystem->Exit(13);
 if (!ttt_resolution || ttt_resolution->GetVal() != 16.0) gSystem->Exit(14);
 if (!real_time || std::abs(real_time->GetVal() - 8.0e-6) > 1.0e-15) gSystem->Exit(15);
-if (!window_sum || std::abs(window_sum->GetVal() - 2.048e-6) > 1.0e-15) gSystem->Exit(16);
-if (!window_ratio || std::abs(window_ratio->GetVal() - 25.6) > 1.0e-12) gSystem->Exit(17);
+if (!window_sum || std::abs(window_sum->GetVal() - 2.08e-6) > 1.0e-15) gSystem->Exit(16);
+if (!window_ratio || std::abs(window_ratio->GetVal() - 26.0) > 1.0e-12) gSystem->Exit(17);
 if (!dead_available || dead_available->GetVal() != 0 || !dead_method || TString(dead_method->GetString()) != "unavailable_no_hardware_busy_or_livetime_scaler") gSystem->Exit(18);
 if (f.Get("LiveTime_sec") || f.Get("DeadTime_pct")) gSystem->Exit(19);
 auto *dsp_schema = dynamic_cast<TParameter<int>*>(f.Get("WaveformDspSchema"));
@@ -890,7 +1093,7 @@ auto *dsp_baseline = dynamic_cast<TParameter<int>*>(f.Get("DspBaselineSamples"))
 auto *dsp_short = dynamic_cast<TParameter<int>*>(f.Get("DspShortGateSamples"));
 auto *dsp_long = dynamic_cast<TParameter<int>*>(f.Get("DspLongGateSamples"));
 auto *dsp_threshold = dynamic_cast<TParameter<double>*>(f.Get("DspPulseStartThresholdAdc"));
-if (!dsp_schema || dsp_schema->GetVal() != 1 || !dsp_baseline || dsp_baseline->GetVal() != 163 || !dsp_short || dsp_short->GetVal() != 40 || !dsp_long || dsp_long->GetVal() != 200 || !dsp_threshold || dsp_threshold->GetVal() != 30.0) gSystem->Exit(21);
+if (!dsp_schema || dsp_schema->GetVal() != 2 || !dsp_baseline || dsp_baseline->GetVal() != 163 || !dsp_short || dsp_short->GetVal() != 40 || !dsp_long || dsp_long->GetVal() != 200 || !dsp_threshold || dsp_threshold->GetVal() != 30.0) gSystem->Exit(21);
 '''
                     root_check = subprocess.run(
                         [str(ROOT), "-l", "-b", "-q", "-e", expression],
@@ -1003,6 +1206,13 @@ if (!dsp_schema || dsp_schema->GetVal() != 1 || !dsp_baseline || dsp_baseline->G
                     "post-trigger readback differs",
                 ),
                 (
+                    "waveform_dsp_schema",
+                    lambda value: value["hardware"].__setitem__(
+                        "waveform_dsp_schema", 4
+                    ),
+                    "waveform_dsp_schema is out of range",
+                ),
+                (
                     "zmq_watermark",
                     lambda value: value["runtime_counters"].__setitem__(
                         "zmq_send_hwm_approx_bytes",
@@ -1082,8 +1292,8 @@ if (!dsp_schema || dsp_schema->GetVal() != 1 || !dsp_baseline || dsp_baseline->G
 
             changed_raw = directory / "changed_run023.dat"
             changed_raw.write_bytes(
-                struct.pack("<QIIHHI", 0, 0, 512, 3, 0, 0) +
-                struct.pack("<1024H", *([16000] * 1024))
+                struct.pack("<QIIHHI", 0, 0, 520, 3, 0, 0) +
+                struct.pack("<1040H", *([16000] * 1040))
             )
             changed_metadata = directory / "changed.run.json"
             changed_metadata.write_text(

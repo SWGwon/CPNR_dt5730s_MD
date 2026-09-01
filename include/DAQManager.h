@@ -137,6 +137,9 @@ private:
   float latest_max_temperature_c_ = 0.0F;
   bool health_readback_available_ = false;
   uint64_t runtime_configuration_checks_ = 0;
+  uint64_t software_random_trigger_seed_ = 0;
+  uint64_t software_random_triggers_sent_ = 0;
+  double software_random_trigger_elapsed_sec_ = 0.0;
   // Counts only failures returned by zmq_send(DONTWAIT).  A PUB socket can
   // silently discard per-subscriber messages at HWM, so this is deliberately
   // not called a delivery/drop counter.

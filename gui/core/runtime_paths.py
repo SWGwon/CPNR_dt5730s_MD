@@ -16,6 +16,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from core.dt5730_constraints import (
+    MAX_RECORD_LENGTH,
+    MIN_RECORD_LENGTH,
+    RECORD_LENGTH_GRANULARITY,
+)
+
 
 RAW_EVENT_HEADER_BYTES = 24
 
@@ -53,9 +59,13 @@ def raw_event_size_bytes(record_length: int, channel_mask: int) -> int:
 
     if isinstance(record_length, bool) or not isinstance(record_length, int):
         raise RuntimeValidationError("RecordLength는 정수여야 합니다.")
-    if record_length < 128 or record_length > 102400 or record_length % 8:
+    if (
+        record_length < MIN_RECORD_LENGTH
+        or record_length > MAX_RECORD_LENGTH
+        or record_length % RECORD_LENGTH_GRANULARITY
+    ):
         raise RuntimeValidationError(
-            "RecordLength는 128..102400 범위의 8의 배수여야 합니다."
+            "RecordLength는 130..102400 범위의 10의 배수여야 합니다."
         )
     if isinstance(channel_mask, bool) or not isinstance(channel_mask, int):
         raise RuntimeValidationError("ChannelMask는 정수여야 합니다.")

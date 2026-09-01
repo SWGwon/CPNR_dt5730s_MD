@@ -15,6 +15,16 @@ from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager, DatabaseError
 from core.process_output import parse_drop_count
 from core.trigger_settings import millivolts_to_adc_delta
+from core.dt5730_constraints import (
+    MAX_RECORD_LENGTH,
+    MAX_PROVENANCE_GATE_SAMPLES,
+    MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    MIN_PRE_TRIGGER_SAMPLES,
+    MIN_RECORD_LENGTH,
+    MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    predict_post_trigger,
+    validate_effective_record_length,
+)
 from core.runtime_paths import (
     RuntimeValidationError,
     build_frontend_command,
@@ -1082,12 +1092,48 @@ class DaqTab(QWidget):
                 )
             return value
 
-        record_length = required_int("Digitizer", "RecordLength", 128, 102400)
+        record_length = required_int(
+            "Digitizer", "RecordLength",
+            MIN_RECORD_LENGTH, MAX_RECORD_LENGTH,
+        )
         channel_mask = required_int("Digitizer", "ChannelMask", 1, (1 << 8) - 1)
         post_trigger = required_int("Digitizer", "PostTrigger", 0, 100)
         required_int("Digitizer", "TriggerPolarity", 0, 1)
         ext_trigger = required_int("Digitizer", "ExtTriggerMode", 0, 1)
         self_trigger = required_int("Digitizer", "SelfTriggerMode", 0, 1)
+        random_trigger_mode = optional_int(
+            "Digitizer", "SoftwareRandomTriggerMode", 0, 0, 1
+        )
+        random_rate_raw = config_data.get("Digitizer", {}).get(
+            "SoftwareRandomTriggerRateHz", "0"
+        )
+        try:
+            random_trigger_rate = float(random_rate_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "실수가 아닌 설정값입니다: [Digitizer] "
+                f"SoftwareRandomTriggerRateHz={random_rate_raw}"
+            ) from exc
+        if not math.isfinite(random_trigger_rate):
+            raise ValueError(
+                "[Digitizer] SoftwareRandomTriggerRateHz는 유한한 값이어야 합니다."
+            )
+        if random_trigger_mode:
+            if not (
+                MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+                <= random_trigger_rate
+                <= MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+            ):
+                raise ValueError(
+                    "Software Random 모드의 SoftwareRandomTriggerRateHz는 "
+                    f"{MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g}.."
+                    f"{MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g} Hz 범위여야 합니다."
+                )
+        elif random_trigger_rate != 0:
+            raise ValueError(
+                "SoftwareRandomTriggerMode=0이면 "
+                "SoftwareRandomTriggerRateHz는 0이어야 합니다."
+            )
 
         input_range_mv = required_int("Digitizer", "InputRangeMv", 500, 2000)
         if input_range_mv not in (500, 2000):
@@ -1132,11 +1178,30 @@ class DaqTab(QWidget):
                 "HardwareCoincidence", "PairLogic", {"AND", "OR"}
             )
 
-        if record_length % 8 != 0:
-            raise ValueError("[Digitizer] RecordLength는 8의 배수여야 합니다.")
-        if record_length * (100 - post_trigger) < 8000:
+        try:
+            validate_effective_record_length(record_length)
+            post_trigger_truth = predict_post_trigger(
+                record_length, post_trigger
+            )
+        except ValueError as exc:
+            raise ValueError(f"[Digitizer] {exc}") from exc
+        if post_trigger_truth.actual_pre_samples < MIN_PRE_TRIGGER_SAMPLES:
             raise ValueError("[Digitizer] 트리거 이전 구간이 최소 160 ns보다 짧습니다.")
-        if ext_trigger == 0 and self_trigger == 0:
+        if post_trigger_truth.actual_post_samples < 1:
+            raise ValueError(
+                "[Digitizer] PostTrigger가 SoftwareDSP용 트리거 이후 "
+                "샘플을 남기지 않습니다."
+            )
+        if random_trigger_mode:
+            if ext_trigger or self_trigger:
+                raise ValueError(
+                    "Software Random은 External/Self trigger와 함께 사용할 수 없습니다."
+                )
+            if self_trigger_mask != 0:
+                raise ValueError(
+                    "Software Random에서는 [Digitizer] SelfTriggerMask를 0으로 설정해야 합니다."
+                )
+        elif ext_trigger == 0 and self_trigger == 0:
             raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
         if self_trigger_mask & ~channel_mask:
             raise ValueError(
@@ -1235,6 +1300,51 @@ class DaqTab(QWidget):
             required_int(
                 "TriggerCalibration", "StableMeasurements", 2, 100
             )
+
+        default_baseline = min(
+            150, post_trigger_truth.actual_pre_samples
+        )
+        baseline_samples = optional_int(
+            "SoftwareDSP", "BaselineSamples", default_baseline,
+            1, record_length,
+        )
+        if baseline_samples > post_trigger_truth.actual_pre_samples:
+            raise ValueError(
+                "[SoftwareDSP] BaselineSamples가 실제 pre-trigger 구간 "
+                f"{post_trigger_truth.actual_pre_samples} samples를 초과합니다."
+            )
+        for gate_key in ("ShortGate", "LongGate"):
+            optional_int(
+                "SoftwareDSP",
+                gate_key,
+                None,
+                1,
+                MAX_PROVENANCE_GATE_SAMPLES,
+            )
+
+        pulse_start_threshold_raw = config_data.get("SoftwareDSP", {}).get(
+            "PulseStartThresholdAdc"
+        )
+        if pulse_start_threshold_raw is not None:
+            try:
+                pulse_start_threshold_adc = float(pulse_start_threshold_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "실수가 아닌 설정값입니다: [SoftwareDSP] "
+                    f"PulseStartThresholdAdc={pulse_start_threshold_raw}"
+                ) from exc
+            maximum_threshold_adc = float((1 << adc_bits) - 1)
+            if not (
+                math.isfinite(pulse_start_threshold_adc)
+                and 0.0
+                <= pulse_start_threshold_adc
+                <= maximum_threshold_adc
+            ):
+                raise ValueError(
+                    "설정값 범위 오류: [SoftwareDSP] "
+                    f"PulseStartThresholdAdc={pulse_start_threshold_raw} "
+                    f"(허용 0..{maximum_threshold_adc:g})"
+                )
 
         self.config_uses_mv_threshold = uses_mv_threshold
         self.validated_storage_settings = {

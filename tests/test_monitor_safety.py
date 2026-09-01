@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - optional outside GUI test runtime
 def make_frame(
     event_id=0,
     *,
-    record_length=128,
+    record_length=130,
     channel_mask=0x03,
     waveforms=None,
     board_event_counter=None,
@@ -74,8 +74,8 @@ def make_frame(
 
 class MonitorStreamPureTests(unittest.TestCase):
     def test_strict_little_endian_decoder_returns_exact_immutable_channels(self):
-        ch0 = [1000] * 128
-        ch3 = [2000] * 128
+        ch0 = [1000] * 130
+        ch3 = [2000] * 130
         ch0[42] = 900
         ch3[64] = ADC_MAX_CODE
         frame = make_frame(
@@ -87,7 +87,7 @@ class MonitorStreamPureTests(unittest.TestCase):
 
         decoded = decode_monitor_frame(frame)
         self.assertEqual(EVENT_HEADER_BYTES, 24)
-        self.assertEqual(decoded.frame_bytes, 24 + 2 * 128 * 2)
+        self.assertEqual(decoded.frame_bytes, 24 + 2 * 130 * 2)
         self.assertEqual(decoded.header.event_id, 17)
         self.assertEqual(decoded.header.channel_mask, 0x09)
         self.assertEqual(decoded.header.board_event_counter, 0xABCDE)
@@ -112,7 +112,7 @@ class MonitorStreamPureTests(unittest.TestCase):
             (make_frame(channel_mask=0), "at least one channel"),
             (make_frame(channel_mask=0x100), "unsupported bits"),
             (make_frame(record_length=120), "outside"),
-            (make_frame(record_length=130), "multiple of 8"),
+            (make_frame(record_length=132), "multiple of 10"),
             (
                 make_frame(board_event_counter=0x1000000),
                 "24-bit range",
@@ -123,7 +123,7 @@ class MonitorStreamPureTests(unittest.TestCase):
                 with self.assertRaisesRegex(MonitorFrameError, expected):
                     decode_monitor_frame(frame)
 
-        bad_samples = [1000] * 128
+        bad_samples = [1000] * 130
         bad_samples[91] = ADC_MAX_CODE + 1
         with self.assertRaisesRegex(MonitorFrameError, "14-bit ADC range"):
             decode_monitor_frame(
@@ -236,7 +236,7 @@ class MonitorStreamPureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.config.conf"
             path.write_text(
-                "[Digitizer]\nRecordLength = 128\nTriggerPolarity = 0\n",
+                "[Digitizer]\nRecordLength = 130\nTriggerPolarity = 0\n",
                 encoding="utf-8",
             )
             rising = load_runtime_polarity(path)
@@ -281,6 +281,26 @@ class MonitorStreamPureTests(unittest.TestCase):
         self.assertEqual(rising.charge, 800.0)
         self.assertEqual(rising.pulse_index, 64)
 
+        balanced_noise = np.full(128, 1000, dtype=np.uint16)
+        balanced_noise[64] = 900
+        balanced_noise[65] = 1100
+        self.assertEqual(
+            analyze_monitor_waveform(balanced_noise, "falling").charge,
+            0.0,
+        )
+        self.assertEqual(
+            analyze_monitor_waveform(balanced_noise, "rising").charge,
+            0.0,
+        )
+
+        net_opposite = np.full(128, 1000, dtype=np.uint16)
+        net_opposite[64] = 900
+        net_opposite[65] = 1200
+        self.assertEqual(
+            analyze_monitor_waveform(net_opposite, "falling").charge,
+            -100.0,
+        )
+
 
 @unittest.skipIf(
     QApplication is None or zmq is None,
@@ -307,6 +327,47 @@ class MonitorTabQtSafetyTests(unittest.TestCase):
         )
         if hasattr(zmq, "CONFLATE"):
             self.assertEqual(tab.sock.getsockopt(zmq.CONFLATE), 1)
+        tab.cleanup()
+        tab.deleteLater()
+
+    def test_history_defaults_to_100k_and_supports_true_unlimited_mode(self):
+        from widgets.MonitorTab import DEFAULT_HISTORY_FRAMES, MonitorTab
+
+        class EmptySocket:
+            def recv(self, *, flags):
+                raise zmq.Again()
+
+            def close(self, linger=0):
+                pass
+
+        tab = MonitorTab(monitor_socket=EmptySocket())
+        tab.timer.stop()
+        self.assertEqual(tab.spin_history.value(), DEFAULT_HISTORY_FRAMES)
+        self.assertEqual(DEFAULT_HISTORY_FRAMES, 100_000)
+        self.assertFalse(tab.chk_unlimited_history.isChecked())
+
+        tab.rebuild_plots(1)
+        self.assertEqual(tab.q_long_hists[0].maxlen, 100_000)
+        tab.q_long_hists[0].extend(range(150))
+
+        tab.chk_unlimited_history.setChecked(True)
+        self.assertIsNone(tab.q_long_hists[0].maxlen)
+        self.assertFalse(tab.spin_history.isEnabled())
+        self.assertEqual(list(tab.q_long_hists[0]), list(range(150)))
+
+        tab.spin_history.setValue(100)
+        self.assertIsNone(tab.q_long_hists[0].maxlen)
+        tab.chk_unlimited_history.setChecked(False)
+        self.assertEqual(tab.q_long_hists[0].maxlen, 100)
+        self.assertTrue(tab.spin_history.isEnabled())
+        self.assertEqual(list(tab.q_long_hists[0]), list(range(50, 150)))
+
+        tab.chk_unlimited_history.setChecked(True)
+        tab.rebuild_plots(0x03)
+        self.assertIsNone(tab.q_long_hists[0].maxlen)
+        self.assertIsNone(tab.q_long_hists[1].maxlen)
+        tab._start_new_runtime_observation()
+        self.assertIsNone(tab.q_long_hists[0].maxlen)
         tab.cleanup()
         tab.deleteLater()
 
@@ -375,10 +436,57 @@ class MonitorTabQtSafetyTests(unittest.TestCase):
             self.assertTrue(socket.closed)
             tab.deleteLater()
 
+    def test_charge_histogram_keeps_negative_and_zero_signed_integrals(self):
+        from widgets.MonitorTab import MonitorTab
+
+        negative_charge = [1000] * 130
+        negative_charge[64] = 900
+        negative_charge[65] = 1200
+        balanced_charge = [1000] * 130
+        balanced_charge[64] = 900
+        balanced_charge[65] = 1100
+        messages = [
+            make_frame(
+                0, channel_mask=1, waveforms={0: negative_charge}
+            )
+        ]
+
+        class QueueSocket:
+            def recv(self, *, flags):
+                if messages:
+                    return messages.pop(0)
+                raise zmq.Again()
+
+            def close(self, linger=0):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "falling.config.conf"
+            config.write_text(
+                "[Digitizer]\nTriggerPolarity = 1\n", encoding="utf-8"
+            )
+            tab = MonitorTab(
+                monitor_socket=QueueSocket(),
+                config_path_provider=lambda: config,
+            )
+            tab.timer.stop()
+            tab.poll_zmq()
+            self.assertEqual(list(tab.q_long_hists[0]), [-100.0])
+
+            messages.append(
+                make_frame(
+                    1, channel_mask=1, waveforms={0: balanced_charge}
+                )
+            )
+            tab.poll_zmq()
+            self.assertEqual(list(tab.q_long_hists[0]), [-100.0, 0.0])
+            tab.cleanup()
+            tab.deleteLater()
+
     def test_qt_monitor_tracks_exact_runtime_polarity_without_mixing_runs(self):
         from widgets.MonitorTab import MonitorTab
 
-        rising_waveform = [1000] * 128
+        rising_waveform = [1000] * 130
         rising_waveform[64:72] = [1100] * 8
         messages = [
             make_frame(
@@ -423,16 +531,20 @@ class MonitorTabQtSafetyTests(unittest.TestCase):
             self.assertTrue(tab._polarity_authenticated)
             self.assertIn("rising", tab.lbl_polarity.text())
             self.assertEqual(list(tab.q_long_hists[0]), [100.0])
-
-            falling_waveform = [1000] * 128
-            falling_waveform[64:72] = [900] * 8
-            messages.append(
-                make_frame(
-                    0,
-                    channel_mask=1,
-                    waveforms={0: falling_waveform},
-                )
+            waveform_before_finish = np.array(
+                tab.curves_wave[0].getData()[1], copy=True
             )
+
+            tab.hold_last_preview(0)
+            self.assertIn("HELD", tab.lbl_preview_status.text())
+            tab.poll_zmq()
+            self.assertEqual(list(tab.q_long_hists[0]), [100.0])
+            np.testing.assert_array_equal(
+                tab.curves_wave[0].getData()[1], waveform_before_finish
+            )
+
+            falling_waveform = [1000] * 130
+            falling_waveform[64:72] = [900] * 8
             active_config[0] = RuntimeConfigReference(
                 falling_config,
                 hashlib.sha256(falling_config.read_bytes()).hexdigest(),
@@ -440,9 +552,26 @@ class MonitorTabQtSafetyTests(unittest.TestCase):
             # The provider path is checked on every tick, even though the
             # periodic same-file refresh deadline is still in the future.
             tab.poll_zmq()
+            self.assertEqual(list(tab.q_long_hists[0]), [])
+            cleared_waveform = tab.curves_wave[0].getData()[1]
+            self.assertTrue(
+                cleared_waveform is None or len(cleared_waveform) == 0
+            )
+            self.assertFalse(tab._has_rendered_data)
+            self.assertIn("LIVE/WAITING", tab.lbl_preview_status.text())
+
+            messages.append(
+                make_frame(
+                    0,
+                    channel_mask=1,
+                    waveforms={0: falling_waveform},
+                )
+            )
+            tab.poll_zmq()
             self.assertEqual(tab._active_polarity, "falling")
             self.assertIn("falling", tab.lbl_polarity.text())
             self.assertEqual(list(tab.q_long_hists[0]), [100.0])
+            self.assertIn("LIVE", tab.lbl_preview_status.text())
             self.assertEqual(
                 tab.sequence_tracker.sequence_discontinuities, 0
             )

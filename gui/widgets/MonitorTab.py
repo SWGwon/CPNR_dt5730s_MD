@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pyqtgraph as pg
 import zmq
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox, QProgressBar, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox, QProgressBar, QMessageBox, QCheckBox
 from PyQt6.QtCore import QTimer, pyqtSlot
 from collections import deque
 
@@ -27,6 +27,8 @@ MAX_POLL_TIME_BUDGET_MS = 50.0
 POLARITY_REFRESH_NS = 1_000_000_000
 HISTOGRAM_REFRESH_NS = 100_000_000
 MONITOR_RCVHWM_MESSAGES = 32
+DEFAULT_HISTORY_FRAMES = 100_000
+MAX_NUMERIC_HISTORY_FRAMES = 2_147_483_647
 
 class MonitorTab(QWidget):
     def __init__(
@@ -89,6 +91,7 @@ class MonitorTab(QWidget):
         self.budget_limited_ticks = 0
         self.socket_errors = 0
         self.last_stream_error = None
+        self._has_rendered_data = False
 
         self.colors = [
             '#0d6efd', '#198754', '#dc3545', '#fd7e14', 
@@ -144,18 +147,32 @@ class MonitorTab(QWidget):
 
         ctrl_layout.addWidget(QLabel("  |  <b>Analysis Mode:</b>"))
         self.cb_spec_mode = QComboBox()
-        self.cb_spec_mode.addItems(["📊 Pulse Charge (Integral Area)", "📈 Pulse Height (Amplitude)"])
+        self.cb_spec_mode.addItems(["📊 Pulse Charge (Signed Integral)", "📈 Pulse Height (Amplitude)"])
+        self.cb_spec_mode.setToolTip(
+            "Charge is the signed, baseline-subtracted sum over the full "
+            "waveform, oriented so the configured pulse polarity is positive."
+        )
         self.cb_spec_mode.currentIndexChanged.connect(self.toggle_spec_mode)
         ctrl_layout.addWidget(self.cb_spec_mode)
 
         ctrl_layout.addWidget(QLabel("  |  <b>GUI Sample History:</b>"))
         self.spin_history = QSpinBox()
-        self.spin_history.setRange(100, 100000)
-        self.spin_history.setSingleStep(500)
-        self.spin_history.setValue(2000)
+        self.spin_history.setRange(100, MAX_NUMERIC_HISTORY_FRAMES)
+        self.spin_history.setSingleStep(10_000)
+        self.spin_history.setValue(DEFAULT_HISTORY_FRAMES)
         self.spin_history.setSuffix(" frames")
+        self.spin_history.setAccelerated(True)
         self.spin_history.valueChanged.connect(self.update_history_size)
         ctrl_layout.addWidget(self.spin_history)
+
+        self.chk_unlimited_history = QCheckBox("Unlimited")
+        self.chk_unlimited_history.setToolTip(
+            "Keep every rendered monitor sample without eviction. Memory "
+            "usage and histogram refresh cost will continue to grow until "
+            "Clear All or application exit."
+        )
+        self.chk_unlimited_history.toggled.connect(self.update_history_size)
+        ctrl_layout.addWidget(self.chk_unlimited_history)
 
         self.btn_clear = QPushButton("🗑️ Clear All")
         self.btn_clear.setStyleSheet("font-weight: bold; padding: 4px 15px; margin-left: 10px;")
@@ -174,6 +191,17 @@ class MonitorTab(QWidget):
         layout.addLayout(ctrl_layout)
 
         monitor_status_layout = QHBoxLayout()
+        self.lbl_preview_status = QLabel()
+        self.lbl_preview_status.setToolTip(
+            "This is the latest lossy Live Monitor preview. It confirms that "
+            "the GUI observed a valid monitor frame, but it does not prove "
+            "raw-file completeness or DAQ losslessness."
+        )
+        self._set_preview_status(
+            "EMPTY — waiting for a valid monitor frame", "#6c757d"
+        )
+        monitor_status_layout.addWidget(self.lbl_preview_status)
+        monitor_status_layout.addSpacing(20)
         self.lbl_polarity = QLabel(
             "DSP polarity: unavailable (spectrum paused)"
         )
@@ -204,10 +232,10 @@ class MonitorTab(QWidget):
         self.glw.nextRow()
 
         self.plot_qlong = self.glw.addPlot(
-            title="Decimated Live-Monitor Charge Spectrum"
+            title="Decimated Live-Monitor Signed Charge Spectrum"
         )
         self.plot_qlong.setLogMode(y=True)
-        self.plot_qlong.setLabel('bottom', "Integrated Charge (ADC Bins)")
+        self.plot_qlong.setLabel('bottom', "Signed Integrated Charge (ADC·sample)")
         self.plot_qlong.setLabel('left', "Counts (Log)")
         self.plot_qlong.addLegend(offset=(10, 10))
 
@@ -216,15 +244,21 @@ class MonitorTab(QWidget):
         """Update the monitor-only DSP view and discard mixed-mode history."""
         if idx == 0:
             self.plot_qlong.setTitle(
-                "Decimated Live-Monitor Charge Spectrum"
+                "Decimated Live-Monitor Signed Charge Spectrum"
             )
-            self.plot_qlong.setLabel('bottom', "Integrated Charge (ADC Bins)")
+            self.plot_qlong.setLabel(
+                'bottom', "Signed Integrated Charge (ADC·sample)"
+            )
         else:
             self.plot_qlong.setTitle(
                 "Decimated Live-Monitor Pulse Height Spectrum"
             )
             self.plot_qlong.setLabel('bottom', "Pulse Height Amplitude (ADC Bins)")
         self._clear_plot_data(reset_stream_stats=False)
+        self._set_preview_status(
+            "EMPTY — analysis mode changed; waiting for a new frame",
+            "#6c757d",
+        )
 
     @pyqtSlot(float)
     def update_temperature(self, temp: float):
@@ -244,10 +278,23 @@ class MonitorTab(QWidget):
                 self.warning_latched = False
 
     def update_history_size(self, _value=None):
-        new_size = self.spin_history.value()
+        new_size = self._history_maxlen()
+        self.spin_history.setEnabled(new_size is not None)
         for ch in self.q_long_hists:
-            current_data = list(self.q_long_hists[ch])
-            self.q_long_hists[ch] = deque(current_data[-new_size:], maxlen=new_size)
+            self.q_long_hists[ch] = deque(
+                self.q_long_hists[ch], maxlen=new_size
+            )
+
+    def _history_maxlen(self):
+        if self.chk_unlimited_history.isChecked():
+            return None
+        return self.spin_history.value()
+
+    def _set_preview_status(self, text, color):
+        self.lbl_preview_status.setText(f"Preview: {text}")
+        self.lbl_preview_status.setStyleSheet(
+            f"color: {color}; font-weight: bold;"
+        )
 
     def rebuild_plots(self, mask):
         self.plot_wave.clear()
@@ -278,7 +325,7 @@ class MonitorTab(QWidget):
                 pen=color,
             )
             
-            self.q_long_hists[ch] = deque(maxlen=self.spin_history.value())
+            self.q_long_hists[ch] = deque(maxlen=self._history_maxlen())
 
     def toggle_monitor(self, idx):
         if idx == 0:
@@ -286,12 +333,27 @@ class MonitorTab(QWidget):
             # report the intentionally unobserved interval as a DAQ loss.
             self.sequence_tracker.start_new_observation_window()
             self.timer.start(33)
+            if self._has_rendered_data:
+                self._set_preview_status(
+                    "WAITING — monitor enabled; previous preview retained",
+                    "#997404",
+                )
+            else:
+                self._set_preview_status(
+                    "WAITING — monitor enabled; awaiting a valid frame",
+                    "#6c757d",
+                )
         else:
             self.timer.stop()
             self.sequence_tracker.start_new_observation_window()
+            self._set_preview_status(
+                "PAUSED — monitor disabled; displayed preview is frozen",
+                "#997404",
+            )
 
     def clear_data(self):
         self._clear_plot_data(reset_stream_stats=True)
+        self._set_preview_status("EMPTY — cleared by operator", "#6c757d")
 
     def _clear_plot_data(self, *, reset_stream_stats):
         for ch in self.q_long_hists:
@@ -300,6 +362,8 @@ class MonitorTab(QWidget):
                 self.curves_wave[ch].setData(np.array([], dtype=np.uint16))
             if ch in self.curves_qlong:
                 self.curves_qlong[ch].setData(x=np.array([-0.5, 0.5]), y=np.array([0.1]))
+
+        self._has_rendered_data = False
 
         if reset_stream_stats:
             self.sequence_tracker.reset()
@@ -412,6 +476,23 @@ class MonitorTab(QWidget):
     def _start_new_runtime_observation(self):
         self.sequence_tracker.start_new_observation_window()
         self._clear_plot_data(reset_stream_stats=False)
+        self._set_preview_status(
+            "LIVE/WAITING — new run detected; awaiting a valid frame",
+            "#0d6efd",
+        )
+
+    @pyqtSlot(int)
+    def hold_last_preview(self, _returncode):
+        if self._has_rendered_data:
+            self._set_preview_status(
+                "HELD — DAQ stopped; last monitor preview retained",
+                "#997404",
+            )
+        else:
+            self._set_preview_status(
+                "EMPTY — DAQ stopped; no valid monitor frame received",
+                "#b02a37",
+            )
 
     def _update_polarity_status(self):
         if self._active_polarity is None:
@@ -515,8 +596,13 @@ class MonitorTab(QWidget):
                 waveform, self._active_polarity
             )
             value = result.charge if spec_mode == 0 else result.pulse_height
-            if value > 0.0:
+            if spec_mode == 0 or value > 0.0:
                 self.q_long_hists[channel].append(value)
+
+        self._has_rendered_data = True
+        self._set_preview_status(
+            f"LIVE — latest EventID {frame.header.event_id}", "#146c43"
+        )
 
         if now_ns < self._next_histogram_refresh_ns:
             return

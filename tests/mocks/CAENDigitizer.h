@@ -1,8 +1,9 @@
 #ifndef TESTS_MOCKS_CAEN_DIGITIZER_H
 #define TESTS_MOCKS_CAEN_DIGITIZER_H
 
-#include "DT5730Status.h"
 #include "DataQuality.h"
+#include "DT5730Constraints.h"
+#include "DT5730Status.h"
 
 #include <array>
 #include <cstdint>
@@ -82,6 +83,7 @@ struct State {
   bool corrupt_threshold_readback = false;
   bool corrupt_pair_logic_readback = false;
   bool corrupt_channel_mask_readback = false;
+  bool corrupt_post_trigger_readback = false;
   bool corrupt_adc_bits = false;
   bool readout_failure = false;
   bool corrupt_event_record_length = false;
@@ -105,8 +107,9 @@ struct State {
   bool force_zero_event_count = false;
   bool acquisition_running = false;
   uint32_t channel_mask = 0;
-  uint32_t record_length = 512;
+  uint32_t record_length = 520;
   uint32_t post_trigger = 60;
+  uint32_t post_trigger_register = 39;
   uint32_t pending_events = 0;
   uint32_t current_read_events = 0;
   uint32_t baseline_batch = 0;
@@ -167,6 +170,8 @@ struct State {
     const bool preserve_threshold_fault = corrupt_threshold_readback;
     const bool preserve_pair_fault = corrupt_pair_logic_readback;
     const bool preserve_channel_mask_fault = corrupt_channel_mask_readback;
+    const bool preserve_post_trigger_fault =
+        corrupt_post_trigger_readback;
     const bool preserve_adc_bits_fault = corrupt_adc_bits;
     const bool preserve_board_not_ready_fault = board_not_ready_fault;
     const bool preserve_pll_unlock_fault = pll_unlock_fault;
@@ -187,6 +192,7 @@ struct State {
     corrupt_threshold_readback = preserve_threshold_fault;
     corrupt_pair_logic_readback = preserve_pair_fault;
     corrupt_channel_mask_readback = preserve_channel_mask_fault;
+    corrupt_post_trigger_readback = preserve_post_trigger_fault;
     corrupt_adc_bits = preserve_adc_bits_fault;
     board_not_ready_fault = preserve_board_not_ready_fault;
     pll_unlock_fault = preserve_pll_unlock_fault;
@@ -268,6 +274,10 @@ inline void SetPairLogicReadbackFault(bool enabled) {
 
 inline void SetChannelMaskReadbackFault(bool enabled) {
   state.corrupt_channel_mask_readback = enabled;
+}
+
+inline void SetPostTriggerReadbackFault(bool enabled) {
+  state.corrupt_post_trigger_readback = enabled;
 }
 
 inline void SetAdcBitsFault(bool enabled) {
@@ -451,7 +461,8 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_WriteRegister(
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetRecordLength(int, uint32_t length) {
-  caen_mock::state.record_length = length;
+  caen_mock::state.record_length =
+      dt5730_constraints::RoundRecordLengthUp(length);
   return CAEN_DGTZ_Success;
 }
 
@@ -476,12 +487,20 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetChannelEnableMask(
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetPostTriggerSize(
     int, uint32_t post_trigger) {
   caen_mock::state.post_trigger = post_trigger;
+  caen_mock::state.post_trigger_register =
+      dt5730_constraints::PredictPostTriggerLayout(
+          caen_mock::state.record_length, post_trigger)
+          .register_value;
   return CAEN_DGTZ_Success;
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetPostTriggerSize(
     int, uint32_t* post_trigger) {
-  *post_trigger = caen_mock::state.post_trigger;
+  *post_trigger = static_cast<uint32_t>(
+      static_cast<uint64_t>(caen_mock::state.post_trigger_register) *
+      dt5730_constraints::kPostTriggerGranularitySamples * 100U /
+      caen_mock::state.record_length);
+  if (caen_mock::state.corrupt_post_trigger_readback) ++*post_trigger;
   return CAEN_DGTZ_Success;
 }
 

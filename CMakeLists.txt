@@ -210,6 +210,15 @@ if(BUILD_TESTING)
          "${CMAKE_BINARY_DIR}/venv/bin/python")
   endif()
   list(APPEND _CPNR_GUI_TEST_PYTHON_CANDIDATES "${Python3_EXECUTABLE}")
+  # FindPython may select a newer development interpreter than the `python3`
+  # used by bin/daq_gui. Try that launcher interpreter as well so an installed
+  # GUI stack is not overlooked merely because the build interpreter lacks it.
+  unset(_CPNR_PATH_PYTHON CACHE)
+  find_program(_CPNR_PATH_PYTHON NAMES python3)
+  if(_CPNR_PATH_PYTHON)
+    list(APPEND _CPNR_GUI_TEST_PYTHON_CANDIDATES
+         "${_CPNR_PATH_PYTHON}")
+  endif()
   list(REMOVE_DUPLICATES _CPNR_GUI_TEST_PYTHON_CANDIDATES)
 
   unset(CPNR_GUI_TEST_PYTHON)
@@ -255,6 +264,7 @@ if(BUILD_TESTING)
   unset(_CPNR_GUI_IMPORT_RESULT)
   unset(_CPNR_PYTHON_CANDIDATE)
   unset(_CPNR_GUI_TEST_PYTHON_CANDIDATES)
+  unset(_CPNR_PATH_PYTHON CACHE)
 endif()
 
 if(BUILD_DAQ_APPLICATIONS)

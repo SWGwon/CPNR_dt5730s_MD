@@ -1,6 +1,7 @@
 #include "RootValidator.h"
 
 #include "DAQConfig.h"
+#include "DT5730Constraints.h"
 #include "DT5730Status.h"
 #include "DT5730Timing.h"
 #include "EventHeader.h"
@@ -62,6 +63,7 @@ namespace fs = std::filesystem;
 constexpr int kChannelCount = 8;
 constexpr double kAdcMaximum = 16383.0;
 constexpr std::uint64_t kQuantileSampleLimit = 500000U;
+constexpr std::size_t kMaximumChargeHistogramBins = 150U;
 
 struct FileIdentity {
   std::uint64_t device = 0U;
@@ -481,14 +483,21 @@ struct HardwareMetadata {
   std::string polarity;
   std::uint32_t record_mask = 0U;
   std::uint32_t record_length = 0U;
+  std::uint32_t record_length_granularity = 8U;
   std::uint32_t post_trigger = 0U;
   std::uint32_t external_mode = 0U;
   std::uint32_t self_mode = 0U;
   std::uint32_t self_mask = 0U;
+  // Added after schema v2 was introduced.  Missing fields are the legacy
+  // hardware-trigger configuration (software random trigger disabled).
+  std::uint32_t software_random_trigger_mode = 0U;
+  double software_random_trigger_rate_hz = 0.0;
   std::string pair_logic;
   bool explicit_routing = false;
   std::uint32_t global_readback = 0U;
   std::array<std::uint32_t, 4> pair_readback{};
+  std::uint32_t waveform_dsp_schema =
+      cpnr::kWaveformDspSchemaClampedCharge;
   std::uint32_t dsp_baseline_samples = 0U;
   std::uint32_t dsp_short_gate_samples = 0U;
   std::uint32_t dsp_long_gate_samples = 0U;
@@ -831,8 +840,18 @@ void ValidateConfigAgainstMetadata(const std::string& config_contents,
   const HardwareMetadata& hardware = metadata.hardware;
   DAQHardwareSettings settings;
   try {
-    settings = LoadDAQHardwareSettings(ConfigParser::FromText(
-        config_contents, "embedded RunConfigExact"));
+    const DAQRecordLengthContract record_length_contract =
+        hardware.record_length_granularity ==
+                dt5730_constraints::kRecordLengthGranularitySamples
+            ? DAQRecordLengthContract::kCurrentX730
+            : DAQRecordLengthContract::kLegacyMultipleOf8;
+    settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(config_contents, "embedded RunConfigExact"),
+        record_length_contract,
+        hardware.waveform_dsp_schema ==
+                cpnr::kWaveformDspSchemaPeakCenteredCharge
+            ? DAQWaveformDspContract::kPeakCentered
+            : DAQWaveformDspContract::kLegacyThresholdGates);
   } catch (const std::exception& error) {
     checks->Add("FAIL", "provenance", "config_metadata_consistency",
                 error.what(),
@@ -867,6 +886,16 @@ void ValidateConfigAgainstMetadata(const std::string& config_contents,
           hardware.external_mode);
   compare("Digitizer.SelfTriggerMode", settings.self_trigger_mode,
           hardware.self_mode);
+  compare("Digitizer.SoftwareRandomTriggerMode",
+          settings.software_random_trigger_mode,
+          hardware.software_random_trigger_mode);
+  if (!MetadataApproxEqual(settings.software_random_trigger_rate_hz,
+                           hardware.software_random_trigger_rate_hz)) {
+    mismatches.push_back(
+        {{"key", "Digitizer.SoftwareRandomTriggerRateHz"},
+         {"config", settings.software_random_trigger_rate_hz},
+         {"metadata", hardware.software_random_trigger_rate_hz}});
+  }
   compare("Digitizer.SelfTriggerMask", settings.self_trigger_mask,
           hardware.self_mask);
   compare("HardwareCoincidence.PairLogic",
@@ -1255,10 +1284,46 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
         throw std::runtime_error(
             "metadata.hardware connection/board identity is inconsistent");
       }
-      if (RequireUnsigned(hardware, "waveform_dsp_schema",
-                          "metadata.hardware", 1U, 1U) != 1U) {
+      parsed_hardware.waveform_dsp_schema =
+          static_cast<std::uint32_t>(RequireUnsigned(
+              hardware, "waveform_dsp_schema", "metadata.hardware",
+              cpnr::kWaveformDspSchemaClampedCharge,
+              cpnr::kWaveformDspCurrentSchema));
+      if (parsed_hardware.waveform_dsp_schema !=
+              cpnr::kWaveformDspSchemaClampedCharge &&
+          parsed_hardware.waveform_dsp_schema !=
+              cpnr::kWaveformDspSchemaSignedCharge &&
+          parsed_hardware.waveform_dsp_schema !=
+              cpnr::kWaveformDspSchemaPeakCenteredCharge) {
         throw std::runtime_error(
             "metadata.hardware waveform DSP schema is unsupported");
+      }
+      if (parsed_hardware.waveform_dsp_schema ==
+          cpnr::kWaveformDspSchemaPeakCenteredCharge) {
+        if (RequireString(hardware, "dsp_charge_anchor",
+                          "metadata.hardware") !=
+                cpnr::kPeakCenteredChargeAnchor ||
+            RequireUnsigned(hardware, "dsp_charge_window_pre_ns",
+                            "metadata.hardware", 0U,
+                            std::numeric_limits<std::uint32_t>::max()) !=
+                cpnr::kPeakCenteredChargePreNs ||
+            RequireUnsigned(hardware, "dsp_charge_window_post_ns",
+                            "metadata.hardware", 0U,
+                            std::numeric_limits<std::uint32_t>::max()) !=
+                cpnr::kPeakCenteredChargePostNs ||
+            RequireUnsigned(hardware, "dsp_charge_window_samples",
+                            "metadata.hardware", 1U,
+                            std::numeric_limits<std::uint32_t>::max()) !=
+                cpnr::kPeakCenteredChargeWindowSamples ||
+            RequireString(hardware, "dsp_short_charge_semantics",
+                          "metadata.hardware") !=
+                cpnr::kPeakCenteredShortChargeSemantics ||
+            RequireString(hardware, "dsp_pulse_time_semantics",
+                          "metadata.hardware") !=
+                cpnr::kPeakCenteredPulseTimeSemantics) {
+          throw std::runtime_error(
+              "metadata.hardware peak-centered charge contract is invalid");
+        }
       }
       parsed_hardware.dsp_baseline_samples =
           static_cast<std::uint32_t>(RequireUnsigned(
@@ -1314,16 +1379,48 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
     parsed_hardware.record_length =
         static_cast<std::uint32_t>(RequireUnsigned(
             hardware, "record_length", "metadata.hardware", 128U, 102400U));
-    if (parsed_hardware.record_length % 8U != 0U) {
-      throw std::runtime_error("record length is not a multiple of 8");
+    if (hardware.contains("record_length_granularity_samples")) {
+      if (schema < 2U) {
+        throw std::runtime_error(
+            "metadata schema v1 cannot declare record-length granularity");
+      }
+      parsed_hardware.record_length_granularity =
+          static_cast<std::uint32_t>(RequireUnsigned(
+              hardware, "record_length_granularity_samples",
+              "metadata.hardware", 1U, 102400U));
+      if (parsed_hardware.record_length_granularity != 8U &&
+          parsed_hardware.record_length_granularity !=
+              dt5730_constraints::kRecordLengthGranularitySamples) {
+        throw std::runtime_error(
+            "record-length granularity is unsupported");
+      }
+    }
+    if (parsed_hardware.record_length %
+            parsed_hardware.record_length_granularity !=
+        0U) {
+      throw std::runtime_error(
+          "record length does not match its metadata granularity");
     }
     parsed_hardware.post_trigger = static_cast<std::uint32_t>(RequireUnsigned(
         hardware, "post_trigger_percent", "metadata.hardware", 0U, 100U));
-    if (schema >= 2U &&
-        RequireUnsigned(hardware, "post_trigger_readback_percent",
-                        "metadata.hardware", 0U, 100U) !=
-            parsed_hardware.post_trigger) {
-      throw std::runtime_error("post-trigger differs from readback");
+    if (schema >= 2U) {
+      const std::uint64_t observed_readback = RequireUnsigned(
+          hardware, "post_trigger_readback_percent", "metadata.hardware",
+          0U, 100U);
+      const std::uint32_t predicted_readback =
+          parsed_hardware.record_length_granularity ==
+                  dt5730_constraints::
+                      kRecordLengthGranularitySamples
+              ? dt5730_constraints::PredictPostTriggerLayout(
+                    parsed_hardware.record_length,
+                    parsed_hardware.post_trigger)
+                    .predicted_readback_percent
+              : parsed_hardware.post_trigger;
+      if (observed_readback != predicted_readback) {
+        throw std::runtime_error(
+            "post-trigger readback differs from the value required by its "
+            "record-length contract");
+      }
     }
     parsed_hardware.external_mode =
         static_cast<std::uint32_t>(RequireUnsigned(
@@ -1332,6 +1429,37 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
         hardware, "self_trigger_mode", "metadata.hardware", 0U, 1U));
     parsed_hardware.self_mask = static_cast<std::uint32_t>(RequireUnsigned(
         hardware, "self_trigger_mask", "metadata.hardware", 0U, 0xFFU));
+    const bool has_random_mode =
+        hardware.contains("software_random_trigger_mode");
+    const bool has_random_rate =
+        hardware.contains("software_random_trigger_rate_hz");
+    if (has_random_mode != has_random_rate) {
+      throw std::runtime_error(
+          "metadata.hardware software-random trigger mode/rate must be "
+          "provided together");
+    }
+    if (has_random_mode) {
+      parsed_hardware.software_random_trigger_mode =
+          static_cast<std::uint32_t>(RequireUnsigned(
+              hardware, "software_random_trigger_mode", "metadata.hardware",
+              0U, 1U));
+      parsed_hardware.software_random_trigger_rate_hz = RequireNumber(
+          hardware, "software_random_trigger_rate_hz", "metadata.hardware",
+          0.0, kMaximumSoftwareRandomTriggerRateHz);
+      if ((parsed_hardware.software_random_trigger_mode != 0U) !=
+          (parsed_hardware.software_random_trigger_rate_hz > 0.0)) {
+        throw std::runtime_error(
+            "metadata.hardware software-random trigger mode/rate are "
+            "inconsistent");
+      }
+      if (parsed_hardware.software_random_trigger_mode != 0U &&
+          parsed_hardware.software_random_trigger_rate_hz <
+              kMinimumSoftwareRandomTriggerRateHz) {
+        throw std::runtime_error(
+            "metadata.hardware software-random trigger rate is below the "
+            "supported minimum");
+      }
+    }
     parsed_hardware.pair_logic =
         RequireString(hardware, "pair_logic", "metadata.hardware");
     if (parsed_hardware.pair_logic != "AND" &&
@@ -1340,16 +1468,36 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
     }
     parsed_hardware.explicit_routing = RequireBool(
         hardware, "explicit_trigger_routing", "metadata.hardware");
-    if (static_cast<std::uint64_t>(parsed_hardware.record_length) *
-            (100U - parsed_hardware.post_trigger) <
-        8000U) {
+    const std::uint32_t metadata_pre_trigger_samples =
+        parsed_hardware.record_length_granularity ==
+                dt5730_constraints::kRecordLengthGranularitySamples
+            ? dt5730_constraints::PredictPostTriggerLayout(
+                  parsed_hardware.record_length,
+                  parsed_hardware.post_trigger)
+                  .pre_trigger_samples
+            : static_cast<std::uint32_t>(
+                  static_cast<std::uint64_t>(
+                      parsed_hardware.record_length) *
+                  (100U - parsed_hardware.post_trigger) / 100U);
+    if (metadata_pre_trigger_samples <
+        dt5730_constraints::kMinimumPreTriggerSamples) {
       throw std::runtime_error(
           "record length/post-trigger leave less than 160 ns pre-trigger");
     }
+    const bool software_random_enabled =
+        parsed_hardware.software_random_trigger_mode != 0U;
     if (parsed_hardware.external_mode == 0U &&
-        parsed_hardware.self_mode == 0U) {
+        parsed_hardware.self_mode == 0U && !software_random_enabled) {
       throw std::runtime_error(
-          "external and self trigger modes cannot both be disabled");
+          "external and self trigger modes cannot both be disabled unless "
+          "software random trigger is enabled");
+    }
+    if (software_random_enabled &&
+        (parsed_hardware.external_mode != 0U ||
+         parsed_hardware.self_mode != 0U || parsed_hardware.self_mask != 0U)) {
+      throw std::runtime_error(
+          "software random trigger cannot be mixed with external or self "
+          "trigger sources");
     }
     if (parsed_hardware.self_mode != 0U &&
         parsed_hardware.pair_logic == "AND") {
@@ -1414,7 +1562,9 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
     const std::uint32_t expected_global =
         expected_pair_sources |
         (parsed_hardware.external_mode != 0U ? (1U << 30U) : 0U) |
-        (!parsed_hardware.explicit_routing ? (1U << 31U) : 0U);
+        ((software_random_enabled || !parsed_hardware.explicit_routing)
+             ? (1U << 31U)
+             : 0U);
     if ((parsed_hardware.global_readback & 0xC000000FU) != expected_global ||
         (parsed_hardware.global_readback & (0x7U << 24U)) != 0U) {
       throw std::runtime_error(
@@ -1993,6 +2143,7 @@ struct ChannelAccumulator {
   std::vector<double> tail_samples;
   std::vector<double> bin_samples;
   std::vector<double> bin_medians;
+  std::vector<double> charge_samples;
 };
 
 struct LegacyPairExtremum {
@@ -2040,6 +2191,83 @@ Json NullOrDouble(bool available, double value) {
 
 Json NullOrUnsigned(bool available, std::uint64_t value) {
   return available ? Json(value) : Json(nullptr);
+}
+
+Json BuildChargeHistogram(const ChannelAccumulator& accumulator, int channel,
+                          std::uint64_t sample_stride,
+                          bool partial_event_scan, bool scan_cancelled) {
+  const bool stride_sampled = sample_stride > 1U;
+  const std::string coverage =
+      scan_cancelled
+          ? "cancelled_prefix"
+      : partial_event_scan
+          ? stride_sampled ? "stride_sampled_prefix" : "prefix"
+      : stride_sampled ? "stride_sampled_full_scan" : "full_scan";
+  Json histogram =
+      {{"available", false},
+       {"source_branch", "Charge_CH" + std::to_string(channel)},
+       {"unit", "ADC.sample"},
+       {"binning", "linear"},
+       {"bin_edges", Json::array()},
+       {"counts", Json::array()},
+       {"values_sampled", accumulator.charge_samples.size()},
+       {"events_scanned", accumulator.active_events},
+       {"sample_stride", sample_stride},
+       {"sampled", stride_sampled},
+       {"coverage", coverage}};
+
+  if (accumulator.charge_samples.empty() ||
+      !std::isfinite(accumulator.charge_min) ||
+      !std::isfinite(accumulator.charge_max)) {
+    return histogram;
+  }
+
+  double lower = accumulator.charge_min;
+  double upper = accumulator.charge_max;
+  std::size_t bin_count = 1U;
+  if (upper > lower) {
+    bin_count = std::min<std::size_t>(
+        kMaximumChargeHistogramBins,
+        std::max<std::size_t>(
+            1U, static_cast<std::size_t>(std::ceil(std::sqrt(
+                    static_cast<double>(accumulator.charge_samples.size()))))));
+  } else {
+    const double padding = std::max(0.5, std::abs(lower) * 1.0e-9);
+    lower -= padding;
+    upper += padding;
+  }
+
+  const double bin_width =
+      (upper - lower) / static_cast<double>(bin_count);
+  if (!(bin_width > 0.0) || !std::isfinite(bin_width)) {
+    return histogram;
+  }
+
+  std::vector<std::uint64_t> counts(bin_count, 0U);
+  for (const double value : accumulator.charge_samples) {
+    std::size_t index = bin_count - 1U;
+    if (value < upper) {
+      const double position = (value - lower) / bin_width;
+      if (position <= 0.0) {
+        index = 0U;
+      } else {
+        index = std::min<std::size_t>(
+            bin_count - 1U, static_cast<std::size_t>(position));
+      }
+    }
+    ++counts[index];
+  }
+
+  Json edges = Json::array();
+  for (std::size_t index = 0U; index <= bin_count; ++index) {
+    edges.push_back(index == bin_count
+                        ? upper
+                        : lower + static_cast<double>(index) * bin_width);
+  }
+  histogram["available"] = true;
+  histogram["bin_edges"] = std::move(edges);
+  histogram["counts"] = std::move(counts);
+  return histogram;
 }
 
 std::string DomainStatus(
@@ -2186,22 +2414,53 @@ Json ValidateRootFile(const std::string& input_path,
       !metadata.hardware.valid || metadata.hardware.polarity == "falling";
   const std::optional<int> waveform_dsp_schema =
       ReadParameter<int>(*file, "WaveformDspSchema");
-  const bool current_waveform_dsp_schema =
-      waveform_dsp_schema && *waveform_dsp_schema == 1;
-  const bool requires_current_waveform_dsp_schema =
+  const bool supported_waveform_dsp_schema =
+      waveform_dsp_schema &&
+      (*waveform_dsp_schema == cpnr::kWaveformDspSchemaClampedCharge ||
+       *waveform_dsp_schema == cpnr::kWaveformDspSchemaSignedCharge ||
+       *waveform_dsp_schema ==
+           cpnr::kWaveformDspSchemaPeakCenteredCharge);
+  const bool requires_explicit_waveform_dsp_schema =
       metadata.parsed && metadata.schema_version >= 2U;
-  // A valid v2 run promises the current DSP layout.  Continue scanning that
-  // layout even when its marker is missing so the report exposes all
+  const bool waveform_dsp_schema_matches_metadata =
+      !requires_explicit_waveform_dsp_schema ||
+      (supported_waveform_dsp_schema && metadata.hardware.valid &&
+       *waveform_dsp_schema ==
+           static_cast<int>(metadata.hardware.waveform_dsp_schema));
+  // A valid v2 run promises an explicit DSP layout. Continue scanning that
+  // layout even when its marker is defective so the report exposes all
   // independent branch/parameter defects, while the contract itself fails.
-  const bool scan_current_waveform_dsp =
-      current_waveform_dsp_schema || requires_current_waveform_dsp_schema;
+  const bool scan_explicit_waveform_dsp =
+      supported_waveform_dsp_schema ||
+      requires_explicit_waveform_dsp_schema;
+  const int effective_waveform_dsp_schema =
+      supported_waveform_dsp_schema
+          ? *waveform_dsp_schema
+      : requires_explicit_waveform_dsp_schema && metadata.hardware.valid
+          ? static_cast<int>(metadata.hardware.waveform_dsp_schema)
+          : cpnr::kWaveformDspSchemaClampedCharge;
   cpnr::WaveformDspSettings waveform_dsp_settings;
   std::optional<DAQHardwareSettings> embedded_settings;
   if (config_contents) {
     try {
-      embedded_settings = LoadDAQHardwareSettings(ConfigParser::FromText(
-          *config_contents, "embedded RunConfigExact"));
-      if (scan_current_waveform_dsp) {
+      const DAQRecordLengthContract record_length_contract =
+          metadata.hardware.valid
+              ? metadata.hardware.record_length_granularity ==
+                        dt5730_constraints::
+                            kRecordLengthGranularitySamples
+                    ? DAQRecordLengthContract::kCurrentX730
+                    : DAQRecordLengthContract::kLegacyMultipleOf8
+              : DAQRecordLengthContract::kLegacyOrCurrent;
+      embedded_settings = LoadDAQHardwareSettings(
+          ConfigParser::FromText(*config_contents,
+                                 "embedded RunConfigExact"),
+          record_length_contract,
+          effective_waveform_dsp_schema ==
+                  static_cast<int>(
+                      cpnr::kWaveformDspSchemaPeakCenteredCharge)
+              ? DAQWaveformDspContract::kPeakCentered
+              : DAQWaveformDspContract::kLegacyThresholdGates);
+      if (scan_explicit_waveform_dsp) {
         waveform_dsp_settings = embedded_settings->software_dsp.waveform;
       }
     } catch (const std::exception&) {
@@ -2209,7 +2468,7 @@ Json ValidateRootFile(const std::string& input_path,
       // failure.  Keep validation running to expose independent defects.
     }
   }
-  if (!scan_current_waveform_dsp && metadata.hardware.valid) {
+  if (!scan_explicit_waveform_dsp && metadata.hardware.valid) {
     // Converter versions before WaveformDspSchema=1 integrated from the
     // detected pulse to the end of each record and capped the adaptive
     // baseline at 150 samples.
@@ -2221,6 +2480,14 @@ Json ValidateRootFile(const std::string& input_path,
     waveform_dsp_settings.integrate_from_pulse_start = false;
     waveform_dsp_settings.legacy_adaptive_baseline = true;
   }
+  waveform_dsp_settings.preserve_signed_charge =
+      effective_waveform_dsp_schema !=
+      cpnr::kWaveformDspSchemaClampedCharge;
+  waveform_dsp_settings.integration_mode =
+      effective_waveform_dsp_schema ==
+              cpnr::kWaveformDspSchemaPeakCenteredCharge
+          ? cpnr::WaveformDspIntegrationMode::kPeakCenteredWindow
+          : cpnr::WaveformDspIntegrationMode::kThresholdAnchoredGates;
   ValidateExternalProvenance(*file, metadata, config_contents, &checks,
                              options, hash_full_contents);
 
@@ -2241,10 +2508,11 @@ Json ValidateRootFile(const std::string& input_path,
   } else if (!metadata.parsed || !metadata.hardware.valid) {
     raw_fidelity_failure =
         "Authenticated modern RunMetadata/hardware fields are unavailable";
-  } else if (requires_current_waveform_dsp_schema &&
-             !current_waveform_dsp_schema) {
+  } else if (requires_explicit_waveform_dsp_schema &&
+             !waveform_dsp_schema_matches_metadata) {
     raw_fidelity_failure =
-        "Schema-v2 provenance requires WaveformDspSchema=1 before RAW-to-ROOT fidelity can be trusted";
+        "Schema-v2 provenance requires matching supported metadata and ROOT "
+        "WaveformDspSchema values before RAW-to-ROOT fidelity can be trusted";
   } else {
     try {
       const std::optional<std::string> resolved_raw =
@@ -2267,11 +2535,13 @@ Json ValidateRootFile(const std::string& input_path,
       settings.expected_sha256 = RequireString(
           metadata.document, "raw_output_sha256", "metadata");
       settings.expected_record_length = metadata.hardware.record_length;
+      settings.expected_record_length_granularity =
+          metadata.hardware.record_length_granularity;
       settings.expected_channel_mask = static_cast<std::uint16_t>(
           metadata.hardware.record_mask);
       settings.falling_polarity = falling_polarity;
       settings.waveform_dsp = waveform_dsp_settings;
-      settings.compare_short_charge = scan_current_waveform_dsp;
+      settings.compare_short_charge = scan_explicit_waveform_dsp;
       settings.cancelled = [&options]() { return IsCancelled(options); };
       settings.authentication_progress = [&options](double fraction) {
         Progress(options, 17.0 + 7.0 * std::clamp(fraction, 0.0, 1.0),
@@ -2319,7 +2589,16 @@ Json ValidateRootFile(const std::string& input_path,
            {"expected", expected}});
     }
   };
-  if (current_waveform_dsp_schema) {
+  if (supported_waveform_dsp_schema) {
+    if (requires_explicit_waveform_dsp_schema &&
+        !waveform_dsp_schema_matches_metadata) {
+      waveform_dsp_errors.push_back(
+          {{"name", "WaveformDspSchema"},
+           {"observed", *waveform_dsp_schema},
+           {"expected", metadata.hardware.valid
+                            ? Json(metadata.hardware.waveform_dsp_schema)
+                            : Json(nullptr)}});
+    }
     if (!embedded_settings) {
       waveform_dsp_errors.push_back(
           {{"name", "RunConfigExact"},
@@ -2351,31 +2630,65 @@ Json ValidateRootFile(const std::string& input_path,
                                                : Json(nullptr)},
              {"expected", expected_threshold}});
       }
+      if (*waveform_dsp_schema ==
+          cpnr::kWaveformDspSchemaPeakCenteredCharge) {
+        require_dsp_int("DspChargeWindowPreNs",
+                        cpnr::kPeakCenteredChargePreNs);
+        require_dsp_int("DspChargeWindowPostNs",
+                        cpnr::kPeakCenteredChargePostNs);
+        require_dsp_int("DspChargeWindowSamples",
+                        cpnr::kPeakCenteredChargeWindowSamples);
+        const auto require_dsp_string =
+            [&](const char* name, const char* expected) {
+              const std::optional<std::string> observed =
+                  ReadStringObject(*file, name);
+              if (!observed || *observed != expected) {
+                waveform_dsp_errors.push_back(
+                    {{"name", name},
+                     {"observed", observed ? Json(*observed) : Json(nullptr)},
+                     {"expected", expected}});
+              }
+            };
+        require_dsp_string("DspChargeAnchor",
+                           cpnr::kPeakCenteredChargeAnchor);
+        require_dsp_string("DspShortChargeSemantics",
+                           cpnr::kPeakCenteredShortChargeSemantics);
+        require_dsp_string("DspPulseTimeSemantics",
+                           cpnr::kPeakCenteredPulseTimeSemantics);
+      }
     }
     checks.Add(waveform_dsp_errors.empty() ? "PASS" : "FAIL", "schema",
                "waveform_dsp_contract", waveform_dsp_errors, Json::array(),
                waveform_dsp_errors.empty()
-                   ? "Applied ROOT DSP parameters exactly match the authenticated runtime config."
-                   : "ROOT DSP parameters are missing, mistyped, or disagree with RunConfigExact.");
+                   ? "Applied ROOT DSP schema and parameters exactly match "
+                     "the authenticated runtime metadata and config."
+                   : "ROOT DSP schema/parameters are missing, mistyped, or "
+                     "disagree with runtime metadata or RunConfigExact.");
   } else if (waveform_dsp_object_present) {
     checks.Add("FAIL", "schema", "waveform_dsp_contract",
                waveform_dsp_schema ? Json(*waveform_dsp_schema)
                                    : Json(nullptr),
-               1,
+               Json::array({cpnr::kWaveformDspSchemaClampedCharge,
+                            cpnr::kWaveformDspSchemaSignedCharge,
+                            cpnr::kWaveformDspSchemaPeakCenteredCharge}),
                "WaveformDspSchema exists but is not the supported schema version/type.");
-  } else if (requires_current_waveform_dsp_schema) {
+  } else if (requires_explicit_waveform_dsp_schema) {
     checks.Add(
-        "FAIL", "schema", "waveform_dsp_contract", nullptr, 1,
-        "Schema-v2 runtime provenance requires WaveformDspSchema=1; the marker is missing, so scalar DSP semantics cannot be authenticated.");
+        "FAIL", "schema", "waveform_dsp_contract", nullptr,
+        metadata.hardware.valid ? Json(metadata.hardware.waveform_dsp_schema)
+                                : Json(cpnr::kWaveformDspCurrentSchema),
+        "Schema-v2 runtime provenance requires a matching supported "
+        "WaveformDspSchema marker; it is missing, so scalar DSP semantics "
+        "cannot be authenticated.");
   } else {
     checks.Add(
         "WARN", "compatibility", "legacy_waveform_dsp_contract",
         "hard-coded adaptive baseline and end-of-record integration",
-        "WaveformDspSchema=1 with authenticated gate settings",
+        "WaveformDspSchema=1, 2, or 3 with authenticated DSP settings",
         "This ROOT predates explicit applied DSP provenance; embedded SoftwareDSP values cannot be assumed to have controlled its scalar branches.");
   }
   report["summary"]["waveform_dsp_schema"] =
-      current_waveform_dsp_schema ? Json(1) : Json(nullptr);
+      waveform_dsp_schema ? Json(*waveform_dsp_schema) : Json(nullptr);
 
   Progress(options, 17.0, "validating ROOT schema");
   auto* tree = dynamic_cast<TTree*>(file->Get("phys_tree"));
@@ -2485,7 +2798,7 @@ Json ValidateRootFile(const std::string& input_path,
         {"ChannelMask", "UShort_t", kUShort_t},
         {"RecordLength", "UInt_t", kUInt_t}};
     for (int channel = 0; channel < kChannelCount; ++channel) {
-      if (scan_current_waveform_dsp) {
+      if (scan_explicit_waveform_dsp) {
         specifications.push_back(
             {"ShortCharge_CH" + std::to_string(channel), "Double_t",
              kDouble_t});
@@ -2572,7 +2885,7 @@ Json ValidateRootFile(const std::string& input_path,
     checks.Add(branch_errors.empty() ? "PASS" : "FAIL", "schema",
                "scalar_branches", branch_errors, Json::array(),
                branch_errors.empty()
-                   ? (scan_current_waveform_dsp
+                   ? (scan_explicit_waveform_dsp
                           ? "All 44 required scalar branches have expected leaf types and entry counts."
                           : "All 36 legacy scalar branches have expected leaf types and entry counts.")
                    : "Required scalar branches are missing, mistyped, or have inconsistent entries.");
@@ -2700,7 +3013,8 @@ Json ValidateRootFile(const std::string& input_path,
   std::set<std::uint32_t> observed_patterns;
   std::optional<std::uint64_t> first_ttt;
   std::optional<std::uint64_t> last_ttt;
-  std::optional<std::uint32_t> previous_board_counter;
+  std::uint32_t previous_board_counter = 0U;
+  bool previous_board_counter_available = false;
   bool scan_cancelled = false;
   std::unique_ptr<RawRootFidelityVerifier> raw_fidelity_verifier;
   std::optional<RawRootFidelityResult> raw_fidelity_result;
@@ -2734,7 +3048,7 @@ Json ValidateRootFile(const std::string& input_path,
       bind("BoardEventCounter", &board_event_counter);
     }
     for (int channel = 0; channel < kChannelCount; ++channel) {
-      if (scan_current_waveform_dsp) {
+      if (scan_explicit_waveform_dsp) {
         bind("ShortCharge_CH" + std::to_string(channel),
              &short_charge[channel]);
       }
@@ -2841,11 +3155,11 @@ Json ValidateRootFile(const std::string& input_path,
         observed_patterns.insert(pattern);
         if (board_event_counter > 0xFFFFFFU) {
           ++board_counter_range_violations;
-          previous_board_counter.reset();
+          previous_board_counter_available = false;
         } else {
-          if (previous_board_counter) {
+          if (previous_board_counter_available) {
             const std::uint32_t difference =
-                (board_event_counter - *previous_board_counter) & 0xFFFFFFU;
+                (board_event_counter - previous_board_counter) & 0xFFFFFFU;
             if (difference == 0U) {
               ++board_counter_duplicate_violations;
             } else if (difference > 0x800000U) {
@@ -2862,13 +3176,23 @@ Json ValidateRootFile(const std::string& input_path,
             }
           }
           previous_board_counter = board_event_counter;
+          previous_board_counter_available = true;
         }
       }
-      const std::uint32_t required_granularity = metadata.present ? 8U : 4U;
+      const bool record_length_matches_known_contract =
+          metadata.hardware.valid
+              ? record_length %
+                        metadata.hardware.record_length_granularity ==
+                    0U
+              : record_length % 4U == 0U ||
+                    record_length %
+                            dt5730_constraints::
+                                kRecordLengthGranularitySamples ==
+                        0U;
       const bool shape_is_valid =
           channel_mask != 0U && (channel_mask & ~0xFFU) == 0U &&
           record_length >= 128U && record_length <= 102400U &&
-          record_length % required_granularity == 0U;
+          record_length_matches_known_contract;
       if (!shape_is_valid ||
           (metadata.hardware.valid &&
            (channel_mask != metadata.hardware.record_mask ||
@@ -2882,7 +3206,7 @@ Json ValidateRootFile(const std::string& input_path,
         ChannelAccumulator& accumulator = accumulators[channel];
         const bool active = ((channel_mask >> channel) & 1U) != 0U;
         const bool finite =
-                            (!scan_current_waveform_dsp ||
+                            (!scan_explicit_waveform_dsp ||
                              std::isfinite(short_charge[channel])) &&
                             std::isfinite(charge[channel]) &&
                             std::isfinite(pulse[channel]) &&
@@ -2890,7 +3214,7 @@ Json ValidateRootFile(const std::string& input_path,
                             std::isfinite(baseline[channel]);
         if (!active) {
           if (!finite ||
-              (scan_current_waveform_dsp &&
+              (scan_explicit_waveform_dsp &&
                short_charge[channel] != 0.0) ||
               charge[channel] != 0.0 || pulse[channel] != 0.0 ||
               start_time[channel] != -1.0 || baseline[channel] != 0.0) {
@@ -2907,25 +3231,43 @@ Json ValidateRootFile(const std::string& input_path,
           ++accumulator.finite_violations;
           continue;
         }
+        const bool peak_centered_charge =
+            effective_waveform_dsp_schema ==
+            cpnr::kWaveformDspSchemaPeakCenteredCharge;
+        const std::size_t maximum_charge_samples =
+            peak_centered_charge
+                ? std::min<std::size_t>(record_length,
+                                        cpnr::kPeakCenteredChargeWindowSamples)
+                : scan_explicit_waveform_dsp
+                      ? waveform_dsp_settings.long_gate_samples
+                      : record_length;
+        const std::size_t maximum_short_charge_samples =
+            peak_centered_charge
+                ? maximum_charge_samples
+                : waveform_dsp_settings.short_gate_samples;
         const double theoretical_charge_max =
-            static_cast<double>(
-                scan_current_waveform_dsp
-                    ? waveform_dsp_settings.long_gate_samples
-                    : record_length) *
-            kAdcMaximum;
+            static_cast<double>(maximum_charge_samples) * kAdcMaximum;
         const double theoretical_short_charge_max =
-            static_cast<double>(waveform_dsp_settings.short_gate_samples) *
-            kAdcMaximum;
+            static_cast<double>(maximum_short_charge_samples) * kAdcMaximum;
+        const double theoretical_charge_min =
+            waveform_dsp_settings.preserve_signed_charge
+                ? -theoretical_charge_max
+                : 0.0;
+        const double theoretical_short_charge_min =
+            waveform_dsp_settings.preserve_signed_charge
+                ? -theoretical_short_charge_max
+                : 0.0;
         const double pulse_height_limit =
             falling_polarity ? baseline[channel]
                              : kAdcMaximum - baseline[channel];
         if (baseline[channel] < 0.0 || baseline[channel] > kAdcMaximum ||
             pulse[channel] < 0.0 ||
             pulse[channel] > pulse_height_limit + 1e-9 ||
-            (scan_current_waveform_dsp &&
-             (short_charge[channel] < 0.0 ||
+            (scan_explicit_waveform_dsp &&
+             (short_charge[channel] <
+                  theoretical_short_charge_min - 1e-9 ||
               short_charge[channel] > theoretical_short_charge_max + 1e-9)) ||
-            charge[channel] < 0.0 ||
+            charge[channel] < theoretical_charge_min - 1e-9 ||
             charge[channel] > theoretical_charge_max + 1e-9) {
           ++accumulator.range_violations;
         }
@@ -2939,9 +3281,11 @@ Json ValidateRootFile(const std::string& input_path,
              start_time[channel] <= maximum_t0 &&
              std::fmod(start_time[channel], 2.0) == 0.0);
         const bool t0_consistent =
-            (start_time[channel] >= 0.0) ==
-            (pulse[channel] >
-             waveform_dsp_settings.pulse_start_threshold_adc);
+            peak_centered_charge
+                ? start_time[channel] >= 0.0
+                : (start_time[channel] >= 0.0) ==
+                      (pulse[channel] >
+                       waveform_dsp_settings.pulse_start_threshold_adc);
         if (!t0_in_range || !t0_consistent) ++accumulator.t0_violations;
         if (start_time[channel] >= 0.0) ++accumulator.t0_found;
         accumulator.pulse_min =
@@ -2964,6 +3308,7 @@ Json ValidateRootFile(const std::string& input_path,
                              : pulse_extremum >= kAdcMaximum - 0.5;
 
         if ((entry % sample_stride) == 0U) {
+          accumulator.charge_samples.push_back(charge[channel]);
           accumulator.baseline_samples.push_back(baseline[channel]);
           accumulator.bin_samples.push_back(baseline[channel]);
           if (entry >= tail_start) {
@@ -2993,7 +3338,7 @@ Json ValidateRootFile(const std::string& input_path,
                   waveforms[channel]->data(), waveforms[channel]->size(),
                   falling_polarity, waveform_dsp_settings);
               if (!ApproxEqual(derived.baseline, baseline[channel]) ||
-                  (scan_current_waveform_dsp &&
+                  (scan_explicit_waveform_dsp &&
                    !ApproxEqual(derived.short_charge,
                                 short_charge[channel])) ||
                   !ApproxEqual(derived.charge, charge[channel]) ||
@@ -3372,9 +3717,14 @@ Json ValidateRootFile(const std::string& input_path,
                    : "Channel mask and record length must be constant and agree with metadata.");
     if (!metadata.present &&
         std::any_of(observed_lengths.begin(), observed_lengths.end(),
-                    [](std::uint32_t length) { return length % 8U != 0U; })) {
+                    [](std::uint32_t length) {
+                      return length %
+                                 dt5730_constraints::
+                                     kRecordLengthGranularitySamples !=
+                             0U;
+                    })) {
       checks.Add("WARN", "compatibility", "legacy_record_length_granularity",
-                 observed_lengths, "current files use a multiple of 8",
+                 observed_lengths, "current files use a multiple of 10",
                  "This legacy file uses the older valid x730 multiple-of-4 "
                  "record-length convention; it is not classified as data "
                  "corruption.");
@@ -3457,9 +3807,11 @@ Json ValidateRootFile(const std::string& input_path,
   const std::optional<double> recorded_window_percent = current_timing_schema
       ? ReadParameter<double>(*file, "RecordedWindowToElapsed_pct")
       : std::nullopt;
-  const std::optional<int> dead_time_available = current_timing_schema
-      ? ReadParameter<int>(*file, "DeadTimeMeasurementAvailable")
-      : std::nullopt;
+  std::optional<int> dead_time_available;
+  if (current_timing_schema) {
+    dead_time_available =
+        ReadParameter<int>(*file, "DeadTimeMeasurementAvailable");
+  }
   const std::optional<std::string> dead_time_method = current_timing_schema
       ? ReadStringObject(*file, "DeadTimeMethod")
       : std::nullopt;
@@ -3993,9 +4345,12 @@ Json ValidateRootFile(const std::string& input_path,
         {{"channel", channel},
          {"active", active},
          {"trigger_enabled",
-          threshold.present ? Json(threshold.trigger_enabled) : Json(nullptr)},
+         threshold.present ? Json(threshold.trigger_enabled) : Json(nullptr)},
          {"threshold", std::move(threshold_json)},
-         {"metrics", std::move(metrics)}});
+         {"metrics", std::move(metrics)},
+         {"charge_histogram",
+          BuildChargeHistogram(accumulator, channel, sample_stride,
+                               partial_event_scan, scan_cancelled)}});
   }
 
   if (routing_evaluable != 0U) {

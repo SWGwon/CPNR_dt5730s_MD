@@ -2,6 +2,7 @@ import os
 import shutil
 import hashlib
 import json
+import re
 import signal
 import sys
 import tempfile
@@ -23,11 +24,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PyQt6.QtCore import QProcess, QSettings
     from PyQt6.QtGui import QCloseEvent
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QScrollArea
 except ImportError:  # pragma: no cover - optional outside the GUI environment
     QProcess = None
     QSettings = None
     QApplication = None
+    QScrollArea = None
     QCloseEvent = None
 
 
@@ -175,6 +177,23 @@ class GuiOperatorSafetyTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(predicate(), "condition was not reached before timeout")
 
+    @staticmethod
+    def replace_config_value(path, key, value):
+        text = Path(path).read_text(encoding="utf-8")
+        text, replacements = re.subn(
+            rf"(?m)^(\s*{re.escape(key)}\s*=\s*)[^#\n]+?(\s*(?:#.*)?)$",
+            rf"\g<1>{value}\2",
+            text,
+            count=1,
+        )
+        if replacements != 1:
+            raise AssertionError(f"could not replace {key} in {path}")
+        Path(path).write_text(text, encoding="utf-8")
+
+    @classmethod
+    def replace_config_integer(cls, path, key, value):
+        cls.replace_config_value(path, key, value)
+
     def test_zero_finite_stop_conditions_are_rejected(self):
         from widgets.DaqTab import validate_stop_condition
 
@@ -195,6 +214,7 @@ class GuiOperatorSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "run.conf"
             shutil.copy2(source, config_path)
+            self.replace_config_integer(config_path, "RecordLength", 1030)
             with (
                 mock.patch.object(
                     daq_module, "find_project_root", return_value=Path(directory)
@@ -228,6 +248,7 @@ class GuiOperatorSafetyTests(unittest.TestCase):
              tempfile.TemporaryDirectory() as output_dir:
             config_path = Path(project_dir) / "run.conf"
             shutil.copy2(source, config_path)
+            self.replace_config_integer(config_path, "RecordLength", 520)
             with (
                 mock.patch.object(
                     daq_module, "find_project_root",
@@ -248,14 +269,234 @@ class GuiOperatorSafetyTests(unittest.TestCase):
             plan = tab.last_storage_plan
             self.assertIsNotNone(plan)
             self.assertEqual(plan["output_parent"], str(selected.parent))
-            self.assertEqual(plan["event_bytes"], 24 + 4 * 512 * 2)
+            self.assertEqual(plan["event_bytes"], 24 + 4 * 520 * 2)
             self.assertEqual(
-                plan["expected_total_bytes"], (24 + 4 * 512 * 2) * 200000
+                plan["expected_total_bytes"], (24 + 4 * 520 * 2) * 200000
             )
             self.assertIn(str(selected.parent), tab.lbl_output_storage.text())
             self.assertIn("planned RAW", tab.lbl_output_storage.text())
             tab.disk_timer.stop()
             tab.deleteLater()
+
+    def test_daq_preflight_rejects_off_grid_record_but_ignores_legacy_gates(self):
+        from widgets import DaqTab as daq_module
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_inorganic.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "preflight.conf"
+            shutil.copy2(source, config_path)
+            with (
+                mock.patch.object(
+                    daq_module, "find_project_root",
+                    return_value=Path(directory),
+                ),
+                mock.patch.object(
+                    daq_module, "DatabaseManager", DummyDatabaseManager
+                ),
+            ):
+                tab = daq_module.DaqTab()
+            tab.config_input.setText(str(config_path))
+
+            self.replace_config_integer(config_path, "RecordLength", 1024)
+            with self.assertRaisesRegex(ValueError, "10 samples"):
+                tab.validate_config_before_start()
+
+            self.replace_config_integer(config_path, "RecordLength", 1030)
+            self.replace_config_integer(config_path, "LongGate", 721)
+            self.replace_config_integer(config_path, "ShortGate", 900)
+            self.assertEqual(
+                tab.validate_config_before_start(), str(config_path.resolve())
+            )
+
+            self.replace_config_value(config_path, "ShortGate", "abc")
+            with self.assertRaisesRegex(ValueError, "ShortGate"):
+                tab.validate_config_before_start()
+            self.replace_config_integer(
+                config_path, "ShortGate", (1 << 31)
+            )
+            with self.assertRaisesRegex(ValueError, "ShortGate"):
+                tab.validate_config_before_start()
+            self.replace_config_integer(config_path, "ShortGate", 900)
+
+            config_text = config_path.read_text(encoding="utf-8")
+            config_text, replacements = re.subn(
+                r"(?m)^(\s*LongGate\s*=\s*[^\n]+)$",
+                r"\1\nPulseStartThresholdAdc=nan",
+                config_text,
+                count=1,
+            )
+            self.assertEqual(replacements, 1)
+            config_path.write_text(config_text, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "PulseStartThresholdAdc"):
+                tab.validate_config_before_start()
+            self.replace_config_value(
+                config_path, "PulseStartThresholdAdc", 1 << 14
+            )
+            with self.assertRaisesRegex(ValueError, "PulseStartThresholdAdc"):
+                tab.validate_config_before_start()
+            self.replace_config_value(
+                config_path, "PulseStartThresholdAdc", (1 << 14) - 1
+            )
+            self.assertEqual(
+                tab.validate_config_before_start(), str(config_path.resolve())
+            )
+
+            self.replace_config_integer(config_path, "BaselineSamples", 311)
+            with self.assertRaisesRegex(ValueError, "BaselineSamples"):
+                tab.validate_config_before_start()
+            tab.disk_timer.stop()
+            tab.deleteLater()
+
+    def test_time_calculator_normalizes_and_applies_all_coupled_values(self):
+        from widgets.ConfigTab import ConfigTab
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_inorganic.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "time_plan.conf"
+            shutil.copy2(source, config_path)
+            for key, value in (
+                ("RecordLength", 256),
+                ("PostTrigger", 27),
+                ("BaselineSamples", 102),
+                ("ShortGate", 40),
+                ("LongGate", 70),
+            ):
+                self.replace_config_integer(config_path, key, value)
+
+            tab = ConfigTab()
+            tab.load_file(str(config_path))
+            self.assertEqual(tab.spin_record.value(), 256)
+            self.assertEqual(tab.spin_target_t0.value(), 256)
+            self.assertIn("256 requested", tab.lbl_res_record.text())
+            self.assertIn("260 effective", tab.lbl_res_record.text())
+            self.assertEqual(tab.time_dsp_plan.actual_pre_samples, 188)
+            self.assertEqual(tab.time_dsp_plan.actual_post_samples, 72)
+            self.assertEqual(tab.time_dsp_plan.post_trigger_percent, 27)
+            self.assertEqual(tab.time_dsp_plan.baseline_samples, 102)
+            self.assertTrue(tab.time_dsp_plan.preserved_gate_settings)
+
+            tab.apply_time_to_table()
+            self.assertEqual(
+                tab.table_value("Digitizer", "RecordLength"), "260"
+            )
+            self.assertEqual(
+                tab.table_value("Digitizer", "PostTrigger"), "27"
+            )
+            self.assertEqual(
+                tab.table_value("SoftwareDSP", "BaselineSamples"), "102"
+            )
+            self.assertEqual(
+                tab.table_value("SoftwareDSP", "ShortGate"), "40"
+            )
+            self.assertEqual(
+                tab.table_value("SoftwareDSP", "LongGate"), "70"
+            )
+            self.assertTrue(tab.is_dirty())
+            tab.deleteLater()
+
+    def test_software_random_trigger_controls_apply_and_pass_daq_preflight(self):
+        from core.dt5730_constraints import (
+            MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+            MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+        )
+        from widgets.ConfigTab import ConfigTab
+        from widgets import DaqTab as daq_module
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_inorganic.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "software_random.conf"
+            shutil.copy2(source, config_path)
+
+            config_tab = ConfigTab()
+            config_tab.load_file(str(config_path))
+            self.assertEqual(
+                config_tab.spin_random_rate.minimum(),
+                MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+            )
+            self.assertEqual(
+                config_tab.spin_random_rate.maximum(),
+                MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+            )
+            for invalid_rate in (
+                MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ / 2.0,
+                MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ + 1.0,
+            ):
+                with self.assertRaisesRegex(ValueError, "0.001.*100000"):
+                    ConfigTab.validate_trigger_values(
+                        1, 0, "OR", 0, 0, 1, invalid_rate
+                    )
+            config_tab.combo_trigger_source.setCurrentText(
+                ConfigTab.TRIGGER_SOURCE_RANDOM
+            )
+            config_tab.spin_random_rate.setValue(37.5)
+            self.app.processEvents()
+
+            self.assertTrue(config_tab.spin_random_rate.isEnabled())
+            self.assertEqual(
+                config_tab.table_value("Digitizer", "ExtTriggerMode"), "0"
+            )
+            self.assertEqual(
+                config_tab.table_value("Digitizer", "SelfTriggerMode"), "0"
+            )
+            self.assertEqual(
+                config_tab.table_value(
+                    "Digitizer", "SoftwareRandomTriggerMode"
+                ),
+                "1",
+            )
+            self.assertEqual(
+                config_tab.table_value(
+                    "Digitizer", "SoftwareRandomTriggerRateHz"
+                ),
+                "37.5",
+            )
+            self.assertEqual(
+                config_tab.table_value("Digitizer", "SelfTriggerMask"), "0"
+            )
+            config_tab.validate_trigger_table()
+            with mock.patch(
+                "widgets.ConfigTab.QMessageBox.critical"
+            ) as critical:
+                config_tab.save_config()
+            critical.assert_not_called()
+
+            with (
+                mock.patch.object(
+                    daq_module, "find_project_root", return_value=Path(directory)
+                ),
+                mock.patch.object(
+                    daq_module, "DatabaseManager", DummyDatabaseManager
+                ),
+            ):
+                daq_tab = daq_module.DaqTab()
+            daq_tab.config_input.setText(str(config_path))
+            self.assertEqual(
+                daq_tab.validate_config_before_start(),
+                str(config_path.resolve()),
+            )
+
+            config_text = config_path.read_text(encoding="utf-8")
+            config_text, replacements = re.subn(
+                r"(?m)^(\s*SoftwareRandomTriggerRateHz\s*=\s*)"
+                r"[^#\n]+?(\s*(?:#.*)?)$",
+                r"\g<1>0.0005\2",
+                config_text,
+                count=1,
+            )
+            self.assertEqual(replacements, 1)
+            config_path.write_text(config_text, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "0.001.*100000"):
+                daq_tab.validate_config_before_start()
+
+            daq_tab.disk_timer.stop()
+            daq_tab.deleteLater()
+            config_tab.deleteLater()
 
     def test_config_edit_emits_path_scoped_dirty_and_save_clears_it(self):
         from widgets.ConfigTab import ConfigTab
@@ -408,6 +649,7 @@ class GuiOperatorSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "dirty.conf"
             shutil.copy2(source, config_path)
+            self.replace_config_integer(config_path, "RecordLength", 1030)
             with (
                 mock.patch.object(
                     daq_module, "find_project_root", return_value=Path(directory)
@@ -463,6 +705,141 @@ class GuiOperatorSafetyTests(unittest.TestCase):
             self.assertEqual(
                 window.daq_tab.dirty_config_path, str(config_path.resolve())
             )
+            window.daq_tab.disk_timer.stop()
+            window.monitor_tab.cleanup()
+            window.deleteLater()
+
+    def test_mainwindow_tabs_scroll_and_window_can_shrink(self):
+        from widgets import DaqTab as daq_module
+        from widgets import ProductionTab as production_module
+        from windows.MainWindow import MainWindow
+
+        with (
+            mock.patch.object(
+                daq_module, "DatabaseManager", DummyDatabaseManager
+            ),
+            mock.patch.object(
+                production_module, "DatabaseManager", DummyDatabaseManager
+            ),
+        ):
+            window = MainWindow()
+
+        pages = (
+            window.daq_tab,
+            window.env_tab,
+            window.config_tab,
+            window.monitor_tab,
+            window.production_tab,
+            window.root_validation_tab,
+            window.database_tab,
+        )
+        self.assertEqual(window.tabs.count(), len(pages))
+        for index, page in enumerate(pages):
+            scroll_area = window.tabs.widget(index)
+            self.assertIsInstance(scroll_area, QScrollArea)
+            self.assertIs(scroll_area.widget(), page)
+            self.assertTrue(scroll_area.widgetResizable())
+
+        window.resize(1024, 600)
+        window.show()
+        self.app.processEvents()
+        self.assertLessEqual(window.width(), 1024)
+        self.assertLessEqual(window.height(), 600)
+
+        config_scroll = window.tabs.widget(2)
+        window.tabs.setCurrentIndex(2)
+        self.app.processEvents()
+        self.assertGreater(config_scroll.verticalScrollBar().maximum(), 0)
+
+        window.daq_tab.disk_timer.stop()
+        window.monitor_tab.cleanup()
+        window.close()
+        window.deleteLater()
+
+    def test_mainwindow_holds_monitor_snapshot_until_next_active_run(self):
+        from core.monitor_stream import RuntimeConfigReference
+        from widgets import DaqTab as daq_module
+        from widgets import ProductionTab as production_module
+        from windows.MainWindow import MainWindow
+
+        class ProcessState:
+            def __init__(self):
+                self.active = True
+
+            def isRunning(self):
+                return self.active
+
+            def has_pending_work(self):
+                return self.active
+
+        with tempfile.TemporaryDirectory() as directory:
+            first_snapshot = Path(directory) / "run071.dat.config.conf"
+            first_snapshot.write_text(
+                "[Digitizer]\nTriggerPolarity = 1\n", encoding="utf-8"
+            )
+            second_snapshot = Path(directory) / "run072.dat.config.conf"
+            second_snapshot.write_text(
+                "[Digitizer]\nTriggerPolarity = 0\n", encoding="utf-8"
+            )
+            first_sha = hashlib.sha256(first_snapshot.read_bytes()).hexdigest()
+            second_sha = hashlib.sha256(second_snapshot.read_bytes()).hexdigest()
+
+            with (
+                mock.patch.object(
+                    daq_module, "DatabaseManager", DummyDatabaseManager
+                ),
+                mock.patch.object(
+                    production_module, "DatabaseManager", DummyDatabaseManager
+                ),
+            ):
+                window = MainWindow()
+
+            process = ProcessState()
+            window.daq_tab.daq_process = process
+            window.daq_tab.current_run_context = {
+                "config_path": str(first_snapshot),
+                "config_sha256": first_sha,
+            }
+            active_reference = window._monitor_runtime_config_path()
+            self.assertEqual(
+                active_reference,
+                RuntimeConfigReference(str(first_snapshot), first_sha),
+            )
+
+            process.active = False
+            window.daq_tab.current_run_context = None
+            self.assertEqual(
+                window._monitor_runtime_config_path(), active_reference
+            )
+            window.monitor_tab._has_rendered_data = True
+            window._hold_monitor_preview_after_daq(0)
+            self.assertIn("HELD", window.monitor_tab.lbl_preview_status.text())
+
+            window.monitor_tab._set_preview_status(
+                "LIVE — next batch already active", "#146c43"
+            )
+            process.active = True
+            window._hold_monitor_preview_after_daq(0)
+            self.assertIn(
+                "next batch already active",
+                window.monitor_tab.lbl_preview_status.text(),
+            )
+
+            window.daq_tab.current_run_context = {
+                "config_path": str(second_snapshot),
+                "config_sha256": second_sha,
+            }
+            self.assertEqual(
+                window._monitor_runtime_config_path(),
+                RuntimeConfigReference(str(second_snapshot), second_sha),
+            )
+
+            window.daq_tab.current_run_context = {
+                "config_path": str(second_snapshot)
+            }
+            self.assertIsNone(window._monitor_runtime_config_path())
+
+            window.daq_tab.daq_process = None
             window.daq_tab.disk_timer.stop()
             window.monitor_tab.cleanup()
             window.deleteLater()

@@ -40,6 +40,13 @@ from core.runtime_paths import (  # noqa: E402
     validate_output_capacity,
     verify_paths_absent,
 )
+from core.dt5730_constraints import (  # noqa: E402
+    MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    derive_time_dsp_plan,
+    normalize_record_length,
+    predict_post_trigger,
+)
 
 
 class RuntimePathTests(unittest.TestCase):
@@ -151,20 +158,54 @@ class RuntimePathTests(unittest.TestCase):
 
     def test_raw_storage_estimate_matches_binary_event_format(self):
         # EventHeader is fixed at 24 bytes; ADC samples are uint16_t.
-        self.assertEqual(raw_event_size_bytes(512, 0b1111), 24 + 4 * 512 * 2)
+        self.assertEqual(raw_event_size_bytes(520, 0b1111), 24 + 4 * 520 * 2)
         self.assertEqual(
-            expected_raw_size_bytes(512, 0b1111, 200000),
-            (24 + 4 * 512 * 2) * 200000,
+            expected_raw_size_bytes(520, 0b1111, 200000),
+            (24 + 4 * 520 * 2) * 200000,
         )
         self.assertEqual(
-            expected_raw_size_bytes(512, 0b1111, 200000, segments=5),
-            (24 + 4 * 512 * 2) * 200000 * 5,
+            expected_raw_size_bytes(520, 0b1111, 200000, segments=5),
+            (24 + 4 * 520 * 2) * 200000 * 5,
         )
-        self.assertIsNone(expected_raw_size_bytes(512, 0b1111, 0))
+        self.assertIsNone(expected_raw_size_bytes(520, 0b1111, 0))
         with self.assertRaises(RuntimeValidationError):
-            raw_event_size_bytes(513, 0b1111)
+            raw_event_size_bytes(512, 0b1111)
         with self.assertRaises(RuntimeValidationError):
-            raw_event_size_bytes(512, 0)
+            raw_event_size_bytes(520, 0)
+
+    def test_dt5730_time_plan_mirrors_both_hardware_quantizers(self):
+        self.assertEqual(MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ, 0.001)
+        self.assertEqual(MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ, 100_000.0)
+        self.assertEqual(normalize_record_length(256), 260)
+        exact = predict_post_trigger(260, 27)
+        self.assertEqual(exact.register_locations, 9)
+        self.assertEqual(exact.actual_pre_samples, 188)
+        self.assertEqual(exact.actual_post_samples, 72)
+        self.assertEqual(exact.readback_percent, 27)
+        self.assertTrue(exact.exact_readback)
+
+        rounded = predict_post_trigger(260, 28)
+        self.assertEqual(rounded.actual_post_samples, 72)
+        self.assertEqual(rounded.readback_percent, 27)
+        self.assertFalse(rounded.exact_readback)
+
+        preserved = derive_time_dsp_plan(
+            256, 256, current_short_gate=40, current_long_gate=70
+        )
+        self.assertEqual(preserved.record_length, 260)
+        self.assertEqual(preserved.post_trigger_percent, 27)
+        self.assertEqual(preserved.achieved_t0_ns, 256.0)
+        self.assertEqual(preserved.baseline_samples, 102)
+        self.assertEqual(preserved.short_gate_samples, 40)
+        self.assertEqual(preserved.long_gate_samples, 70)
+        self.assertTrue(preserved.preserved_gate_settings)
+
+        repaired = derive_time_dsp_plan(
+            256, 256, current_short_gate=150, current_long_gate=1500
+        )
+        self.assertEqual(repaired.short_gate_samples, 40)
+        self.assertEqual(repaired.long_gate_samples, 72)
+        self.assertFalse(repaired.preserved_gate_settings)
 
     def test_output_capacity_rule_includes_raw_estimate_and_reserve(self):
         mib = 1024 * 1024

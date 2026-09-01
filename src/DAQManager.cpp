@@ -1,5 +1,6 @@
 #include "DAQManager.h"
 #include "DataQuality.h"
+#include "DT5730Constraints.h"
 #include "DT5730Status.h"
 #include "DT5730Timing.h"
 #include "Sha256.h"
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -725,6 +727,25 @@ std::string DescribeTriggerRouting(uint32_t self_trigger_mask,
   return description.str();
 }
 
+uint64_t MakeRandomTriggerSeed(int run_number) {
+  const auto steady_ticks = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto system_ticks = static_cast<uint64_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  uint64_t seed = steady_ticks ^ (system_ticks + 0x9E3779B97F4A7C15ULL) ^
+                  (static_cast<uint64_t>(static_cast<uint32_t>(run_number))
+                   << 32U) ^
+                  static_cast<uint64_t>(::getpid());
+  try {
+    std::random_device entropy;
+    seed ^= (static_cast<uint64_t>(entropy()) << 32U) ^ entropy();
+  } catch (...) {
+    // Clock, PID, and run identity still provide a run-specific fallback on
+    // platforms where std::random_device is unavailable.
+  }
+  return seed != 0U ? seed : 0xD1B54A32D192ED03ULL;
+}
+
 }  // namespace
 
 DAQManager::DAQManager(const std::string &config_file,
@@ -750,6 +771,9 @@ DAQManager::DAQManager(const std::string &config_file,
       run_number_(PositiveRunNumber(run_number)), max_events_(max_events),
       run_time_sec_(run_time_sec), running_(false),
       cancellation_flag_(cancellation_flag) {
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    software_random_trigger_seed_ = MakeRandomTriggerSeed(run_number_);
+  }
   expected_raw_bytes_ = ExpectedRawBytes(hardware_settings_, max_events_);
   output_free_bytes_at_start_ = FilesystemFreeBytes(working_output_file_);
   std::cout << "\033[1;36m[Storage Preflight]\033[0m filesystem_free="
@@ -1027,10 +1051,15 @@ void DAQManager::SetupHardware() {
                                           hardware_settings_.post_trigger));
   CAEN_CHECK(CAEN_DGTZ_GetPostTriggerSize(handle,
                                           &post_trigger_readback_));
-  if (post_trigger_readback_ != hardware_settings_.post_trigger) {
+  const uint32_t expected_post_trigger_readback =
+      dt5730_constraints::PredictPostTriggerLayout(
+          record_length_readback, hardware_settings_.post_trigger)
+          .predicted_readback_percent;
+  if (post_trigger_readback_ != expected_post_trigger_readback) {
     throw std::runtime_error(
         "Post-trigger readback mismatch: requested " +
-        std::to_string(hardware_settings_.post_trigger) + ", read back " +
+        std::to_string(hardware_settings_.post_trigger) + ", expected " +
+        std::to_string(expected_post_trigger_readback) + ", observed " +
         std::to_string(post_trigger_readback_));
   }
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
@@ -1478,6 +1507,7 @@ void DAQManager::ConfigureAndVerifyTriggerRouting(int handle) {
   // Explicit split-mask configurations do not allow software triggers to
   // bypass the selected physical route.  Legacy configs preserve old behavior.
   const bool software_trigger_enabled =
+      hardware_settings_.software_random_trigger_mode != 0 ||
       !hardware_settings_.explicit_trigger_routing;
   CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(
       handle, software_trigger_enabled ? trigger_mode
@@ -1550,6 +1580,10 @@ void DAQManager::ConfigureAndVerifyTriggerRouting(int handle) {
     }
   } else {
     std::cout << ", self-trigger disabled";
+  }
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    std::cout << ", software-random=" << std::fixed << std::setprecision(6)
+              << hardware_settings_.software_random_trigger_rate_hz << " Hz";
   }
   std::cout << ", global readback=" << Hex32(global_trigger_mask_readback_)
             << ".\n";
@@ -2022,6 +2056,18 @@ void DAQManager::WriteRuntimeArtifacts() {
            << zmq_send_hwm_approx_bytes_
            << ", \"runtime_configuration_checks\": "
            << runtime_configuration_checks_
+           << ", \"software_random_triggers_sent\": "
+           << software_random_triggers_sent_
+           << ", \"software_random_trigger_elapsed_sec\": "
+           << software_random_trigger_elapsed_sec_
+           << ", \"software_random_trigger_effective_rate_hz\": ";
+  if (software_random_trigger_elapsed_sec_ > 0.0) {
+    metadata << (static_cast<double>(software_random_triggers_sent_) /
+                 software_random_trigger_elapsed_sec_);
+  } else {
+    metadata << "null";
+  }
+  metadata
            << ", \"subscriber_delivery_evidence\": "
               "\"unavailable_pub_socket_may_drop_silently\""
            << ", \"max_temperature_c\": [";
@@ -2117,7 +2163,20 @@ void DAQManager::WriteRuntimeArtifacts() {
            << latest_status_register_ << ",\n"
            << "    \"latest_board_failure_status_register\": "
            << latest_board_failure_register_ << ",\n"
-           << "    \"waveform_dsp_schema\": 1,\n"
+           << "    \"waveform_dsp_schema\": "
+           << cpnr::kWaveformDspCurrentSchema << ",\n"
+           << "    \"dsp_charge_anchor\": \""
+           << cpnr::kPeakCenteredChargeAnchor << "\",\n"
+           << "    \"dsp_charge_window_pre_ns\": "
+           << cpnr::kPeakCenteredChargePreNs << ",\n"
+           << "    \"dsp_charge_window_post_ns\": "
+           << cpnr::kPeakCenteredChargePostNs << ",\n"
+           << "    \"dsp_charge_window_samples\": "
+           << cpnr::kPeakCenteredChargeWindowSamples << ",\n"
+           << "    \"dsp_short_charge_semantics\": \""
+           << cpnr::kPeakCenteredShortChargeSemantics << "\",\n"
+           << "    \"dsp_pulse_time_semantics\": \""
+           << cpnr::kPeakCenteredPulseTimeSemantics << "\",\n"
            << "    \"dsp_baseline_samples\": "
            << hardware_settings_.software_dsp.waveform.baseline_samples
            << ",\n"
@@ -2154,6 +2213,8 @@ void DAQManager::WriteRuntimeArtifacts() {
            << channel_mask_readback_ << ",\n"
            << "    \"record_length\": " << hardware_settings_.record_length
            << ",\n"
+           << "    \"record_length_granularity_samples\": "
+           << dt5730_constraints::kRecordLengthGranularitySamples << ",\n"
            << "    \"post_trigger_percent\": "
            << hardware_settings_.post_trigger << ",\n"
            << "    \"post_trigger_readback_percent\": "
@@ -2162,6 +2223,17 @@ void DAQManager::WriteRuntimeArtifacts() {
            << hardware_settings_.ext_trigger_mode << ",\n"
            << "    \"self_trigger_mode\": "
            << hardware_settings_.self_trigger_mode << ",\n"
+           << "    \"software_random_trigger_mode\": "
+           << hardware_settings_.software_random_trigger_mode << ",\n"
+           << "    \"software_random_trigger_rate_hz\": "
+           << hardware_settings_.software_random_trigger_rate_hz << ",\n"
+           << "    \"software_random_trigger_seed\": ";
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    metadata << software_random_trigger_seed_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ",\n"
            << "    \"self_trigger_mask\": "
            << hardware_settings_.self_trigger_mask << ",\n"
            << "    \"pair_logic\": \""
@@ -2475,6 +2547,12 @@ void DAQManager::Start(std::atomic<bool>& is_running) {
   if (max_events_ > 0) std::cout << max_events_ << " Events\n";
   else if (run_time_sec_ > 0) std::cout << run_time_sec_ << " Seconds\n";
   else std::cout << "Unlimited (Manual Stop)\n";
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    std::cout << " - Trigger Source  : Software Random (Poisson, mean "
+              << std::fixed << std::setprecision(6)
+              << hardware_settings_.software_random_trigger_rate_hz
+              << " Hz)\n";
+  }
 
   const auto finalize_prestart_cancellation = [&]() {
     termination_reason_ = "cancelled_before_start";
@@ -2568,6 +2646,28 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   uint64_t ttt_rollovers = 0;
 
   auto start_time = std::chrono::steady_clock::now();
+  const bool software_random_trigger =
+      hardware_settings_.software_random_trigger_mode != 0;
+  std::mt19937_64 random_trigger_engine(software_random_trigger_seed_);
+  std::exponential_distribution<double> random_trigger_interval(
+      software_random_trigger
+          ? hardware_settings_.software_random_trigger_rate_hz
+          : 1.0);
+  auto next_random_trigger = start_time;
+  const auto schedule_next_random_trigger =
+      [&](std::chrono::steady_clock::time_point from) {
+        auto interval = std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(
+                random_trigger_interval(random_trigger_engine)));
+        if (interval <= std::chrono::steady_clock::duration::zero()) {
+          interval = std::chrono::steady_clock::duration{1};
+        }
+        next_random_trigger = from + interval;
+      };
+  if (software_random_trigger) {
+    schedule_next_random_trigger(start_time);
+  }
   auto last_log_time = start_time;
   auto last_health_check = start_time;
   auto last_configuration_check = start_time;
@@ -2596,6 +2696,20 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
       }
     }
 
+    const auto loop_now = std::chrono::steady_clock::now();
+    if (software_random_trigger) {
+      software_random_trigger_elapsed_sec_ =
+          std::chrono::duration<double>(loop_now - start_time).count();
+      if (loop_now >= next_random_trigger) {
+        CAEN_CHECK(CAEN_DGTZ_SendSWtrigger(handle));
+        ++software_random_triggers_sent_;
+        // Schedule from the actual send time. Host/readout stalls therefore
+        // reduce the effective rate instead of creating a dangerous catch-up
+        // burst of backlogged software triggers.
+        schedule_next_random_trigger(loop_now);
+      }
+    }
+
     uint32_t bsize = 0; 
 
     try {
@@ -2621,7 +2735,14 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
     previous_read_completed_time = read_completed_time;
 
     if (bsize == 0U) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      auto wake_time = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(1);
+      if (software_random_trigger && next_random_trigger < wake_time) {
+        wake_time = next_random_trigger;
+      }
+      if (wake_time > std::chrono::steady_clock::now()) {
+        std::this_thread::sleep_until(wake_time);
+      }
     }
 
     try {
@@ -2973,6 +3094,11 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             : "completed";
   }
 
+  if (software_random_trigger) {
+    software_random_trigger_elapsed_sec_ = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time).count();
+  }
+
   CAEN_CHECK(CAEN_DGTZ_SWStopAcquisition(handle));
   std::cout << "\n\033[1;31m[DAQManager] Stopped Acquisition.\033[0m\n";
 
@@ -2995,6 +3121,11 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   
   const double avg_rate = dt5730_timing::AverageRecordedEventRateHz(
       recorded_events_, final_real_time_sec);
+  const double software_random_effective_rate =
+      software_random_trigger_elapsed_sec_ > 0.0
+          ? static_cast<double>(software_random_triggers_sent_) /
+                software_random_trigger_elapsed_sec_
+          : 0.0;
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
@@ -3005,6 +3136,19 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             << " - HW Dead Time   : N/A (no hardware busy/live-time scaler)\n"
             << " - Total Events    : " << recorded_events_ << " events\n"
             << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n" 
+            << (software_random_trigger ? " - SW Random Req    : " : "")
+            << (software_random_trigger
+                    ? std::to_string(
+                          hardware_settings_.software_random_trigger_rate_hz) +
+                          " Hz\n"
+                    : "")
+            << (software_random_trigger ? " - SW Random Sent   : " : "")
+            << (software_random_trigger
+                    ? std::to_string(software_random_triggers_sent_) +
+                          " (effective " +
+                          std::to_string(software_random_effective_rate) +
+                          " Hz)\n"
+                    : "")
             << " - Lost Events     : " << lost_events_ << " events (24-bit board-counter gaps)\n"
             << " - Data Size Saved : " << std::fixed << std::setprecision(2) << (total_bytes_written / (1024.0 * 1024.0)) << " MB\n"
             << "\033[1;36m=========================================\033[0m\n\n";

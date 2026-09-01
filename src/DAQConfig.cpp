@@ -1,4 +1,5 @@
 #include "DAQConfig.h"
+#include "DT5730Constraints.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +25,8 @@ const ConfigSchema& DAQConfigSchema() {
         {"Digitizer",
          {"RecordLength", "ChannelMask", "SelfTriggerMask", "PostTrigger",
           "InputRangeMv", "ADCBits", "TriggerPolarity", "ExtTriggerMode",
-          "SelfTriggerMode"}},
+          "SelfTriggerMode", "SoftwareRandomTriggerMode",
+          "SoftwareRandomTriggerRateHz"}},
         {"HardwareCoincidence", {"PairLogic"}},
         {"Synchronization", {"ClockSource", "RunSyncMode"}},
         {"TriggerCalibration",
@@ -184,7 +186,10 @@ double OptionalFiniteDouble(const ConfigParser& config,
 
 }  // namespace
 
-DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
+DAQHardwareSettings LoadDAQHardwareSettings(
+    const ConfigParser& config,
+    DAQRecordLengthContract record_length_contract,
+    DAQWaveformDspContract waveform_dsp_contract) {
   ValidateDAQConfigSchema(config);
   DAQHardwareSettings settings;
   settings.connection.type = config.GetString("Connection", "Type", "USB");
@@ -219,11 +224,89 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
                               std::numeric_limits<int>::max()));
   }
   settings.record_length = static_cast<uint32_t>(
-      config.GetRequiredInt("Digitizer", "RecordLength", 128, 102400));
+      config.GetRequiredInt(
+          "Digitizer", "RecordLength",
+          static_cast<int>(
+              dt5730_constraints::kMinimumRecordLengthSamples),
+          static_cast<int>(
+              dt5730_constraints::kMaximumRecordLengthSamples)));
   settings.channel_mask = static_cast<uint32_t>(
       config.GetRequiredInt("Digitizer", "ChannelMask", 1, (1 << MAX_CH) - 1));
   settings.post_trigger = static_cast<uint32_t>(
       config.GetRequiredInt("Digitizer", "PostTrigger", 0, 100));
+  const bool current_record_length =
+      dt5730_constraints::IsSupportedRecordLength(settings.record_length);
+  const bool legacy_record_length =
+      settings.record_length >=
+          dt5730_constraints::kMinimumRecordLengthSamples &&
+      settings.record_length <=
+          dt5730_constraints::kMaximumRecordLengthSamples &&
+      settings.record_length % 8U == 0U;
+  const bool accepted_record_length =
+      record_length_contract == DAQRecordLengthContract::kCurrentX730
+          ? current_record_length
+          : record_length_contract ==
+                    DAQRecordLengthContract::kLegacyMultipleOf8
+              ? legacy_record_length
+              : current_record_length || legacy_record_length;
+  if (!accepted_record_length) {
+    const std::string required_granularity =
+        record_length_contract == DAQRecordLengthContract::kCurrentX730
+            ? "a multiple of 10"
+            : record_length_contract ==
+                      DAQRecordLengthContract::kLegacyMultipleOf8
+                  ? "a legacy multiple of 8"
+                  : "a multiple of 10 or a legacy multiple of 8";
+    throw std::runtime_error(
+        "[Digitizer] RecordLength must be in range " +
+        std::to_string(dt5730_constraints::kMinimumRecordLengthSamples) +
+        ".." +
+        std::to_string(dt5730_constraints::kMaximumRecordLengthSamples) +
+        " and " + required_granularity);
+  }
+  struct TimingRegion {
+    uint32_t pre_trigger_samples;
+    uint32_t post_trigger_samples;
+  };
+  std::vector<TimingRegion> timing_regions;
+  if (record_length_contract !=
+          DAQRecordLengthContract::kLegacyMultipleOf8 &&
+      current_record_length) {
+    const auto post_trigger_layout =
+        dt5730_constraints::PredictPostTriggerLayout(
+            settings.record_length, settings.post_trigger);
+    timing_regions.push_back({post_trigger_layout.pre_trigger_samples,
+                              post_trigger_layout.post_trigger_samples});
+  }
+  if (record_length_contract != DAQRecordLengthContract::kCurrentX730 &&
+      legacy_record_length) {
+    // Preserve the exact offline parsing semantics used by artifacts written
+    // before the hardware-native 10-sample contract was introduced.
+    const uint32_t legacy_pre_trigger_samples = static_cast<uint32_t>(
+        static_cast<uint64_t>(settings.record_length) *
+        (100U - settings.post_trigger) / 100U);
+    timing_regions.push_back(
+        {legacy_pre_trigger_samples,
+         settings.record_length - legacy_pre_trigger_samples});
+  }
+  const auto usable_timing_region = std::find_if(
+      timing_regions.begin(), timing_regions.end(), [](const TimingRegion& r) {
+        return r.pre_trigger_samples >=
+               dt5730_constraints::kMinimumPreTriggerSamples;
+      });
+  if (usable_timing_region == timing_regions.end()) {
+    throw std::runtime_error(
+        "[Digitizer] RecordLength/PostTrigger leave less than 160 ns "
+        "pre-trigger time under the selected record-length contract");
+  }
+  // Current timing is preferred for defaults when an unauthenticated recovery
+  // config lies on both grids. Explicit DSP values are validated against each
+  // complete candidate below, so a legacy pre region is never mixed with a
+  // current post region (or vice versa).
+  const uint32_t pre_trigger_samples =
+      usable_timing_region->pre_trigger_samples;
+  const uint32_t post_trigger_samples =
+      usable_timing_region->post_trigger_samples;
   settings.input_range_mv = OptionalUnsigned(
       config, "Digitizer", "InputRangeMv", 2000, 500, 2000);
   if (settings.input_range_mv != 500 && settings.input_range_mv != 2000) {
@@ -238,6 +321,44 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
       config.GetRequiredInt("Digitizer", "ExtTriggerMode", 0, 1);
   settings.self_trigger_mode =
       config.GetRequiredInt("Digitizer", "SelfTriggerMode", 0, 1);
+  settings.software_random_trigger_mode =
+      config.GetInt("Digitizer", "SoftwareRandomTriggerMode", 0);
+  if (settings.software_random_trigger_mode < 0 ||
+      settings.software_random_trigger_mode > 1) {
+    throw std::runtime_error(
+        "[Digitizer] SoftwareRandomTriggerMode must be 0 or 1");
+  }
+  const bool has_software_random_rate =
+      HasValue(config, "Digitizer", "SoftwareRandomTriggerRateHz");
+  if (settings.software_random_trigger_mode != 0) {
+    if (!has_software_random_rate) {
+      throw std::runtime_error(
+          "[Digitizer] SoftwareRandomTriggerRateHz is required when "
+          "SoftwareRandomTriggerMode is enabled");
+    }
+    settings.software_random_trigger_rate_hz =
+        config.GetDouble("Digitizer", "SoftwareRandomTriggerRateHz", 0.0);
+    if (!std::isfinite(settings.software_random_trigger_rate_hz) ||
+        settings.software_random_trigger_rate_hz <
+            kMinimumSoftwareRandomTriggerRateHz ||
+        settings.software_random_trigger_rate_hz >
+            kMaximumSoftwareRandomTriggerRateHz) {
+      throw std::runtime_error(
+          "[Digitizer] SoftwareRandomTriggerRateHz must be finite and in "
+          "range " +
+          std::to_string(kMinimumSoftwareRandomTriggerRateHz) + ".." +
+          std::to_string(kMaximumSoftwareRandomTriggerRateHz) + " Hz");
+    }
+  } else if (has_software_random_rate) {
+    settings.software_random_trigger_rate_hz =
+        config.GetDouble("Digitizer", "SoftwareRandomTriggerRateHz", 0.0);
+    if (!std::isfinite(settings.software_random_trigger_rate_hz) ||
+        settings.software_random_trigger_rate_hz != 0.0) {
+      throw std::runtime_error(
+          "[Digitizer] SoftwareRandomTriggerRateHz must be 0 when "
+          "SoftwareRandomTriggerMode is disabled");
+    }
+  }
   settings.clock_source =
       config.GetInt("Synchronization", "ClockSource", 0);
   if (settings.clock_source < 0 || settings.clock_source > 1) {
@@ -295,17 +416,15 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
         "[DataQuality] MaxLostFraction must be finite and in range 0..1");
   }
 
-  const uint64_t pre_trigger_samples =
-      static_cast<uint64_t>(settings.record_length) *
-      (100U - settings.post_trigger) / 100U;
-  const uint64_t post_trigger_samples =
-      static_cast<uint64_t>(settings.record_length) - pre_trigger_samples;
   const uint32_t default_baseline_samples = static_cast<uint32_t>(
-      std::min<uint64_t>(150U, pre_trigger_samples));
+      std::min<uint32_t>(150U, pre_trigger_samples));
   const uint32_t default_long_gate_samples = static_cast<uint32_t>(
-      std::min<uint64_t>(200U, post_trigger_samples));
+      std::min<uint32_t>(200U, post_trigger_samples));
   const uint32_t default_short_gate_samples =
       std::min<uint32_t>(40U, default_long_gate_samples);
+  const bool legacy_threshold_gates =
+      waveform_dsp_contract ==
+      DAQWaveformDspContract::kLegacyThresholdGates;
 
   settings.software_dsp.coincidence_window_ns = OptionalUnsigned(
       config, "SoftwareDSP", "CoincidenceWindow", 20, 1, 1000000);
@@ -315,26 +434,80 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
       settings.record_length);
   waveform_dsp.short_gate_samples = OptionalUnsigned(
       config, "SoftwareDSP", "ShortGate", default_short_gate_samples, 1,
-      settings.record_length);
+      legacy_threshold_gates
+          ? settings.record_length
+          : static_cast<uint32_t>(std::numeric_limits<int>::max()));
   waveform_dsp.long_gate_samples = OptionalUnsigned(
       config, "SoftwareDSP", "LongGate", default_long_gate_samples, 1,
-      settings.record_length);
-  waveform_dsp.pulse_start_threshold_adc = OptionalFiniteDouble(
-      config, "SoftwareDSP", "PulseStartThresholdAdc", 30.0, 0.0,
-      static_cast<double>((1U << settings.adc_bits) - 1U));
-
-  if (waveform_dsp.baseline_samples > pre_trigger_samples) {
-    throw std::runtime_error(
-        "[SoftwareDSP] BaselineSamples exceeds the configured pre-trigger "
-        "region");
+      legacy_threshold_gates
+          ? settings.record_length
+          : static_cast<uint32_t>(std::numeric_limits<int>::max()));
+  if (legacy_threshold_gates) {
+    waveform_dsp.pulse_start_threshold_adc = OptionalFiniteDouble(
+        config, "SoftwareDSP", "PulseStartThresholdAdc", 30.0, 0.0,
+        static_cast<double>((1U << settings.adc_bits) - 1U));
+  } else {
+    waveform_dsp.pulse_start_threshold_adc =
+        config.GetDouble("SoftwareDSP", "PulseStartThresholdAdc", 30.0);
+    const double maximum_threshold_adc =
+        static_cast<double>((1U << settings.adc_bits) - 1U);
+    if (!std::isfinite(waveform_dsp.pulse_start_threshold_adc) ||
+        waveform_dsp.pulse_start_threshold_adc < 0.0 ||
+        waveform_dsp.pulse_start_threshold_adc > maximum_threshold_adc) {
+      throw std::runtime_error(
+          "Config value out of range [SoftwareDSP] PulseStartThresholdAdc");
+    }
   }
-  if (waveform_dsp.short_gate_samples > waveform_dsp.long_gate_samples) {
+
+  if (legacy_threshold_gates &&
+      waveform_dsp.short_gate_samples > waveform_dsp.long_gate_samples) {
     throw std::runtime_error(
         "[SoftwareDSP] ShortGate must not exceed LongGate");
   }
-  if (waveform_dsp.long_gate_samples > post_trigger_samples) {
-    throw std::runtime_error(
-        "[SoftwareDSP] LongGate exceeds the configured post-trigger region");
+  const auto timing_region_accepts_dsp =
+      [&](const TimingRegion& region) {
+        return region.pre_trigger_samples >=
+                   dt5730_constraints::kMinimumPreTriggerSamples &&
+               waveform_dsp.baseline_samples <= region.pre_trigger_samples &&
+               (!legacy_threshold_gates ||
+                waveform_dsp.long_gate_samples <=
+                    region.post_trigger_samples);
+      };
+  if (std::none_of(timing_regions.begin(), timing_regions.end(),
+                   timing_region_accepts_dsp)) {
+    const auto eligible_region = [](const TimingRegion& region) {
+      return region.pre_trigger_samples >=
+             dt5730_constraints::kMinimumPreTriggerSamples;
+    };
+    const bool baseline_exceeds_every_region = std::none_of(
+        timing_regions.begin(), timing_regions.end(),
+        [&](const TimingRegion& region) {
+          return eligible_region(region) &&
+                 waveform_dsp.baseline_samples <= region.pre_trigger_samples;
+        });
+    if (baseline_exceeds_every_region) {
+      throw std::runtime_error(
+          "[SoftwareDSP] BaselineSamples exceeds the configured pre-trigger "
+          "region");
+    }
+    if (legacy_threshold_gates) {
+      const bool long_gate_exceeds_every_region = std::none_of(
+          timing_regions.begin(), timing_regions.end(),
+          [&](const TimingRegion& region) {
+            return eligible_region(region) &&
+                   waveform_dsp.long_gate_samples <=
+                       region.post_trigger_samples;
+          });
+      if (long_gate_exceeds_every_region) {
+        throw std::runtime_error(
+            "[SoftwareDSP] LongGate exceeds the configured post-trigger "
+            "region");
+      }
+      throw std::runtime_error(
+          "[SoftwareDSP] BaselineSamples and LongGate do not fit the same "
+          "pre/post-trigger layout under the selected record-length "
+          "contract");
+    }
   }
 
   const bool has_self_trigger_mask =
@@ -364,18 +537,17 @@ DAQHardwareSettings LoadDAQHardwareSettings(const ConfigParser& config) {
     settings.pair_logic = ParsePairLogic(config);
   }
 
-  if (settings.record_length % 8 != 0) {
-    throw std::runtime_error("[Digitizer] RecordLength must be a multiple of 8");
-  }
-  if (static_cast<uint64_t>(settings.record_length) *
-          (100U - settings.post_trigger) <
-      8000U) {
+  if (settings.software_random_trigger_mode != 0 &&
+      (settings.ext_trigger_mode != 0 || settings.self_trigger_mode != 0)) {
     throw std::runtime_error(
-        "[Digitizer] RecordLength/PostTrigger leave less than 160 ns pre-trigger time");
+        "[Digitizer] SoftwareRandomTriggerMode is mutually exclusive with "
+        "ExtTriggerMode and SelfTriggerMode");
   }
-  if (settings.ext_trigger_mode == 0 && settings.self_trigger_mode == 0) {
+  if (settings.ext_trigger_mode == 0 && settings.self_trigger_mode == 0 &&
+      settings.software_random_trigger_mode == 0) {
     throw std::runtime_error(
-        "[Digitizer] ExtTriggerMode and SelfTriggerMode cannot both be disabled");
+        "[Digitizer] ExtTriggerMode, SelfTriggerMode, and "
+        "SoftwareRandomTriggerMode cannot all be disabled");
   }
   if ((settings.self_trigger_mask & ~settings.channel_mask) != 0U) {
     throw std::runtime_error(

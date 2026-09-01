@@ -24,6 +24,9 @@ struct RawRootFidelitySettings {
   std::string expected_sha256;
   std::uint64_t expected_events = 0U;
   std::uint32_t expected_record_length = 0U;
+  // New x730 acquisitions use 10 samples; authenticated legacy metadata may
+  // explicitly select the former software contract of 8 samples.
+  std::uint32_t expected_record_length_granularity = 10U;
   std::uint16_t expected_channel_mask = 0U;
   bool falling_polarity = true;
   WaveformDspSettings waveform_dsp{};

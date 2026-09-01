@@ -1,6 +1,8 @@
 #include "ConfigParser.h"
 #include "DAQConfig.h"
+#include "DT5730Constraints.h"
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -116,7 +119,7 @@ int main() {
 
     const std::string valid_daq_config =
         "[Digitizer]\n"
-        "RecordLength=1024\n"
+        "RecordLength=1030\n"
         "ChannelMask=3\n"
         "SelfTriggerMask=3\n"
         "PostTrigger=70\n"
@@ -135,7 +138,7 @@ int main() {
     WriteFile(valid_daq_path, valid_daq_config);
     ConfigParser valid_daq_parser(valid_daq_path.string());
     const DAQHardwareSettings settings = LoadDAQHardwareSettings(valid_daq_parser);
-    Check(settings.record_length == 1024, "DAQ schema record length");
+    Check(settings.record_length == 1030, "DAQ schema record length");
     Check(settings.channel_mask == 3, "DAQ schema channel mask");
     Check(settings.self_trigger_mask == 3, "DAQ schema self-trigger mask");
     Check(settings.explicit_trigger_routing,
@@ -158,6 +161,120 @@ int main() {
           "DAQ schema active-channel settings");
     Check(!settings.channels[1].threshold_is_relative_mv,
           "legacy absolute threshold mode");
+
+    const auto quantized_layout =
+        dt5730_constraints::PredictPostTriggerLayout(260U, 27U);
+    Check(quantized_layout.register_value == 9U &&
+              quantized_layout.pre_trigger_samples == 188U &&
+              quantized_layout.post_trigger_samples == 72U &&
+              quantized_layout.predicted_readback_percent == 27U,
+          "x730 post-trigger quantization predicts K and actual sample "
+          "regions");
+
+    std::string quantized_dsp_config = valid_daq_config;
+    quantized_dsp_config.replace(
+        quantized_dsp_config.find("RecordLength=1030"),
+        std::string("RecordLength=1030").size(), "RecordLength=260");
+    quantized_dsp_config.replace(
+        quantized_dsp_config.find("PostTrigger=70"),
+        std::string("PostTrigger=70").size(), "PostTrigger=27");
+    const auto quantized_dsp_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(quantized_dsp_config,
+                               "quantized-dsp-defaults-test"));
+    Check(quantized_dsp_settings.software_dsp.waveform.baseline_samples ==
+                  150U &&
+              quantized_dsp_settings.software_dsp.waveform
+                      .short_gate_samples == 40U &&
+              quantized_dsp_settings.software_dsp.waveform
+                      .long_gate_samples == 72U,
+          "DSP defaults use the hardware-quantized pre/post sample regions");
+
+    std::string quantized_dsp_bounds_config = quantized_dsp_config;
+    quantized_dsp_bounds_config.insert(
+        quantized_dsp_bounds_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nBaselineSamples=188\nShortGate=40\nLongGate=72\n");
+    (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+        quantized_dsp_bounds_config, "quantized-dsp-bounds-test"));
+    quantized_dsp_bounds_config.replace(
+        quantized_dsp_bounds_config.find("BaselineSamples=188"),
+        std::string("BaselineSamples=188").size(), "BaselineSamples=189");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              quantized_dsp_bounds_config,
+              "quantized-dsp-pre-bound-test"));
+        },
+        "BaselineSamples exceeds",
+        "DSP baseline bound uses actual quantized pre-trigger samples");
+
+    quantized_dsp_bounds_config.replace(
+        quantized_dsp_bounds_config.find("BaselineSamples=189"),
+        std::string("BaselineSamples=189").size(), "BaselineSamples=188");
+    quantized_dsp_bounds_config.replace(
+        quantized_dsp_bounds_config.find("LongGate=72"),
+        std::string("LongGate=72").size(), "LongGate=73");
+    const auto peak_centered_dsp_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(quantized_dsp_bounds_config,
+                               "peak-centered-dsp-post-bound-test"));
+    Check(peak_centered_dsp_settings.software_dsp.waveform
+                  .long_gate_samples == 73U,
+          "schema-3 parser retains a legacy LongGate beyond the post-trigger "
+          "region as non-blocking provenance");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              quantized_dsp_bounds_config,
+              "legacy-dsp-post-bound-test"),
+              DAQRecordLengthContract::kCurrentX730,
+              DAQWaveformDspContract::kLegacyThresholdGates);
+        },
+        "LongGate exceeds",
+        "legacy DSP long-gate bound uses actual quantized post-trigger "
+        "samples");
+
+    std::string peak_provenance_config = quantized_dsp_config;
+    peak_provenance_config.insert(
+        peak_provenance_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nBaselineSamples=188\nShortGate=2000\n"
+        "LongGate=1500\nPulseStartThresholdAdc=0\n");
+    const auto peak_provenance_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(peak_provenance_config,
+                               "peak-centered-legacy-provenance-test"));
+    Check(peak_provenance_settings.software_dsp.waveform.short_gate_samples ==
+                  2000U &&
+              peak_provenance_settings.software_dsp.waveform
+                      .long_gate_samples == 1500U &&
+              peak_provenance_settings.software_dsp.waveform
+                      .pulse_start_threshold_adc == 0.0,
+          "schema-3 parser preserves out-of-window legacy gates and a "
+          "zero-valued legacy threshold without blocking "
+          "acquisition");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(peak_provenance_config,
+                                     "legacy-dsp-gate-range-test"),
+              DAQRecordLengthContract::kCurrentX730,
+              DAQWaveformDspContract::kLegacyThresholdGates);
+        },
+        "ShortGate",
+        "legacy DSP contract retains the gate-to-record bound");
+
+    std::string zero_legacy_threshold_config = quantized_dsp_config;
+    zero_legacy_threshold_config.insert(
+        zero_legacy_threshold_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nBaselineSamples=188\nShortGate=40\nLongGate=72\n"
+        "PulseStartThresholdAdc=0\n");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(zero_legacy_threshold_config,
+                                     "legacy-dsp-threshold-range-test"),
+              DAQRecordLengthContract::kCurrentX730,
+              DAQWaveformDspContract::kLegacyThresholdGates);
+        },
+        "PulseStartThresholdAdc",
+        "legacy DSP contract retains the positive ADC threshold bound");
 
     std::string complete_schema_config = valid_daq_config;
     complete_schema_config.insert(
@@ -266,7 +383,7 @@ int main() {
     std::string bad_dsp_config = valid_daq_config;
     bad_dsp_config.insert(
         bad_dsp_config.find("[Channel_0]"),
-        "[SoftwareDSP]\nBaselineSamples=308\nShortGate=40\n"
+        "[SoftwareDSP]\nBaselineSamples=311\nShortGate=40\n"
         "LongGate=200\n");
     WriteFile(bad_dsp_path, bad_dsp_config);
     CheckThrows(
@@ -278,7 +395,7 @@ int main() {
     const auto relative_threshold_path = test_dir / "relative_threshold.conf";
     WriteFile(relative_threshold_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=3\n"
               "SelfTriggerMask=3\n"
               "PostTrigger=70\n"
@@ -315,7 +432,7 @@ int main() {
 
     const auto record_only_path = test_dir / "record_only_channels.conf";
     WriteFile(record_only_path,
-              "[Digitizer]\nRecordLength=1024\nChannelMask=15\n"
+              "[Digitizer]\nRecordLength=1030\nChannelMask=15\n"
               "SelfTriggerMask=3\nPostTrigger=70\nInputRangeMv=2000\n"
               "ADCBits=14\nTriggerPolarity=1\nExtTriggerMode=0\n"
               "SelfTriggerMode=1\n[HardwareCoincidence]\nPairLogic=AND\n"
@@ -415,7 +532,7 @@ int main() {
     const auto legacy_daq_path = test_dir / "legacy_daq.conf";
     WriteFile(legacy_daq_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=1\n"
               "PostTrigger=70\n"
               "TriggerPolarity=1\n"
@@ -437,7 +554,7 @@ int main() {
     const auto valid_or_single_path = test_dir / "valid_or_single.conf";
     WriteFile(valid_or_single_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=1\n"
               "SelfTriggerMask=1\n"
               "PostTrigger=70\n"
@@ -458,7 +575,7 @@ int main() {
     const auto valid_ext_only_path = test_dir / "valid_ext_only.conf";
     WriteFile(valid_ext_only_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=1\n"
               "SelfTriggerMask=0\n"
               "PostTrigger=70\n"
@@ -480,7 +597,7 @@ int main() {
         test_dir / "partial_trigger_schema.conf";
     WriteFile(partial_trigger_schema_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=1\n"
               "SelfTriggerMask=1\n"
               "PostTrigger=70\n"
@@ -555,7 +672,7 @@ int main() {
     const auto missing_channel_path = test_dir / "missing_channel.conf";
     WriteFile(missing_channel_path,
               "[Digitizer]\n"
-              "RecordLength=1024\n"
+              "RecordLength=1030\n"
               "ChannelMask=2\n"
               "PostTrigger=70\n"
               "TriggerPolarity=1\n"
@@ -570,19 +687,103 @@ int main() {
 
     const auto non_multiple_path = test_dir / "non_multiple.conf";
     std::string non_multiple_config = valid_daq_config;
-    non_multiple_config.replace(non_multiple_config.find("RecordLength=1024"),
-                                std::string("RecordLength=1024").size(),
-                                "RecordLength=1025");
+    non_multiple_config.replace(non_multiple_config.find("RecordLength=1030"),
+                                std::string("RecordLength=1030").size(),
+                                "RecordLength=256");
     WriteFile(non_multiple_path, non_multiple_config);
     ConfigParser non_multiple(non_multiple_path.string());
     CheckThrows([&]() { LoadDAQHardwareSettings(non_multiple); },
-                "multiple of 8", "unaligned record length fails closed");
+                "multiple of 10",
+                "a record length CAEN would round upward fails closed");
+
+    std::string legacy_record_length_config = valid_daq_config;
+    legacy_record_length_config.replace(
+        legacy_record_length_config.find("RecordLength=1030"),
+        std::string("RecordLength=1030").size(), "RecordLength=512");
+    const ConfigParser legacy_record_length_parser = ConfigParser::FromText(
+        legacy_record_length_config, "legacy-record-length-contract-test");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(legacy_record_length_parser);
+        },
+        "multiple of 10",
+        "legacy multiple-of-8 config is rejected for hardware acquisition");
+    const DAQHardwareSettings legacy_record_length_settings =
+        LoadDAQHardwareSettings(
+            legacy_record_length_parser,
+            DAQRecordLengthContract::kLegacyMultipleOf8);
+    Check(legacy_record_length_settings.record_length == 512U,
+          "offline legacy profile accepts authenticated multiple-of-8 data");
+
+    std::string legacy_timing_config = valid_daq_config;
+    legacy_timing_config.replace(
+        legacy_timing_config.find("RecordLength=1030"),
+        std::string("RecordLength=1030").size(), "RecordLength=128");
+    legacy_timing_config.replace(
+        legacy_timing_config.find("PostTrigger=70"),
+        std::string("PostTrigger=70").size(), "PostTrigger=10");
+    const DAQHardwareSettings legacy_timing_settings =
+        LoadDAQHardwareSettings(
+            ConfigParser::FromText(legacy_timing_config,
+                                   "legacy-timing-contract-test"),
+            DAQRecordLengthContract::kLegacyMultipleOf8);
+    Check(legacy_timing_settings.software_dsp.waveform.baseline_samples ==
+                  115U &&
+              legacy_timing_settings.software_dsp.waveform
+                      .short_gate_samples == 13U &&
+              legacy_timing_settings.software_dsp.waveform
+                      .long_gate_samples == 13U,
+          "offline legacy profile preserves nominal percentage timing and DSP "
+          "defaults");
+
+    std::string overlapping_legacy_timing_config = valid_daq_config;
+    overlapping_legacy_timing_config.replace(
+        overlapping_legacy_timing_config.find("RecordLength=1030"),
+        std::string("RecordLength=1030").size(), "RecordLength=520");
+    overlapping_legacy_timing_config.insert(
+        overlapping_legacy_timing_config.find("[Channel_0]"),
+        "[SoftwareDSP]\nBaselineSamples=156\nShortGate=40\nLongGate=364\n");
+    const ConfigParser overlapping_legacy_timing_parser =
+        ConfigParser::FromText(overlapping_legacy_timing_config,
+                               "overlapping-legacy-timing-contract-test");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(overlapping_legacy_timing_parser);
+        },
+        "BaselineSamples exceeds",
+        "current timing rejects a DSP window that only fits legacy timing");
+    const DAQHardwareSettings overlapping_legacy_timing_settings =
+        LoadDAQHardwareSettings(
+            overlapping_legacy_timing_parser,
+            DAQRecordLengthContract::kLegacyOrCurrent,
+            DAQWaveformDspContract::kLegacyThresholdGates);
+    Check(overlapping_legacy_timing_settings.software_dsp.waveform
+                      .baseline_samples == 156U &&
+              overlapping_legacy_timing_settings.software_dsp.waveform
+                      .long_gate_samples == 364U,
+          "recovery union accepts a complete legacy layout on the 8/10-grid "
+          "intersection");
+
+    overlapping_legacy_timing_config.replace(
+        overlapping_legacy_timing_config.find("LongGate=364"),
+        std::string("LongGate=364").size(), "LongGate=368");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(overlapping_legacy_timing_config,
+                                     "mixed-overlap-timing-contract-test"),
+              DAQRecordLengthContract::kLegacyOrCurrent,
+              DAQWaveformDspContract::kLegacyThresholdGates);
+        },
+        "same pre/post-trigger layout",
+        "recovery union cannot mix the legacy pre region with the current "
+        "post region");
 
     const auto short_pretrigger_path = test_dir / "short_pretrigger.conf";
     std::string short_pretrigger_config = valid_daq_config;
-    short_pretrigger_config.replace(short_pretrigger_config.find("RecordLength=1024"),
-                                    std::string("RecordLength=1024").size(),
-                                    "RecordLength=128");
+    short_pretrigger_config.replace(short_pretrigger_config.find("RecordLength=1030"),
+                                    std::string("RecordLength=1030").size(),
+                                    "RecordLength=130");
     short_pretrigger_config.replace(short_pretrigger_config.find("PostTrigger=70"),
                                     std::string("PostTrigger=70").size(),
                                     "PostTrigger=38");
@@ -599,7 +800,97 @@ int main() {
     WriteFile(no_trigger_path, no_trigger_config);
     ConfigParser no_trigger(no_trigger_path.string());
     CheckThrows([&]() { LoadDAQHardwareSettings(no_trigger); },
-                "cannot both be disabled", "missing trigger source fails closed");
+                "cannot all be disabled", "missing trigger source fails closed");
+
+    // Software-random triggering is an explicit, mutually-exclusive trigger
+    // source.  Missing keys retain the legacy hardware-trigger behavior, but
+    // enabling the mode requires a finite positive mean rate and no hardware
+    // trigger source.
+    const auto random_config = [&](const std::string& rate,
+                                   const std::string& ext = "0",
+                                   const std::string& self = "0",
+                                   const std::string& mask = "0") {
+      std::string config = valid_daq_config;
+      config.replace(config.find("SelfTriggerMask=3"),
+                     std::string("SelfTriggerMask=3").size(),
+                     "SelfTriggerMask=" + mask);
+      config.replace(config.find("ExtTriggerMode=0"),
+                     std::string("ExtTriggerMode=0").size(),
+                     "ExtTriggerMode=" + ext);
+      config.replace(config.find("SelfTriggerMode=1"),
+                     std::string("SelfTriggerMode=1").size(),
+                     "SelfTriggerMode=" + self);
+      const std::size_t insertion = config.find("PostTrigger=70");
+      config.insert(insertion + std::string("PostTrigger=70\n").size(),
+                    "SoftwareRandomTriggerMode=1\n"
+                    "SoftwareRandomTriggerRateHz=" + rate + "\n");
+      return config;
+    };
+
+    const auto random_valid_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(random_config("12.5"),
+                               "random-trigger-valid-test"));
+    Check(random_valid_settings.software_random_trigger_mode == 1,
+          "software-random trigger mode parses as enabled");
+    Check(random_valid_settings.software_random_trigger_rate_hz == 12.5,
+          "software-random trigger rate parses as Hz");
+    Check(random_valid_settings.ext_trigger_mode == 0 &&
+              random_valid_settings.self_trigger_mode == 0 &&
+              random_valid_settings.self_trigger_mask == 0U,
+          "software-random mode disables all hardware trigger sources");
+
+    const auto minimum_random_rate_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(random_config("0.001"),
+                               "random-trigger-minimum-rate-test"));
+    Check(minimum_random_rate_settings.software_random_trigger_rate_hz ==
+              kMinimumSoftwareRandomTriggerRateHz,
+          "software-random trigger accepts the inclusive 0.001 Hz minimum");
+
+    // Omitting both new keys is deliberately backward compatible.
+    Check(settings.software_random_trigger_mode == 0 &&
+              settings.software_random_trigger_rate_hz == 0.0,
+          "legacy config defaults software-random triggering to disabled");
+
+    const std::array<std::pair<std::string, std::string>, 5>
+        invalid_random_rates{{{"0", "positive"},
+                              {"-1", "positive"},
+                              {"0.0009", "below-minimum"},
+                              {"nan", "finite"},
+                              {"1e12", "range"}}};
+    for (const auto& [rate, reason] : invalid_random_rates) {
+      CheckThrows(
+          [&]() {
+            (void)LoadDAQHardwareSettings(
+                ConfigParser::FromText(random_config(rate),
+                                       "random-trigger-invalid-rate-test"));
+          },
+          "SoftwareRandomTriggerRateHz",
+          "software-random rate rejects " + reason + " value");
+    }
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(random_config("12.5", "1"),
+                                     "random-trigger-mixed-external-test"));
+        },
+        "SoftwareRandomTrigger",
+        "software-random mode rejects external-trigger mixing");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(random_config("12.5", "0", "1", "3"),
+                                     "random-trigger-mixed-self-test"));
+        },
+        "SoftwareRandomTrigger",
+        "software-random mode rejects self-trigger mixing");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(
+              ConfigParser::FromText(random_config("12.5", "0", "0", "1"),
+                                     "random-trigger-mask-test"));
+        },
+        "SelfTriggerMask",
+        "software-random mode rejects an enabled self-trigger mask");
 
     const std::filesystem::path source_dir(CPNR_SOURCE_DIR);
     const std::string shipped_configs[] = {

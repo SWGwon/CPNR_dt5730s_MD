@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -5,6 +7,7 @@ import stat as stat_module
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+import pyqtgraph as pg
 from PyQt6.QtCore import (
     QProcess,
     QSettings,
@@ -17,6 +20,7 @@ from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -44,6 +48,7 @@ from core.root_validation_output import (
     parse_validation_progress,
     status_counts,
     strip_ansi,
+    validated_charge_histograms,
     validate_report_envelope,
 )
 from core.runtime_paths import (
@@ -87,6 +92,17 @@ _INPUT_IDENTITY_FIELDS = (
     "mtime_nanoseconds",
     "ctime_seconds",
     "ctime_nanoseconds",
+)
+
+_CHANNEL_COLOURS = (
+    "#0d6efd",
+    "#198754",
+    "#dc3545",
+    "#fd7e14",
+    "#6f42c1",
+    "#0dcaf0",
+    "#d63384",
+    "#6c757d",
 )
 
 
@@ -401,16 +417,62 @@ class RootValidationTab(QWidget):
         )
         self._configure_table(self.channels_table, stretch_column=4)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.report_splitter = QSplitter(Qt.Orientation.Vertical)
         checks_container = self._table_container("Validation Checks", self.checks_table)
         channels_container = self._table_container(
             "Per-channel Threshold & Data Metrics", self.channels_table
         )
-        splitter.addWidget(checks_container)
-        splitter.addWidget(channels_container)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        layout.addWidget(splitter, 1)
+
+        charge_container = QGroupBox("Per-channel Production Charge Histograms")
+        charge_layout = QVBoxLayout(charge_container)
+        charge_layout.setContentsMargins(5, 8, 5, 5)
+        charge_controls = QHBoxLayout()
+        charge_controls.addWidget(QLabel("Display:"))
+        self.charge_hist_channel = QComboBox()
+        self.charge_hist_channel.setEnabled(False)
+        self.charge_hist_channel.setToolTip(
+            "Show all available channels together or inspect one archived "
+            "Production ROOT Charge_CHn distribution."
+        )
+        self.charge_hist_channel.currentIndexChanged.connect(
+            self._update_charge_histogram_plot
+        )
+        charge_controls.addWidget(self.charge_hist_channel)
+        self.lbl_charge_hist_info = QLabel()
+        self.lbl_charge_hist_info.setWordWrap(True)
+        self.lbl_charge_hist_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        charge_controls.addWidget(self.lbl_charge_hist_info, 1)
+        charge_layout.addLayout(charge_controls)
+
+        self.charge_hist_plot = pg.PlotWidget()
+        self.charge_hist_plot.setBackground("#f8f9fa")
+        self.charge_hist_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.charge_hist_plot.setLabel("left", "Sampled event count")
+        self.charge_hist_plot.setLabel(
+            "bottom", "Production Charge", "ADC·sample"
+        )
+        self.charge_hist_plot.setToolTip(
+            "Histogram of the archived Charge_CHn branch. DSP schema 3 uses "
+            "a signed peak-centered [-20 ns, +40 ns) window; schema 2 uses "
+            "the legacy signed threshold/gate sum, and schema 1 clamps that "
+            "legacy result at zero. This is not the Live Monitor "
+            "full-waveform integral."
+        )
+        self.charge_hist_plot.addLegend(offset=(10, 10))
+        charge_layout.addWidget(self.charge_hist_plot, 1)
+
+        self._charge_histograms = {}
+        self._charge_dsp_schema = None
+        self.report_splitter.addWidget(checks_container)
+        self.report_splitter.addWidget(channels_container)
+        self.report_splitter.addWidget(charge_container)
+        self.report_splitter.setStretchFactor(0, 3)
+        self.report_splitter.setStretchFactor(1, 2)
+        self.report_splitter.setStretchFactor(2, 3)
+        layout.addWidget(self.report_splitter, 1)
+        self._clear_charge_histograms()
 
         self.log_console = QPlainTextEdit()
         self.log_console.setReadOnly(True)
@@ -1060,6 +1122,8 @@ class RootValidationTab(QWidget):
         self.lbl_overall.setText("STALE — REVALIDATE")
         self._apply_status_style(self.lbl_overall, "STALE")
         self.progress_bar.setFormat("STALE — input changed; validate again")
+        if self._charge_histograms:
+            self._update_charge_histogram_plot()
         if not already_stale:
             self._log(f"[Error] Validation result is STALE: {detail}")
 
@@ -1126,7 +1190,15 @@ class RootValidationTab(QWidget):
     def _render_report(self, report):
         self._render_summary(report)
         self._render_checks(report.get("checks", []))
-        self._render_channels(report.get("channels", []))
+        channels = report.get("channels", [])
+        self._render_channels(channels)
+        summary = report.get("summary", {})
+        waveform_dsp_schema = (
+            summary.get("waveform_dsp_schema")
+            if isinstance(summary, Mapping)
+            else None
+        )
+        self._render_charge_histograms(channels, waveform_dsp_schema)
 
     def _render_summary(self, report):
         overall = normalize_status(report.get("overall_status"))
@@ -1224,7 +1296,12 @@ class RootValidationTab(QWidget):
                 metric_source["metrics"] = metrics
             for key, value in channel.items():
                 if key not in {
-                    "channel", "active", "trigger_enabled", "threshold", "metrics"
+                    "channel",
+                    "active",
+                    "trigger_enabled",
+                    "threshold",
+                    "metrics",
+                    "charge_histogram",
                 }:
                     metric_source[key] = value
             flattened = flatten_mapping(metric_source)
@@ -1245,6 +1322,175 @@ class RootValidationTab(QWidget):
                     item.setToolTip(display_value(value))
                     self.channels_table.setItem(row, column, item)
         self.channels_table.setSortingEnabled(True)
+
+    def _render_charge_histograms(self, channels, waveform_dsp_schema=None):
+        """Render authenticated Charge_CHn histograms from the report."""
+
+        validated = validated_charge_histograms(channels)
+        self._charge_dsp_schema = (
+            waveform_dsp_schema
+            if isinstance(waveform_dsp_schema, int)
+            and not isinstance(waveform_dsp_schema, bool)
+            and waveform_dsp_schema in (1, 2, 3)
+            else None
+        )
+        charge_axis_title = (
+            "Peak-centered Production Charge"
+            if self._charge_dsp_schema == 3
+            else "Legacy Signed Production Charge"
+            if self._charge_dsp_schema == 2
+            else "Legacy Clamped Production Charge"
+            if self._charge_dsp_schema == 1
+            else "Production Charge"
+        )
+        self.charge_hist_plot.setLabel(
+            "bottom", charge_axis_title, "ADC·sample"
+        )
+        self._charge_histograms = {
+            channel: histogram
+            for channel, histogram in validated.items()
+            if histogram.get("available")
+        }
+
+        combo = self.charge_hist_channel
+        combo.blockSignals(True)
+        combo.clear()
+        if not self._charge_histograms:
+            combo.addItem("No charge histogram", None)
+            combo.setEnabled(False)
+            combo.blockSignals(False)
+            self._clear_charge_histogram_plot_items()
+            self.lbl_charge_hist_info.setText(
+                "Charge histogram unavailable: this report is older, no "
+                "valid active-channel values were scanned, or the value "
+                "range could not be represented."
+            )
+            self.lbl_charge_hist_info.setStyleSheet("color: #6c757d;")
+            return
+
+        combo.addItem("All available channels", None)
+        for channel in sorted(
+            self._charge_histograms, key=self._channel_sort_key
+        ):
+            combo.addItem(f"CH{channel}", channel)
+        combo.setEnabled(True)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        self._update_charge_histogram_plot()
+
+    def _update_charge_histogram_plot(self, _index=-1):
+        self._clear_charge_histogram_plot_items()
+        if not self._charge_histograms:
+            return
+
+        selected = self.charge_hist_channel.currentData()
+        if selected is None:
+            selected_histograms = [
+                (channel, self._charge_histograms[channel])
+                for channel in sorted(
+                    self._charge_histograms, key=self._channel_sort_key
+                )
+            ]
+        else:
+            histogram = self._charge_histograms.get(selected)
+            selected_histograms = (
+                [] if histogram is None else [(selected, histogram)]
+            )
+
+        for channel, histogram in selected_histograms:
+            colour = _CHANNEL_COLOURS[channel % len(_CHANNEL_COLOURS)]
+            self.charge_hist_plot.plot(
+                histogram["bin_edges"],
+                histogram["counts"],
+                name=f"CH{channel}",
+                pen=pg.mkPen(colour, width=1.8),
+                stepMode="center",
+            )
+
+        self.charge_hist_plot.enableAutoRange()
+        self.lbl_charge_hist_info.setText(
+            self._charge_histogram_description(selected_histograms)
+        )
+        if self._result_stale:
+            self.lbl_charge_hist_info.setStyleSheet(
+                "color: #842029; font-weight: bold;"
+            )
+        else:
+            self.lbl_charge_hist_info.setStyleSheet("color: #495057;")
+
+    def _charge_histogram_description(self, selected_histograms):
+        if not selected_histograms:
+            return "Charge histogram unavailable for the selected channel."
+
+        channel_names = ", ".join(
+            f"CH{channel}" for channel, _histogram in selected_histograms
+        )
+        coverage_values = {
+            str(histogram.get("coverage", "unknown"))
+            for _channel, histogram in selected_histograms
+        }
+        coverage = (
+            next(iter(coverage_values))
+            if len(coverage_values) == 1
+            else "mixed"
+        )
+        stride_values = {
+            histogram.get("sample_stride")
+            for _channel, histogram in selected_histograms
+        }
+        stride = (
+            display_value(next(iter(stride_values)))
+            if len(stride_values) == 1
+            else "mixed"
+        )
+        sample_parts = [
+            f"CH{channel} {display_value(histogram.get('values_sampled'))}/"
+            f"{display_value(histogram.get('events_scanned'))}"
+            for channel, histogram in selected_histograms
+        ]
+        charge_mode = (
+            "peak-centered signed schema 3 [-20,+40) ns"
+            if self._charge_dsp_schema == 3
+            else "legacy signed schema 2 (threshold/gates)"
+            if self._charge_dsp_schema == 2
+            else "legacy clamped schema 1"
+            if self._charge_dsp_schema == 1
+            else "unknown DSP schema"
+        )
+        prefix = "STALE — " if self._result_stale else ""
+        return (
+            f"{prefix}{channel_names} | coverage: "
+            f"{coverage.replace('_', ' ')} | sampled/scanned: "
+            f"{', '.join(sample_parts)} | stride: {stride} | "
+            f"unit: ADC·sample | mode: {charge_mode} | "
+            "source: Production ROOT Charge_CHn"
+        )
+
+    def _clear_charge_histogram_plot_items(self):
+        self.charge_hist_plot.clear()
+        legend = self.charge_hist_plot.getPlotItem().legend
+        if legend is not None:
+            legend.clear()
+
+    def _clear_charge_histograms(
+        self,
+        message="Charge histogram unavailable — validate a ROOT file.",
+    ):
+        self._charge_histograms = {}
+        self._charge_dsp_schema = None
+        if not hasattr(self, "charge_hist_channel"):
+            return
+        self.charge_hist_plot.setLabel(
+            "bottom", "Production Charge", "ADC·sample"
+        )
+        self.charge_hist_channel.blockSignals(True)
+        self.charge_hist_channel.clear()
+        self.charge_hist_channel.addItem("No charge histogram", None)
+        self.charge_hist_channel.setEnabled(False)
+        self.charge_hist_channel.blockSignals(False)
+        self._clear_charge_histogram_plot_items()
+        self.lbl_charge_hist_info.setText(message)
+        self.lbl_charge_hist_info.setStyleSheet("color: #6c757d;")
 
     @staticmethod
     def _channel_sort_key(value):
@@ -1274,6 +1520,9 @@ class RootValidationTab(QWidget):
     def _clear_tables_and_summary(self):
         self.checks_table.setRowCount(0)
         self.channels_table.setRowCount(0)
+        self._clear_charge_histograms(
+            "Charge histogram unavailable while validation is running."
+        )
         self.lbl_overall.setText("RUNNING")
         self._apply_status_style(self.lbl_overall, "INFO")
         self.lbl_entries.setText("—")
@@ -1287,6 +1536,7 @@ class RootValidationTab(QWidget):
     def _reset_report_view(self):
         self.checks_table.setRowCount(0)
         self.channels_table.setRowCount(0)
+        self._clear_charge_histograms()
         self.lbl_overall.setText("NOT RUN")
         self.lbl_overall.setStyleSheet(
             "font-weight: bold; padding: 5px; background-color: #e9ecef; "

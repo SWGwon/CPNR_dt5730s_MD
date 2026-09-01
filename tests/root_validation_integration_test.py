@@ -5,9 +5,12 @@ ROOT executable.  Every fixture is created in a temporary directory.  The
 validator is then required to leave each input byte-for-byte unchanged.
 """
 
+from __future__ import annotations
+
 import hashlib
 import configparser
 import json
+import math
 import os
 import re
 import shutil
@@ -73,6 +76,7 @@ def metadata_for(
     config: Path = CONFIG,
     polarity: str = "falling",
     pair_logic: str = "AND",
+    waveform_dsp_schema: int = 2,
 ) -> dict:
     parsed_config = configparser.ConfigParser()
     parsed_config.optionxform = str
@@ -99,7 +103,7 @@ def metadata_for(
     coincidence_window = parsed_config.getint(
         "SoftwareDSP", "CoincidenceWindow", fallback=20
     )
-    event_bytes = 24 + 4 * 512 * 2
+    event_bytes = 24 + 4 * 520 * 2
     raw_size = raw.stat().st_size
     if raw_size % event_bytes != 0:
         raise ValueError("metadata fixture RAW must contain complete events")
@@ -127,7 +131,7 @@ def metadata_for(
         if first_ttt is not None and last_ttt is not None
         else None
     )
-    window_sum = recorded_events * 512 * 2.0e-9
+    window_sum = recorded_events * 520 * 2.0e-9
     window_ratio = (
         100.0 * window_sum / elapsed if elapsed is not None and elapsed > 0
         else None
@@ -174,7 +178,7 @@ def metadata_for(
             "readback_threshold_adc": None,
             "effective_threshold_mv": None,
         })
-    return {
+    result = {
         "schema_version": 2,
         "run_number": run_number,
         "acquisition_status": "completed",
@@ -258,7 +262,7 @@ def metadata_for(
             "dc_offset_dac_bits": 16,
             "latest_acquisition_status_register": 384,
             "latest_board_failure_status_register": 0,
-            "waveform_dsp_schema": 1,
+            "waveform_dsp_schema": waveform_dsp_schema,
             "dsp_baseline_samples": dsp_baseline,
             "dsp_short_gate_samples": dsp_short,
             "dsp_long_gate_samples": dsp_long,
@@ -278,7 +282,8 @@ def metadata_for(
             "trigger_polarity": polarity,
             "record_mask": 15,
             "record_mask_readback": 15,
-            "record_length": 512,
+            "record_length_granularity_samples": 10,
+            "record_length": 520,
             "post_trigger_percent": 60,
             "post_trigger_readback_percent": 60,
             "external_trigger_mode": 0,
@@ -296,6 +301,16 @@ def metadata_for(
         },
         "channels": channels,
     }
+    if waveform_dsp_schema == 3:
+        result["hardware"].update({
+            "dsp_charge_anchor": "polarity_corrected_peak",
+            "dsp_charge_window_pre_ns": 20,
+            "dsp_charge_window_post_ns": 40,
+            "dsp_charge_window_samples": 30,
+            "dsp_short_charge_semantics": "alias_of_charge",
+            "dsp_pulse_time_semantics": "polarity_corrected_peak_sample",
+        })
+    return result
 
 
 def write_raw_fixture(
@@ -308,7 +323,7 @@ def write_raw_fixture(
     board_counters: list[int] | tuple[int, ...] | None = None,
     ttt_phase: int = 0,
 ) -> None:
-    record_length = 512
+    record_length = 520
     channel_mask = 0xF
     baselines = (16164, 16255, 8192, 8192)
     if board_counters is not None and len(board_counters) != event_count:
@@ -320,7 +335,7 @@ def write_raw_fixture(
             stream.write(struct.pack(
                 "<QIIHHI",
                 event_id * 1000 + ttt_phase,
-                # 8 us between triggers, > 1024 ns record.  Absolute odd and
+                # 8 us between triggers, > 1040 ns record.  Absolute odd and
                 # even raw-count phases are both valid at 16 ns resolution.
                 event_id,
                 record_length,
@@ -345,6 +360,54 @@ def write_raw_fixture(
                         else pulse_amplitude
                     )
                     waveform[pulse_start:pulse_start + 8] = [pulse_value] * 8
+                elif channel == 2:
+                    # A record-only channel carries an excursion opposite to
+                    # the configured pulse direction. Schema 2 must preserve
+                    # its negative net charge instead of clipping it to zero.
+                    opposite_value = baseline + (
+                        pulse_amplitude
+                        if polarity == "falling"
+                        else -pulse_amplitude
+                    )
+                    waveform[240:248] = [opposite_value] * 8
+                stream.write(struct.pack(
+                    f"<{record_length}H", *waveform
+                ))
+
+
+def write_peak_centered_raw_fixture(
+    path: Path,
+    event_count: int = 32,
+) -> None:
+    """Write falling pulses whose schema-3 integral is exactly 41 ADC.sample."""
+
+    record_length = 520
+    channel_mask = 0xF
+    baselines = (16164, 16255, 8192, 8192)
+    with path.open("wb") as stream:
+        for event_id in range(event_count):
+            stream.write(struct.pack(
+                "<QIIHHI",
+                event_id * 1000,
+                event_id,
+                record_length,
+                channel_mask,
+                0,
+                event_id,
+            ))
+            for channel, baseline in enumerate(baselines):
+                waveform = [baseline] * record_length
+                if channel in (0, 1):
+                    # The 40-ADC sample is the unique polarity-corrected peak.
+                    # Schema 3 integrates [230, 260): 5 + 40 - 7 + 3 = 41.
+                    # The 39-ADC samples at 220 and 260 are deliberately just
+                    # outside the fixed peak-centered window.
+                    waveform[220] = baseline - 39
+                    waveform[230] = baseline - 5
+                    waveform[240] = baseline - 40
+                    waveform[241] = baseline + 7
+                    waveform[259] = baseline - 3
+                    waveform[260] = baseline - 39
                 stream.write(struct.pack(
                     f"<{record_length}H", *waveform
                 ))
@@ -397,6 +460,47 @@ def run_validator(
         capture_output=True,
         check=False,
     )
+
+
+def read_first_dsp_values(root_file: Path, channel: int) -> tuple[float, ...]:
+    """Read the first converter DSP row without introducing PyROOT."""
+
+    expression = f'''
+TFile input({json.dumps(str(root_file))}, "READ");
+auto *tree = dynamic_cast<TTree*>(input.Get("phys_tree"));
+if (!tree || tree->GetEntries() < 1) gSystem->Exit(1);
+Double_t charge = 0.0;
+Double_t short_charge = 0.0;
+Double_t pulse_height = 0.0;
+Double_t pulse_time = 0.0;
+if (tree->SetBranchAddress("Charge_CH{channel}", &charge) < 0 ||
+    tree->SetBranchAddress("ShortCharge_CH{channel}", &short_charge) < 0 ||
+    tree->SetBranchAddress("PulseHeight_CH{channel}", &pulse_height) < 0 ||
+    tree->SetBranchAddress("PulseStart_T0_CH{channel}", &pulse_time) < 0 ||
+    tree->GetEntry(0) <= 0) gSystem->Exit(2);
+std::printf("CPNR_DSP_ROW %.17g %.17g %.17g %.17g\\n",
+            charge, short_charge, pulse_height, pulse_time);
+input.Close();
+'''
+    result = subprocess.run(
+        [str(ROOT), "-l", "-b", "-q", "-e", expression],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    match = re.search(
+        r"CPNR_DSP_ROW\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+"
+        r"([-+0-9.eE]+)\s+([-+0-9.eE]+)",
+        result.stdout,
+    )
+    if match is None:
+        raise AssertionError(
+            "ROOT did not emit the expected DSP row:\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+    return tuple(float(value) for value in match.groups())
 
 
 def rewrite_board_counters(
@@ -514,6 +618,41 @@ while (auto *key = dynamic_cast<TKey*>(next_key())) {{
   object->Write(key->GetName());
   delete object;
 }}
+output.Close();
+input.Close();
+'''
+    result = subprocess.run(
+        [str(ROOT), "-l", "-b", "-q", "-e", expression],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+
+
+def copy_root_with_int_parameter(
+    source: Path, destination: Path, parameter_name: str, value: int
+) -> None:
+    """Copy a ROOT fixture while replacing one integer parameter."""
+
+    expression = f'''
+TFile input({json.dumps(str(source))}, "READ");
+if (input.IsZombie()) gSystem->Exit(1);
+TFile output({json.dumps(str(destination))}, "RECREATE");
+if (output.IsZombie()) gSystem->Exit(2);
+TIter next_key(input.GetListOfKeys());
+while (auto *key = dynamic_cast<TKey*>(next_key())) {{
+  if (TString(key->GetName()) == {json.dumps(parameter_name)}) continue;
+  auto *object = key->ReadObj();
+  if (!object) gSystem->Exit(3);
+  output.cd();
+  object->Write(key->GetName());
+  delete object;
+}}
+output.cd();
+TParameter<int> replacement({json.dumps(parameter_name)}, {value});
+replacement.Write();
 output.Close();
 input.Close();
 '''
@@ -677,6 +816,106 @@ void make_legacy(const char *path, bool malformed_event_id_array = false,
 
 
 class RootValidationIntegrationTests(unittest.TestCase):
+    def assert_charge_histogram(
+        self,
+        channel: dict,
+        *,
+        available: bool | None = None,
+        expected_value: float | None = None,
+        values_sampled: int | None = None,
+        events_scanned: int | None = None,
+        sample_stride: int | None = None,
+        sampled: bool | None = None,
+        coverage: str | None = None,
+    ) -> dict:
+        channel_id = channel.get("channel")
+        histogram = channel.get("charge_histogram")
+        self.assertIsInstance(histogram, dict, channel)
+        self.assertIsInstance(channel_id, int, channel)
+        self.assertNotIsInstance(channel_id, bool, channel)
+        self.assertEqual(
+            histogram.get("source_branch"), f"Charge_CH{channel_id}", histogram
+        )
+        self.assertEqual(histogram.get("unit"), "ADC.sample", histogram)
+        self.assertEqual(histogram.get("binning"), "linear", histogram)
+        self.assertIsInstance(histogram.get("available"), bool, histogram)
+        self.assertIsInstance(histogram.get("sampled"), bool, histogram)
+        self.assertIn(
+            histogram.get("coverage"),
+            {
+                "full_scan",
+                "prefix",
+                "stride_sampled_full_scan",
+                "stride_sampled_prefix",
+                "cancelled_prefix",
+            },
+            histogram,
+        )
+
+        for field in ("values_sampled", "events_scanned", "sample_stride"):
+            value = histogram.get(field)
+            self.assertIsInstance(value, int, histogram)
+            self.assertNotIsInstance(value, bool, histogram)
+            self.assertGreaterEqual(value, 0, histogram)
+        self.assertGreater(histogram["sample_stride"], 0, histogram)
+        self.assertEqual(
+            histogram["events_scanned"],
+            channel.get("metrics", {}).get("events_scanned"),
+            histogram,
+        )
+
+        edges = histogram.get("bin_edges")
+        counts = histogram.get("counts")
+        self.assertIsInstance(edges, list, histogram)
+        self.assertIsInstance(counts, list, histogram)
+        if histogram["available"]:
+            self.assertGreaterEqual(len(counts), 1, histogram)
+            self.assertLessEqual(len(counts), 150, histogram)
+            self.assertEqual(len(edges), len(counts) + 1, histogram)
+            for edge in edges:
+                self.assertIsInstance(edge, (int, float), histogram)
+                self.assertNotIsInstance(edge, bool, histogram)
+                self.assertTrue(math.isfinite(edge), histogram)
+            self.assertTrue(
+                all(left < right for left, right in zip(edges, edges[1:])),
+                histogram,
+            )
+            for count in counts:
+                self.assertIsInstance(count, int, histogram)
+                self.assertNotIsInstance(count, bool, histogram)
+                self.assertGreaterEqual(count, 0, histogram)
+            self.assertEqual(sum(counts), histogram["values_sampled"], histogram)
+            self.assertGreater(histogram["values_sampled"], 0, histogram)
+        else:
+            self.assertEqual(edges, [], histogram)
+            self.assertEqual(counts, [], histogram)
+
+        if available is not None:
+            self.assertIs(histogram["available"], available, histogram)
+        if values_sampled is not None:
+            self.assertEqual(
+                histogram["values_sampled"], values_sampled, histogram
+            )
+        if events_scanned is not None:
+            self.assertEqual(
+                histogram["events_scanned"], events_scanned, histogram
+            )
+        if sample_stride is not None:
+            self.assertEqual(histogram["sample_stride"], sample_stride, histogram)
+        if sampled is not None:
+            self.assertIs(histogram["sampled"], sampled, histogram)
+        if coverage is not None:
+            self.assertEqual(histogram["coverage"], coverage, histogram)
+        if expected_value is not None:
+            self.assertTrue(histogram["available"], histogram)
+            self.assertLessEqual(edges[0], expected_value, histogram)
+            self.assertGreaterEqual(edges[-1], expected_value, histogram)
+            self.assertEqual(
+                sum(count > 0 for count in counts), 1, histogram
+            )
+            self.assertEqual(max(counts), histogram["values_sampled"], histogram)
+        return histogram
+
     def assert_report_shape(self, report: dict) -> None:
         self.assertTrue(REPORT_KEYS.issubset(report), report)
         self.assertEqual(report["schema_version"], 1)
@@ -684,6 +923,9 @@ class RootValidationIntegrationTests(unittest.TestCase):
         self.assertIsInstance(report["summary"], dict)
         self.assertIsInstance(report["checks"], list)
         self.assertIsInstance(report["channels"], list)
+        for channel in report["channels"]:
+            self.assertIsInstance(channel, dict, report)
+            self.assert_charge_histogram(channel)
         self.assertTrue(report["checks"], "validator returned no checks")
         for check in report["checks"]:
             self.assertIsInstance(check, dict)
@@ -747,7 +989,7 @@ class RootValidationIntegrationTests(unittest.TestCase):
             self.assertTrue(observed.get("waveforms_compared"), observed)
             self.assertEqual(
                 observed.get("waveform_samples_compared"),
-                event_count * 4 * 512,
+                event_count * 4 * 520,
             )
             self.assertEqual(
                 report.get("analysis", {}).get("raw_fidelity", {}).get(
@@ -755,6 +997,32 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 ),
                 True,
                 report,
+            )
+            channel_two = report["channels"][2]
+            channel_two_metrics = channel_two["metrics"]
+            self.assertEqual(
+                channel_two_metrics.get("range_violations"), 0, channel_two
+            )
+            self.assertEqual(
+                channel_two_metrics.get("waveform_dsp_mismatches"),
+                0,
+                channel_two,
+            )
+            self.assertEqual(
+                channel_two_metrics.get("charge_min_adc_samples"), -128.0
+            )
+            self.assertEqual(
+                channel_two_metrics.get("charge_max_adc_samples"), -128.0
+            )
+            self.assert_charge_histogram(
+                channel_two,
+                available=True,
+                expected_value=-128.0,
+                values_sampled=event_count,
+                events_scanned=event_count,
+                sample_stride=1,
+                sampled=False,
+                coverage="full_scan",
             )
             self.assert_validation_was_read_only(raw, raw_identity)
             self.assert_validation_was_read_only(waveform_root, root_identity)
@@ -849,6 +1117,149 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 ),
                 prefix_report,
             )
+
+    def test_schema3_peak_centered_signed_charge_and_raw_fidelity(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cpnr_validator_peak_dsp_"
+        ) as temp:
+            directory = Path(temp)
+            config = directory / "schema3.conf"
+            parsed_config = configparser.ConfigParser()
+            parsed_config.optionxform = str
+            self.assertTrue(parsed_config.read(CONFIG, encoding="utf-8"))
+            # These legacy controls deliberately violate the old gated-DSP
+            # bounds (inverted and longer than the record). Schema 3 retains
+            # them only as provenance and must ignore them for charge/T0.
+            parsed_config["SoftwareDSP"]["ShortGate"] = "2000"
+            parsed_config["SoftwareDSP"]["LongGate"] = "1500"
+            parsed_config["SoftwareDSP"][
+                "PulseStartThresholdAdc"
+            ] = "0"
+            with config.open("w", encoding="utf-8") as stream:
+                parsed_config.write(stream)
+
+            event_count = 32
+            raw = directory / "schema3_run086.dat"
+            write_peak_centered_raw_fixture(raw, event_count=event_count)
+            metadata = directory / "schema3_run086.dat.run.json"
+            metadata_document = metadata_for(
+                raw,
+                metadata,
+                86,
+                config=config,
+                waveform_dsp_schema=3,
+            )
+            expected_contract = {
+                "dsp_charge_anchor": "polarity_corrected_peak",
+                "dsp_charge_window_pre_ns": 20,
+                "dsp_charge_window_post_ns": 40,
+                "dsp_charge_window_samples": 30,
+                "dsp_short_charge_semantics": "alias_of_charge",
+                "dsp_pulse_time_semantics": (
+                    "polarity_corrected_peak_sample"
+                ),
+            }
+            self.assertEqual(
+                {
+                    key: metadata_document["hardware"].get(key)
+                    for key in expected_contract
+                },
+                expected_contract,
+            )
+            metadata.write_text(
+                json.dumps(metadata_document, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            output = directory / "schema3_run086_prod.root"
+            conversion = run_converter(
+                raw,
+                metadata,
+                output,
+                86,
+                config=config,
+                save_waveforms=True,
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            # The [-20 ns, +40 ns) window around sample 240 is [230, 260).
+            # Its signed sum is 5 + 40 - 7 + 3 = 41 ADC.sample; the negative
+            # sample must cancel part of the positive area. ShortCharge is the
+            # schema-3 compatibility alias and T0 stores the peak time.
+            self.assertEqual(
+                read_first_dsp_values(output, 0),
+                (41.0, 41.0, 40.0, 480.0),
+            )
+            self.assertEqual(
+                read_first_dsp_values(output, 1),
+                (41.0, 41.0, 40.0, 480.0),
+            )
+            self.assertEqual(
+                read_first_dsp_values(output, 2),
+                (0.0, 0.0, 0.0, 0.0),
+            )
+
+            raw_identity = read_only_identity(raw)
+            root_identity = read_only_identity(output)
+            validation = run_validator(output, raw_fidelity=True)
+            report = decode_report_with_exit(validation)
+            self.assert_report_shape(report)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            self.assertEqual(report["summary"].get("waveform_dsp_schema"), 3)
+            fidelity = next(
+                check for check in report["checks"]
+                if check.get("name") == "raw_root_fidelity"
+            )
+            self.assertEqual(fidelity["status"], "PASS", fidelity)
+            observed = fidelity.get("observed", {})
+            self.assertEqual(observed.get("events_compared"), event_count)
+            self.assertEqual(observed.get("header_field_mismatches"), 0)
+            self.assertEqual(observed.get("scalar_field_mismatches"), 0)
+            self.assertEqual(observed.get("waveform_sample_mismatches"), 0)
+            self.assertTrue(observed.get("waveforms_compared"), observed)
+            self.assertTrue(
+                report.get("analysis", {}).get("raw_fidelity", {}).get(
+                    "exact_match"
+                ),
+                report,
+            )
+            for channel_id, expected_charge in (
+                (0, 41.0),
+                (1, 41.0),
+                (2, 0.0),
+                (3, 0.0),
+            ):
+                channel = report["channels"][channel_id]
+                metrics = channel["metrics"]
+                self.assertEqual(metrics.get("range_violations"), 0, channel)
+                self.assertEqual(
+                    metrics.get("waveform_dsp_mismatches"), 0, channel
+                )
+                self.assertEqual(
+                    metrics.get("charge_min_adc_samples"),
+                    expected_charge,
+                    channel,
+                )
+                self.assertEqual(
+                    metrics.get("charge_max_adc_samples"),
+                    expected_charge,
+                    channel,
+                )
+                self.assert_charge_histogram(
+                    channel,
+                    available=True,
+                    expected_value=expected_charge,
+                    values_sampled=event_count,
+                    events_scanned=event_count,
+                    sample_stride=1,
+                    sampled=False,
+                    coverage="full_scan",
+                )
+            self.assert_validation_was_read_only(raw, raw_identity)
+            self.assert_validation_was_read_only(output, root_identity)
 
     def test_board_counter_rollover_duplicate_backward_and_range(self):
         with tempfile.TemporaryDirectory(prefix="cpnr_validator_counter_") as temp:
@@ -1096,12 +1507,48 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 if check.get("name") == "board_counter_lost_event_count"
             )
             self.assertEqual(lost_check["status"], "PASS", lost_check)
+            self.assertEqual(report["summary"].get("waveform_dsp_schema"), 2)
+            expected_charges = {0: 128.0, 1: 128.0, 2: -128.0, 3: 0.0}
             for channel in report["channels"]:
+                metrics = channel.get("metrics", {})
                 self.assertEqual(
-                    channel.get("metrics", {}).get("waveform_dsp_mismatches"),
+                    metrics.get("waveform_dsp_mismatches"),
                     0,
                     channel,
                 )
+                channel_id = channel["channel"]
+                if channel_id in expected_charges:
+                    self.assertEqual(metrics.get("range_violations"), 0, channel)
+                    self.assertEqual(
+                        metrics.get("charge_min_adc_samples"),
+                        expected_charges[channel_id],
+                        channel,
+                    )
+                    self.assertEqual(
+                        metrics.get("charge_max_adc_samples"),
+                        expected_charges[channel_id],
+                        channel,
+                    )
+                    self.assert_charge_histogram(
+                        channel,
+                        available=True,
+                        expected_value=expected_charges[channel_id],
+                        values_sampled=256,
+                        events_scanned=256,
+                        sample_stride=1,
+                        sampled=False,
+                        coverage="full_scan",
+                    )
+                else:
+                    self.assert_charge_histogram(
+                        channel,
+                        available=False,
+                        values_sampled=0,
+                        events_scanned=0,
+                        sample_stride=1,
+                        sampled=False,
+                        coverage="full_scan",
+                    )
             self.assertNotIn(
                 "FAIL", {check.get("status") for check in report["checks"]}
             )
@@ -1114,6 +1561,7 @@ class RootValidationIntegrationTests(unittest.TestCase):
 
             sampled_validation = run_validator(output, max_events=32)
             sampled_report = decode_report_with_exit(sampled_validation)
+            self.assert_report_shape(sampled_report)
             self.assertEqual(sampled_report["overall_status"], "WARN")
             self.assertTrue(sampled_report["analysis"]["sampled"])
             self.assertEqual(
@@ -1165,6 +1613,90 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 if check.get("name") == "analysis_coverage"
             )
             self.assertEqual(coverage["status"], "WARN", coverage)
+            for channel in sampled_report["channels"]:
+                channel_id = channel["channel"]
+                if channel_id in expected_charges:
+                    self.assert_charge_histogram(
+                        channel,
+                        available=True,
+                        expected_value=expected_charges[channel_id],
+                        values_sampled=32,
+                        events_scanned=32,
+                        sample_stride=1,
+                        sampled=False,
+                        coverage="prefix",
+                    )
+                else:
+                    self.assert_charge_histogram(
+                        channel,
+                        available=False,
+                        values_sampled=0,
+                        events_scanned=0,
+                        sample_stride=1,
+                        sampled=False,
+                        coverage="prefix",
+                    )
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_schema1_clamped_charge_remains_compatible(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cpnr_validator_clamped_dsp_"
+        ) as temp:
+            directory = Path(temp)
+            raw = directory / "schema1_run075.dat"
+            write_raw_fixture(raw, event_count=32)
+            metadata = directory / "schema1_run075.dat.run.json"
+            metadata.write_text(
+                json.dumps(
+                    metadata_for(
+                        raw,
+                        metadata,
+                        75,
+                        waveform_dsp_schema=1,
+                    ),
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "schema1_run075_prod.root"
+            conversion = run_converter(
+                raw, metadata, output, 75, save_waveforms=True
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+
+            identity = read_only_identity(output)
+            validation = run_validator(output, raw_fidelity=True)
+            report = decode_report_with_exit(validation)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            self.assertEqual(report["summary"].get("waveform_dsp_schema"), 1)
+            fidelity = next(
+                check for check in report["checks"]
+                if check.get("name") == "raw_root_fidelity"
+            )
+            self.assertEqual(fidelity["status"], "PASS", fidelity)
+            channel_two = report["channels"][2]
+            metrics = channel_two["metrics"]
+            self.assertEqual(metrics.get("range_violations"), 0, channel_two)
+            self.assertEqual(
+                metrics.get("waveform_dsp_mismatches"), 0, channel_two
+            )
+            self.assertEqual(metrics.get("charge_min_adc_samples"), 0.0)
+            self.assertEqual(metrics.get("charge_max_adc_samples"), 0.0)
+            self.assert_charge_histogram(
+                channel_two,
+                available=True,
+                expected_value=0.0,
+                values_sampled=32,
+                events_scanned=32,
+                sample_stride=1,
+                sampled=False,
+                coverage="full_scan",
+            )
             self.assert_validation_was_read_only(output, identity)
 
     def test_report_file_is_atomic_no_clobber_and_never_aliases_input(self):
@@ -1300,6 +1832,47 @@ class RootValidationIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(fidelity["status"], "FAIL", fidelity)
             self.assert_validation_was_read_only(malformed, identity)
+
+            mismatched = directory / "mismatched_dsp_schema.root"
+            copy_root_with_int_parameter(
+                valid_root, mismatched, "WaveformDspSchema", 1
+            )
+            mismatched_identity = read_only_identity(mismatched)
+            mismatch_validation = run_validator(
+                mismatched, raw_fidelity=True
+            )
+            mismatch_report = decode_report_with_exit(mismatch_validation)
+            self.assertEqual(
+                mismatch_report["overall_status"], "FAIL", mismatch_report
+            )
+            self.assertEqual(
+                mismatch_report["summary"].get("waveform_dsp_schema"), 1
+            )
+            mismatch_contract = next(
+                check for check in mismatch_report["checks"]
+                if check.get("name") == "waveform_dsp_contract"
+            )
+            self.assertEqual(
+                mismatch_contract["status"], "FAIL", mismatch_contract
+            )
+            self.assertIn(
+                {
+                    "name": "WaveformDspSchema",
+                    "observed": 1,
+                    "expected": 2,
+                },
+                mismatch_contract.get("observed", []),
+            )
+            mismatch_fidelity = next(
+                check for check in mismatch_report["checks"]
+                if check.get("name") == "raw_root_fidelity"
+            )
+            self.assertEqual(
+                mismatch_fidelity["status"], "FAIL", mismatch_fidelity
+            )
+            self.assert_validation_was_read_only(
+                mismatched, mismatched_identity
+            )
 
     def test_missing_all_external_artifacts_is_partial_provenance(self):
         with tempfile.TemporaryDirectory(prefix="cpnr_validator_external_") as temp:
@@ -1526,6 +2099,16 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 self.assertEqual(metrics.get("charge_min_adc_samples"), 512.0)
                 self.assertEqual(metrics.get("charge_max_adc_samples"), 512.0)
                 self.assertEqual(metrics.get("t0_found_fraction"), 1.0)
+                self.assert_charge_histogram(
+                    channel,
+                    available=True,
+                    expected_value=512.0,
+                    values_sampled=256,
+                    events_scanned=256,
+                    sample_stride=1,
+                    sampled=False,
+                    coverage="full_scan",
+                )
             self.assert_validation_was_read_only(output, identity)
 
     def test_legacy_file_is_fully_scanned_but_fails_provenance(self):
@@ -1625,6 +2208,16 @@ class RootValidationIntegrationTests(unittest.TestCase):
             self.assertEqual(coverage["status"], "WARN", coverage)
 
             channel_zero = report["channels"][0]
+            self.assert_charge_histogram(
+                channel_zero,
+                available=True,
+                expected_value=128.0,
+                values_sampled=250_001,
+                events_scanned=event_count,
+                sample_stride=2,
+                sampled=True,
+                coverage="stride_sampled_full_scan",
+            )
             metrics = channel_zero["metrics"]
             self.assertTrue(metrics["baseline_metrics_sampled"], metrics)
             self.assertEqual(metrics["baseline_sample_stride"], 2, metrics)

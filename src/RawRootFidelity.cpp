@@ -1,5 +1,6 @@
 #include "RawRootFidelity.h"
 
+#include "DT5730Constraints.h"
 #include "EventHeader.h"
 #include "Sha256.h"
 #include "WaveformDsp.h"
@@ -23,7 +24,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::uint32_t kMaximumRecordLength = 102400U;
 constexpr std::uint16_t kAdcMaximum = 16383U;
 
 struct FileIdentity {
@@ -128,9 +128,19 @@ struct RawRootFidelityVerifier::Impl {
       throw std::invalid_argument(
           "Recorded RAW SHA-256 must be 64 lowercase hexadecimal digits");
     }
-    if (settings.expected_record_length < 128U ||
-        settings.expected_record_length > kMaximumRecordLength ||
-        settings.expected_record_length % 8U != 0U) {
+    if (settings.expected_record_length_granularity != 8U &&
+        settings.expected_record_length_granularity !=
+            dt5730_constraints::kRecordLengthGranularitySamples) {
+      throw std::invalid_argument(
+          "Authenticated RAW record-length granularity is unsupported");
+    }
+    if (settings.expected_record_length <
+            dt5730_constraints::kMinimumRecordLengthSamples ||
+        settings.expected_record_length >
+            dt5730_constraints::kMaximumRecordLengthSamples ||
+        settings.expected_record_length %
+                settings.expected_record_length_granularity !=
+            0U) {
       throw std::invalid_argument(
           "Authenticated RAW record length is outside the converter contract");
     }
@@ -302,9 +312,13 @@ struct RawRootFidelityVerifier::Impl {
     EventHeader header{};
     ReadExactForComparison(offset, &header, sizeof(header), "EventHeader");
     offset += sizeof(header);
-    if (header.RecordLength < 128U ||
-        header.RecordLength > kMaximumRecordLength ||
-        header.RecordLength % 8U != 0U || header.ChannelMask == 0U ||
+    if (header.RecordLength <
+            dt5730_constraints::kMinimumRecordLengthSamples ||
+        header.RecordLength >
+            dt5730_constraints::kMaximumRecordLengthSamples ||
+        header.RecordLength % settings.expected_record_length_granularity !=
+            0U ||
+        header.ChannelMask == 0U ||
         (header.ChannelMask & ~0xFFU) != 0U ||
         header.BoardEventCounter > 0xFFFFFFU ||
         header.RecordLength != settings.expected_record_length ||

@@ -24,6 +24,14 @@ _PROGRESS_PATTERN = re.compile(
     r"\|\s*(?P<stage>.*?)\s*$"
 )
 _JSON_PREFIXES = ("REPORT_JSON:", "[ValidationResult]")
+_MAXIMUM_CHARGE_HISTOGRAM_BINS = 512
+_CHARGE_HISTOGRAM_COVERAGE = {
+    "cancelled_prefix",
+    "prefix",
+    "stride_sampled_prefix",
+    "full_scan",
+    "stride_sampled_full_scan",
+}
 
 
 def _reject_nonfinite_json(value: str):
@@ -205,6 +213,175 @@ def display_value(value: object) -> str:
     return str(value)
 
 
+def validated_charge_histograms(
+    channels: object,
+) -> dict[int, dict[str, Any]]:
+    """Validate and normalize optional per-channel production-charge plots.
+
+    ``charge_histogram`` was added additively to schema version 1, so reports
+    written by an older validator remain valid and simply return no plots.
+    Present payloads are checked strictly before they reach pyqtgraph.
+    """
+
+    if not isinstance(channels, list):
+        raise ValueError("validator report is missing channels[]")
+
+    normalized: dict[int, dict[str, Any]] = {}
+    for index, channel_report in enumerate(channels):
+        if not isinstance(channel_report, Mapping):
+            continue
+        if "charge_histogram" not in channel_report:
+            continue
+
+        channel = channel_report.get("channel")
+        if (
+            isinstance(channel, bool)
+            or not isinstance(channel, int)
+            or channel < 0
+            or channel > 7
+        ):
+            raise ValueError(
+                f"validator channel {index} has invalid histogram channel"
+            )
+        if channel in normalized:
+            raise ValueError(
+                f"validator report repeats charge histogram for CH{channel}"
+            )
+
+        histogram = channel_report["charge_histogram"]
+        if not isinstance(histogram, Mapping):
+            raise ValueError(f"CH{channel} charge_histogram is not an object")
+
+        available = histogram.get("available")
+        sampled = histogram.get("sampled")
+        if not isinstance(available, bool) or not isinstance(sampled, bool):
+            raise ValueError(
+                f"CH{channel} charge histogram flags must be boolean"
+            )
+        expected_branch = f"Charge_CH{channel}"
+        if histogram.get("source_branch") != expected_branch:
+            raise ValueError(
+                f"CH{channel} charge histogram source_branch is invalid"
+            )
+        if histogram.get("unit") != "ADC.sample":
+            raise ValueError(f"CH{channel} charge histogram unit is invalid")
+        if histogram.get("binning") != "linear":
+            raise ValueError(
+                f"CH{channel} charge histogram binning is invalid"
+            )
+
+        integer_fields: dict[str, int] = {}
+        for field, minimum in (
+            ("values_sampled", 0),
+            ("events_scanned", 0),
+            ("sample_stride", 1),
+        ):
+            value = histogram.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                raise ValueError(
+                    f"CH{channel} charge histogram {field} is invalid"
+                )
+            integer_fields[field] = value
+
+        if sampled != (integer_fields["sample_stride"] > 1):
+            raise ValueError(
+                f"CH{channel} charge histogram sampling flags disagree"
+            )
+        if integer_fields["values_sampled"] > integer_fields["events_scanned"]:
+            raise ValueError(
+                f"CH{channel} charge histogram sampled more values than events"
+            )
+
+        coverage = histogram.get("coverage")
+        if coverage not in _CHARGE_HISTOGRAM_COVERAGE:
+            raise ValueError(
+                f"CH{channel} charge histogram coverage is invalid"
+            )
+        if coverage in {"full_scan", "prefix"} and sampled:
+            raise ValueError(
+                f"CH{channel} charge histogram coverage disagrees with stride"
+            )
+        if coverage in {
+            "stride_sampled_full_scan",
+            "stride_sampled_prefix",
+        } and not sampled:
+            raise ValueError(
+                f"CH{channel} charge histogram coverage disagrees with stride"
+            )
+
+        raw_edges = histogram.get("bin_edges")
+        raw_counts = histogram.get("counts")
+        if not isinstance(raw_edges, list) or not isinstance(raw_counts, list):
+            raise ValueError(
+                f"CH{channel} charge histogram bins must be arrays"
+            )
+        edges: list[float] = []
+        for edge in raw_edges:
+            if isinstance(edge, bool) or not isinstance(edge, (int, float)):
+                raise ValueError(
+                    f"CH{channel} charge histogram edge is not numeric"
+                )
+            numeric_edge = float(edge)
+            if not math.isfinite(numeric_edge):
+                raise ValueError(
+                    f"CH{channel} charge histogram edge is not finite"
+                )
+            edges.append(numeric_edge)
+        counts: list[int] = []
+        for count in raw_counts:
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+            ):
+                raise ValueError(
+                    f"CH{channel} charge histogram count is invalid"
+                )
+            counts.append(count)
+
+        values_sampled = integer_fields["values_sampled"]
+        if available:
+            if not counts or len(counts) > _MAXIMUM_CHARGE_HISTOGRAM_BINS:
+                raise ValueError(
+                    f"CH{channel} charge histogram bin count is invalid"
+                )
+            if len(edges) != len(counts) + 1:
+                raise ValueError(
+                    f"CH{channel} charge histogram edges/counts disagree"
+                )
+            if any(right <= left for left, right in zip(edges, edges[1:])):
+                raise ValueError(
+                    f"CH{channel} charge histogram edges are not increasing"
+                )
+            if values_sampled <= 0 or sum(counts) != values_sampled:
+                raise ValueError(
+                    f"CH{channel} charge histogram counts disagree with sample"
+                )
+        elif edges or counts:
+            raise ValueError(
+                f"CH{channel} unavailable charge histogram contains bins"
+            )
+
+        normalized[channel] = {
+            "available": available,
+            "source_branch": expected_branch,
+            "unit": "ADC.sample",
+            "binning": "linear",
+            "bin_edges": edges,
+            "counts": counts,
+            "values_sampled": values_sampled,
+            "events_scanned": integer_fields["events_scanned"],
+            "sample_stride": integer_fields["sample_stride"],
+            "sampled": sampled,
+            "coverage": coverage,
+        }
+    return dict(sorted(normalized.items()))
+
+
 def validate_report_envelope(
     report: Mapping[str, Any],
     *,
@@ -335,6 +512,7 @@ def validate_report_envelope(
         raise ValueError("validator report is missing checks[]")
     if not isinstance(report.get("channels"), list):
         raise ValueError("validator report is missing channels[]")
+    validated_charge_histograms(report["channels"])
 
     checks = report["checks"]
     derived_counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}

@@ -15,6 +15,18 @@ from core.trigger_settings import (
     calculate_threshold_preview,
     millivolts_to_adc_delta,
 )
+from core.dt5730_constraints import (
+    ADC_SAMPLE_PERIOD_NS,
+    MAX_RECORD_LENGTH,
+    MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    MIN_REQUESTED_RECORD_LENGTH,
+    MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    RECORD_LENGTH_GRANULARITY,
+    TRIGGER_LATENCY_NS,
+    derive_time_dsp_plan,
+    normalize_record_length,
+    predict_post_trigger,
+)
 
 class ConfigTab(QWidget):
     configPathChanged = pyqtSignal(str)
@@ -23,8 +35,16 @@ class ConfigTab(QWidget):
     CONTROLLED_TABLE_KEYS = frozenset({
         ("Digitizer", "ChannelMask"),
         ("Digitizer", "SelfTriggerMask"),
+        ("Digitizer", "ExtTriggerMode"),
+        ("Digitizer", "SelfTriggerMode"),
+        ("Digitizer", "SoftwareRandomTriggerMode"),
+        ("Digitizer", "SoftwareRandomTriggerRateHz"),
         ("HardwareCoincidence", "PairLogic"),
     })
+
+    TRIGGER_SOURCE_SELF = "Self Trigger"
+    TRIGGER_SOURCE_EXTERNAL = "External Trigger"
+    TRIGGER_SOURCE_RANDOM = "Software Random"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -188,11 +208,36 @@ class ConfigTab(QWidget):
         mask_vbox.addLayout(trigger_mask_layout)
 
         trigger_options = QGridLayout()
-        trigger_options.addWidget(QLabel("Adjacent-pair logic:"), 0, 0)
+        trigger_options.addWidget(QLabel("Trigger source:"), 0, 0)
+        self.combo_trigger_source = QComboBox()
+        self.combo_trigger_source.addItems([
+            self.TRIGGER_SOURCE_SELF,
+            self.TRIGGER_SOURCE_EXTERNAL,
+            self.TRIGGER_SOURCE_RANDOM,
+        ])
+        self.combo_trigger_source.currentTextChanged.connect(
+            self.on_trigger_source_changed
+        )
+        trigger_options.addWidget(self.combo_trigger_source, 0, 1)
+        trigger_options.addWidget(QLabel("Random mean rate (Hz):"), 1, 0)
+        self.spin_random_rate = QDoubleSpinBox()
+        self.spin_random_rate.setDecimals(6)
+        self.spin_random_rate.setRange(
+            MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+            MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+        )
+        self.spin_random_rate.setSingleStep(1.0)
+        self.spin_random_rate.setValue(1.0)
+        self.spin_random_rate.setToolTip(
+            "Software Random 선택 시 평균 트리거율입니다. 실제 간격은 Poisson 분포를 따릅니다."
+        )
+        self.spin_random_rate.valueChanged.connect(self.on_random_rate_changed)
+        trigger_options.addWidget(self.spin_random_rate, 1, 1)
+        trigger_options.addWidget(QLabel("Adjacent-pair logic:"), 2, 0)
         self.combo_pair_logic = QComboBox()
         self.combo_pair_logic.addItems(["OR", "AND"])
         self.combo_pair_logic.currentTextChanged.connect(self.on_trigger_control_changed)
-        trigger_options.addWidget(self.combo_pair_logic, 0, 1)
+        trigger_options.addWidget(self.combo_pair_logic, 2, 1)
         mask_vbox.addLayout(trigger_options)
 
         self.lbl_trigger_hint = QLabel()
@@ -210,7 +255,12 @@ class ConfigTab(QWidget):
         time_vbox = QVBoxLayout()
         time_grid = QGridLayout()
         time_grid.addWidget(QLabel("RecordLength (Samples):"), 0, 0)
-        self.spin_record = QSpinBox(); self.spin_record.setRange(128, 102400); self.spin_record.setValue(2000)
+        self.spin_record = QSpinBox()
+        self.spin_record.setRange(
+            MIN_REQUESTED_RECORD_LENGTH, MAX_RECORD_LENGTH
+        )
+        self.spin_record.setSingleStep(RECORD_LENGTH_GRANULARITY)
+        self.spin_record.setValue(2000)
         self.spin_record.valueChanged.connect(self.update_time_simulator)
         time_grid.addWidget(self.spin_record, 0, 1)
         time_grid.addWidget(QLabel("Target T0 Position (ns):"), 1, 0)
@@ -218,9 +268,27 @@ class ConfigTab(QWidget):
         self.spin_target_t0.valueChanged.connect(self.update_time_simulator)
         time_grid.addWidget(self.spin_target_t0, 1, 1)
         time_vbox.addLayout(time_grid)
-        self.lbl_res_post = QLabel(); self.lbl_res_pedestal = QLabel()
+        self.lbl_res_record = QLabel()
+        self.lbl_res_post = QLabel()
+        self.lbl_res_window = QLabel()
+        self.lbl_res_pedestal = QLabel()
+        self.lbl_res_gates = QLabel()
+        time_vbox.addWidget(QLabel("Hardware RecordLength:"))
+        time_vbox.addWidget(self.lbl_res_record)
         time_vbox.addWidget(QLabel("Required PostTrigger (%):")); time_vbox.addWidget(self.lbl_res_post)
+        time_vbox.addWidget(QLabel("Actual Window / Achieved T0:"))
+        time_vbox.addWidget(self.lbl_res_window)
         time_vbox.addWidget(QLabel("Recommended BaselineSamples:")); time_vbox.addWidget(self.lbl_res_pedestal)
+        legacy_gate_label = QLabel("Legacy gates (schema 1/2 only):")
+        legacy_gate_hint = (
+            "현재 schema 3 ROOT charge는 polarity-corrected peak 기준 "
+            "[-20 ns, +40 ns) 고정 window를 사용합니다. ShortGate/LongGate와 "
+            "PulseStartThresholdAdc는 schema 1/2 호환 및 provenance용입니다."
+        )
+        legacy_gate_label.setToolTip(legacy_gate_hint)
+        self.lbl_res_gates.setToolTip(legacy_gate_hint)
+        time_vbox.addWidget(legacy_gate_label)
+        time_vbox.addWidget(self.lbl_res_gates)
         self.btn_apply_time = QPushButton("Apply Time Configs")
         self.btn_apply_time.clicked.connect(self.apply_time_to_table)
         time_vbox.addWidget(self.btn_apply_time)
@@ -358,6 +426,16 @@ class ConfigTab(QWidget):
             ext_trigger_mode = int(
                 self.config.get("Digitizer", "ExtTriggerMode"), 10
             )
+            random_trigger_mode = int(
+                self.config.get(
+                    "Digitizer", "SoftwareRandomTriggerMode", fallback="0"
+                ), 10
+            )
+            random_trigger_rate = float(
+                self.config.get(
+                    "Digitizer", "SoftwareRandomTriggerRateHz", fallback="0"
+                )
+            )
 
             trigger_keys = (
                 ("Digitizer", "SelfTriggerMask"),
@@ -386,7 +464,7 @@ class ConfigTab(QWidget):
 
             self.validate_trigger_values(
                 mask_val, trigger_mask, pair_logic, ext_trigger_mode,
-                self_trigger_mode
+                self_trigger_mode, random_trigger_mode, random_trigger_rate
             )
 
             self.set_mask_checks(self.ch_checks, mask_val)
@@ -394,6 +472,10 @@ class ConfigTab(QWidget):
             self.combo_pair_logic.blockSignals(True)
             self.combo_pair_logic.setCurrentText(pair_logic)
             self.combo_pair_logic.blockSignals(False)
+            self.sync_trigger_source_controls(
+                ext_trigger_mode, self_trigger_mode,
+                random_trigger_mode, random_trigger_rate
+            )
             self.trigger_controls_load_error = None
         except (TypeError, ValueError, OverflowError, configparser.Error) as exc:
             # Never leave values from the previously loaded file in these
@@ -404,11 +486,13 @@ class ConfigTab(QWidget):
             self.combo_pair_logic.blockSignals(True)
             self.combo_pair_logic.setCurrentText("OR")
             self.combo_pair_logic.blockSignals(False)
+            self.sync_trigger_source_controls(1, 0, 0, 0.0)
             self.trigger_controls_load_error = (
                 f"로드한 설정 오류: {exc} 값을 바꾼 뒤 전용 적용 버튼을 누르세요."
             )
 
         self.update_mask_calc()
+        self.sync_time_controls_from_config()
         self.sync_threshold_controls_from_config()
         self._set_config_dirty(False)
 
@@ -444,6 +528,97 @@ class ConfigTab(QWidget):
             chk.setChecked(bool((mask >> i) & 1))
             chk.blockSignals(False)
 
+    @staticmethod
+    def trigger_source_from_values(ext_trigger, self_trigger, random_mode):
+        if random_mode:
+            return ConfigTab.TRIGGER_SOURCE_RANDOM
+        if self_trigger and not ext_trigger:
+            return ConfigTab.TRIGGER_SOURCE_SELF
+        if ext_trigger and not self_trigger:
+            return ConfigTab.TRIGGER_SOURCE_EXTERNAL
+        return None
+
+    def sync_trigger_source_controls(
+        self, ext_trigger, self_trigger, random_mode, random_rate
+    ):
+        """Reflect source/rate values from the loaded table in the controls."""
+
+        source = self.trigger_source_from_values(
+            ext_trigger, self_trigger, random_mode
+        )
+        if source is not None:
+            self.combo_trigger_source.blockSignals(True)
+            self.combo_trigger_source.setCurrentText(source)
+            self.combo_trigger_source.blockSignals(False)
+        self.spin_random_rate.blockSignals(True)
+        try:
+            if math.isfinite(random_rate) and random_rate > 0:
+                self.spin_random_rate.setValue(random_rate)
+            else:
+                self.spin_random_rate.setValue(1.0)
+        finally:
+            self.spin_random_rate.blockSignals(False)
+        self.spin_random_rate.setEnabled(source == self.TRIGGER_SOURCE_RANDOM)
+
+    def current_trigger_source_values(self):
+        source = self.combo_trigger_source.currentText()
+        if source == self.TRIGGER_SOURCE_RANDOM:
+            return 0, 0, 1, self.spin_random_rate.value()
+        if source == self.TRIGGER_SOURCE_EXTERNAL:
+            return 1, 0, 0, 0.0
+        return 0, 1, 0, 0.0
+
+    def on_trigger_source_changed(self, source):
+        self.spin_random_rate.setEnabled(source == self.TRIGGER_SOURCE_RANDOM)
+        if self.table.rowCount() == 0:
+            return
+        ext_trigger, self_trigger, random_mode, random_rate = (
+            self.current_trigger_source_values()
+        )
+        self.set_table_value("Digitizer", "ExtTriggerMode", str(ext_trigger))
+        self.set_table_value("Digitizer", "SelfTriggerMode", str(self_trigger))
+        self.set_table_value(
+            "Digitizer", "SoftwareRandomTriggerMode", str(random_mode)
+        )
+        self.set_table_value(
+            "Digitizer", "SoftwareRandomTriggerRateHz",
+            self.format_random_rate(random_rate),
+        )
+        if self_trigger:
+            selected_mask = sum(
+                (1 << i) for i, chk in enumerate(self.trigger_ch_checks)
+                if chk.isChecked()
+            )
+            if selected_mask == 0:
+                readout_mask = sum(
+                    (1 << i) for i, chk in enumerate(self.ch_checks)
+                    if chk.isChecked()
+                ) or 1
+                self.set_mask_checks(self.trigger_ch_checks, readout_mask)
+                self.set_table_value(
+                    "Digitizer", "SelfTriggerMask", str(readout_mask)
+                )
+        else:
+            self.set_mask_checks(self.trigger_ch_checks, 0)
+            self.set_table_value("Digitizer", "SelfTriggerMask", "0")
+        self.trigger_controls_load_error = None
+        self.update_trigger_mask_calc()
+
+    def on_random_rate_changed(self, value):
+        if self.combo_trigger_source.currentText() != self.TRIGGER_SOURCE_RANDOM:
+            return
+        if self.table.rowCount() > 0:
+            self.set_table_value(
+                "Digitizer", "SoftwareRandomTriggerRateHz",
+                self.format_random_rate(value),
+            )
+            self.trigger_controls_load_error = None
+            self.update_trigger_mask_calc()
+
+    @staticmethod
+    def format_random_rate(value):
+        return f"{float(value):.6f}".rstrip("0").rstrip(".")
+
     def update_mask_calc(self):
         mask = sum((1 << i) for i, chk in enumerate(self.ch_checks) if chk.isChecked())
         self.lbl_mask_res.setText(str(mask))
@@ -467,8 +642,23 @@ class ConfigTab(QWidget):
         if (section_item.text(), parameter_item.text()) in {
             ("Digitizer", "ExtTriggerMode"),
             ("Digitizer", "SelfTriggerMode"),
+            ("Digitizer", "SoftwareRandomTriggerMode"),
+            ("Digitizer", "SoftwareRandomTriggerRateHz"),
         }:
             self.trigger_controls_load_error = None
+            try:
+                self.sync_trigger_source_controls(
+                    self.table_int_value("Digitizer", "ExtTriggerMode"),
+                    self.table_int_value("Digitizer", "SelfTriggerMode"),
+                    self.optional_table_int(
+                        "Digitizer", "SoftwareRandomTriggerMode"
+                    ) or 0,
+                    float(self.optional_table_value(
+                        "Digitizer", "SoftwareRandomTriggerRateHz"
+                    ) or 0.0),
+                )
+            except (ValueError, TypeError):
+                pass
             self.update_trigger_mask_calc()
 
     def update_trigger_mask_calc(self):
@@ -497,9 +687,15 @@ class ConfigTab(QWidget):
                     )
                 ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
                 self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+                random_mode = self.optional_table_int(
+                    "Digitizer", "SoftwareRandomTriggerMode"
+                ) or 0
+                random_rate = float(self.optional_table_value(
+                    "Digitizer", "SoftwareRandomTriggerRateHz"
+                ) or 0.0)
                 self.validate_trigger_values(
                     readout_mask, trigger_mask, logic, ext_trigger,
-                    self_trigger
+                    self_trigger, random_mode, random_rate
                 )
             except ValueError as exc:
                 validation_error = str(exc)
@@ -508,6 +704,12 @@ class ConfigTab(QWidget):
         if display_error:
             hint = f"오류: {display_error}"
             color = "#dc3545"
+        elif self.combo_trigger_source.currentText() == self.TRIGGER_SOURCE_RANDOM:
+            hint = (
+                "Software Random: 하드웨어 self/external trigger는 끄고, "
+                "입력한 Hz를 평균값으로 하는 Poisson 간격으로 소프트웨어 트리거를 생성합니다."
+            )
+            color = "#0d6efd"
         elif trigger_mask == 0:
             hint = (
                 "외부 트리거 전용: SelfTriggerMode=0, ExtTriggerMode=1을 "
@@ -551,11 +753,12 @@ class ConfigTab(QWidget):
                 )
             trigger_mask = int(self.lbl_trigger_mask_res.text())
             pair_logic = self.combo_pair_logic.currentText().upper()
-            ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
-            self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+            ext_trigger, self_trigger, random_mode, random_rate = (
+                self.current_trigger_source_values()
+            )
             self.validate_trigger_values(
                 channel_mask, trigger_mask, pair_logic, ext_trigger,
-                self_trigger
+                self_trigger, random_mode, random_rate
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Trigger Configuration", str(exc))
@@ -563,44 +766,143 @@ class ConfigTab(QWidget):
 
         self.set_table_value("Digitizer", "SelfTriggerMask", str(trigger_mask))
         self.set_table_value("HardwareCoincidence", "PairLogic", pair_logic)
+        self.set_table_value("Digitizer", "ExtTriggerMode", str(ext_trigger))
+        self.set_table_value("Digitizer", "SelfTriggerMode", str(self_trigger))
+        self.set_table_value(
+            "Digitizer", "SoftwareRandomTriggerMode", str(random_mode)
+        )
+        self.set_table_value(
+            "Digitizer", "SoftwareRandomTriggerRateHz",
+            self.format_random_rate(random_rate),
+        )
         self.trigger_controls_load_error = None
         self.update_trigger_mask_calc()
 
-    def update_time_simulator(self):
-        rec_len = self.spin_record.value()
-        target_t0_ns = self.spin_target_t0.value()
-        dt_ns = 2.0 
-        total_time_ns = rec_len * dt_ns
-        
-        # ====================================================================
-        # [제1원리 보정] 하드웨어 트리거 래치 지연시간(120 ns) 선행 보상
-        # ====================================================================
-        intrinsic_latency_ns = 120.0
-        required_pre_ns = target_t0_ns + intrinsic_latency_ns
+    def sync_time_controls_from_config(self):
+        """Load the saved R/P timing into the calculator without editing it."""
 
-        if required_pre_ns >= total_time_ns: 
-            required_pre_ns = total_time_ns - 16.0 
-            
-        pre_pct = (required_pre_ns / total_time_ns) * 100.0
-        post_pct = int(round(100.0 - pre_pct))
-        
-        if post_pct < 10: post_pct = 10
-        if post_pct > 90: post_pct = 90
-        
-        target_t0_samples = int(target_t0_ns / dt_ns)
-        recommended_pedestal = int(target_t0_samples * 0.8) 
-        
-        self.lbl_res_post.setText(f"{post_pct} %")
-        self.lbl_res_pedestal.setText(f"{recommended_pedestal} Samples")
-        self.calculated_post_pct = post_pct
-        self.calculated_pedestal = recommended_pedestal
+        if self.table.rowCount() == 0:
+            self.update_time_simulator()
+            return
+        try:
+            record_length = self.table_int_value(
+                "Digitizer", "RecordLength"
+            )
+            post_trigger = self.table_int_value(
+                "Digitizer", "PostTrigger"
+            )
+            truth = predict_post_trigger(
+                normalize_record_length(record_length), post_trigger
+            )
+            inferred_t0 = int(round(
+                truth.actual_pre_samples * ADC_SAMPLE_PERIOD_NS
+                - TRIGGER_LATENCY_NS
+            ))
+        except ValueError:
+            self.update_time_simulator()
+            return
+
+        self.spin_record.blockSignals(True)
+        self.spin_target_t0.blockSignals(True)
+        try:
+            self.spin_record.setValue(record_length)
+            self.spin_target_t0.setValue(max(
+                self.spin_target_t0.minimum(),
+                min(self.spin_target_t0.maximum(), inferred_t0),
+            ))
+        finally:
+            self.spin_target_t0.blockSignals(False)
+            self.spin_record.blockSignals(False)
+        self.update_time_simulator()
+
+    def optional_table_int(self, section, parameter):
+        value = self.optional_table_value(section, parameter)
+        if value is None:
+            return None
+        try:
+            return int(value, 10)
+        except ValueError:
+            return None
+
+    def update_time_simulator(self, *_):
+        try:
+            plan = derive_time_dsp_plan(
+                self.spin_record.value(),
+                self.spin_target_t0.value(),
+                current_short_gate=self.optional_table_int(
+                    "SoftwareDSP", "ShortGate"
+                ),
+                current_long_gate=self.optional_table_int(
+                    "SoftwareDSP", "LongGate"
+                ),
+            )
+        except ValueError as exc:
+            self.time_dsp_plan = None
+            self.lbl_res_record.setText(f"Invalid: {exc}")
+            self.lbl_res_post.clear()
+            self.lbl_res_window.clear()
+            self.lbl_res_pedestal.clear()
+            self.lbl_res_gates.clear()
+            self.btn_apply_time.setEnabled(False)
+            return
+
+        self.time_dsp_plan = plan
+        if plan.record_length_adjusted:
+            self.lbl_res_record.setText(
+                f"{plan.requested_record_length} requested → "
+                f"{plan.record_length} effective (10-sample grid)"
+            )
+        else:
+            self.lbl_res_record.setText(
+                f"{plan.record_length} Samples (hardware-native)"
+            )
+        readback_note = (
+            "exact"
+            if plan.post_trigger_exact_readback
+            else f"readback {plan.post_trigger_readback_percent}%"
+        )
+        self.lbl_res_post.setText(
+            f"{plan.post_trigger_percent}% ({readback_note}, "
+            f"register K={plan.post_trigger_register_locations})"
+        )
+        self.lbl_res_window.setText(
+            f"pre={plan.actual_pre_samples} Samples / "
+            f"post={plan.actual_post_samples} Samples; "
+            f"achieved T0≈{plan.achieved_t0_ns:g} ns"
+        )
+        self.lbl_res_pedestal.setText(
+            f"{plan.baseline_samples} Samples"
+        )
+        gate_note = "preserved" if plan.preserved_gate_settings else "safe defaults"
+        self.lbl_res_gates.setText(
+            f"ShortGate={plan.short_gate_samples}, "
+            f"LongGate={plan.long_gate_samples} "
+            f"(legacy provenance; {gate_note})"
+        )
+        self.btn_apply_time.setEnabled(self.table.rowCount() > 0)
 
     def apply_time_to_table(self):
-        if self.table.rowCount() == 0: return
-        self.set_table_value("Digitizer", "RecordLength", str(self.spin_record.value()))
-        if hasattr(self, 'calculated_post_pct'):
-            self.set_table_value("Digitizer", "PostTrigger", str(self.calculated_post_pct))
-            self.set_table_value("SoftwareDSP", "BaselineSamples", str(self.calculated_pedestal))
+        if self.table.rowCount() == 0:
+            return
+        self.update_time_simulator()
+        plan = getattr(self, "time_dsp_plan", None)
+        if plan is None:
+            return
+
+        self.spin_record.blockSignals(True)
+        try:
+            self.spin_record.setValue(plan.record_length)
+        finally:
+            self.spin_record.blockSignals(False)
+        for section, parameter, value in (
+            ("Digitizer", "RecordLength", plan.record_length),
+            ("Digitizer", "PostTrigger", plan.post_trigger_percent),
+            ("SoftwareDSP", "BaselineSamples", plan.baseline_samples),
+            ("SoftwareDSP", "ShortGate", plan.short_gate_samples),
+            ("SoftwareDSP", "LongGate", plan.long_gate_samples),
+        ):
+            self.set_table_value(section, parameter, str(value))
+        self.update_time_simulator()
 
     def on_input_range_changed(self, value):
         try:
@@ -796,7 +1098,8 @@ class ConfigTab(QWidget):
 
     @staticmethod
     def validate_trigger_values(
-        channel_mask, trigger_mask, pair_logic, ext_trigger, self_trigger
+        channel_mask, trigger_mask, pair_logic, ext_trigger, self_trigger,
+        random_mode=0, random_rate=0.0
     ):
         if not 1 <= channel_mask <= 0xFF:
             raise ValueError("[Digitizer] ChannelMask는 1..255여야 합니다.")
@@ -804,8 +1107,42 @@ class ConfigTab(QWidget):
             raise ValueError("[Digitizer] SelfTriggerMask는 0..255여야 합니다.")
         if ext_trigger not in (0, 1) or self_trigger not in (0, 1):
             raise ValueError("ExtTriggerMode와 SelfTriggerMode는 0 또는 1이어야 합니다.")
-        if ext_trigger == 0 and self_trigger == 0:
-            raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
+        if random_mode not in (0, 1):
+            raise ValueError(
+                "SoftwareRandomTriggerMode는 0 또는 1이어야 합니다."
+            )
+        if not isinstance(random_rate, (int, float)) or not math.isfinite(random_rate):
+            raise ValueError(
+                "SoftwareRandomTriggerRateHz는 유한한 실수여야 합니다."
+            )
+        if random_mode:
+            if ext_trigger or self_trigger:
+                raise ValueError(
+                    "Software Random은 External/Self trigger와 함께 사용할 수 없습니다."
+                )
+            if trigger_mask != 0:
+                raise ValueError(
+                    "Software Random에서는 SelfTriggerMask를 0으로 설정해야 합니다."
+                )
+            if not (
+                MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+                <= random_rate
+                <= MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+            ):
+                raise ValueError(
+                    "SoftwareRandomTriggerRateHz는 "
+                    f"{MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g}.."
+                    f"{MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g} Hz 범위여야 합니다."
+                )
+        else:
+            if ext_trigger == 0 and self_trigger == 0:
+                raise ValueError(
+                    "외부 트리거와 자체 트리거를 동시에 끌 수 없습니다."
+                )
+            if random_rate != 0:
+                raise ValueError(
+                    "SoftwareRandomTriggerMode=0이면 SoftwareRandomTriggerRateHz는 0이어야 합니다."
+                )
         if trigger_mask & ~channel_mask:
             raise ValueError("SelfTriggerMask는 ChannelMask의 부분집합이어야 합니다.")
         if pair_logic not in ("AND", "OR"):
@@ -863,6 +1200,20 @@ class ConfigTab(QWidget):
         channel_mask = self.table_int_value("Digitizer", "ChannelMask")
         ext_trigger = self.table_int_value("Digitizer", "ExtTriggerMode")
         self_trigger = self.table_int_value("Digitizer", "SelfTriggerMode")
+        random_mode_raw = self.optional_table_value(
+            "Digitizer", "SoftwareRandomTriggerMode"
+        )
+        random_mode = int(random_mode_raw, 10) if random_mode_raw is not None else 0
+        random_rate_raw = self.optional_table_value(
+            "Digitizer", "SoftwareRandomTriggerRateHz"
+        )
+        try:
+            random_rate = float(random_rate_raw) if random_rate_raw is not None else 0.0
+        except ValueError as exc:
+            raise ValueError(
+                "실수가 아닌 설정값입니다: [Digitizer] SoftwareRandomTriggerRateHz="
+                f"{random_rate_raw}"
+            ) from exc
         if trigger_key_count == 0:
             trigger_mask = channel_mask if self_trigger else 0
             pair_logic = "OR"
@@ -874,7 +1225,7 @@ class ConfigTab(QWidget):
 
         self.validate_trigger_values(
             channel_mask, trigger_mask, pair_logic, ext_trigger,
-            self_trigger
+            self_trigger, random_mode, random_rate
         )
 
         uses_mv_threshold = False

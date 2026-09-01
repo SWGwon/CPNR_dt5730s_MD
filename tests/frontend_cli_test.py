@@ -65,7 +65,7 @@ Node=0
 BaseAddress=0
 ExpectedModel=MOCK-DT5730S
 [Digitizer]
-RecordLength=512
+RecordLength=520
 ChannelMask=1
 SelfTriggerMask=1
 PostTrigger=60
@@ -144,7 +144,7 @@ Node=0
 BaseAddress=0
 ExpectedModel=MOCK-DT5730S
 [Digitizer]
-RecordLength=512
+RecordLength=520
 ChannelMask=1
 SelfTriggerMask=1
 PostTrigger=60

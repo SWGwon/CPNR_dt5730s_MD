@@ -3,6 +3,7 @@
 #include "DT5730Status.h"
 #include "ConfigParser.h"
 #include "DAQConfig.h"
+#include "DT5730Constraints.h"
 #include "RaceSafeCleanup.h"
 #include "Sha256.h"
 #include "WaveformDsp.h"
@@ -39,6 +40,7 @@
 #include <chrono>
 #include <csignal>
 #include <numeric>
+#include <utility>
 #include <sys/select.h> 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -407,6 +409,87 @@ uint64_t RequireMetadataUnsigned(const Json& metadata,
     return value;
 }
 
+uint32_t RecordLengthGranularityFromMetadata(const Json& metadata) {
+    const uint64_t schema = RequireMetadataUnsigned(
+        metadata, "schema_version", 1U, 2U);
+    const Json hardware = RequireMetadataField(metadata, "hardware");
+    if (!hardware.is_object()) {
+        throw std::runtime_error(
+            "Runtime metadata hardware schema is malformed");
+    }
+    if (!hardware.contains("record_length_granularity_samples")) {
+        // Metadata written before the DT5730 10-sample contract recorded
+        // files under the application's former multiple-of-8 convention.
+        return 8U;
+    }
+    if (schema < 2U) {
+        throw std::runtime_error(
+            "Runtime metadata schema v1 cannot declare record-length "
+            "granularity");
+    }
+    const uint32_t granularity = static_cast<uint32_t>(
+        RequireMetadataUnsigned(
+            hardware, "record_length_granularity_samples", 1U, 102400U));
+    if (granularity != 8U &&
+        granularity !=
+            dt5730_constraints::kRecordLengthGranularitySamples) {
+        throw std::runtime_error(
+            "Runtime metadata record-length granularity is unsupported");
+    }
+    return granularity;
+}
+
+std::uint32_t WaveformDspSchemaFromMetadata(const Json& metadata) {
+    const std::uint64_t runtime_schema = RequireMetadataUnsigned(
+        metadata, "schema_version", 1U, 2U);
+    if (runtime_schema < 2U) {
+        return cpnr::kWaveformDspSchemaClampedCharge;
+    }
+    const Json hardware = RequireMetadataField(metadata, "hardware");
+    if (!hardware.is_object()) {
+        throw std::runtime_error(
+            "Runtime metadata hardware schema is malformed");
+    }
+    return static_cast<std::uint32_t>(RequireMetadataUnsigned(
+        hardware, "waveform_dsp_schema",
+        cpnr::kWaveformDspSchemaClampedCharge,
+        cpnr::kWaveformDspCurrentSchema));
+}
+
+double RequireMetadataNumber(const Json& metadata,
+                             const std::string& key,
+                             double minimum, double maximum);
+
+// Software-random-trigger provenance was added after the original runtime
+// metadata format.  Keep replay/production conversion of older sidecars
+// possible by treating an omitted pair as mode=0, rate=0 Hz.
+std::pair<uint32_t, double> SoftwareRandomTriggerFromMetadata(
+    const Json& hardware) {
+  const bool has_mode = hardware.contains("software_random_trigger_mode");
+  const bool has_rate = hardware.contains("software_random_trigger_rate_hz");
+  if (has_mode != has_rate) {
+    throw std::runtime_error(
+        "Runtime metadata software-random trigger mode/rate must be provided "
+        "together");
+  }
+  if (!has_mode) return {0U, 0.0};
+  const uint32_t mode = static_cast<uint32_t>(RequireMetadataUnsigned(
+      hardware, "software_random_trigger_mode", 0U, 1U));
+  const double rate = RequireMetadataNumber(
+      hardware, "software_random_trigger_rate_hz", 0.0,
+      kMaximumSoftwareRandomTriggerRateHz);
+  if ((mode != 0U) != (rate > 0.0)) {
+    throw std::runtime_error(
+        "Runtime metadata software-random trigger mode/rate are inconsistent");
+  }
+  if (mode != 0U && rate < kMinimumSoftwareRandomTriggerRateHz) {
+    throw std::runtime_error(
+        "Runtime metadata software-random trigger rate is below the "
+        "supported minimum");
+  }
+  return {mode, rate};
+}
+
 bool RequireMetadataBool(const Json& metadata, const std::string& key) {
     const Json field = RequireMetadataField(metadata, key);
     if (!field.is_boolean()) {
@@ -439,7 +522,7 @@ void RequireMetadataNull(const Json& metadata, const std::string& key) {
     }
 }
 
-void ValidateRuntimeMetadataAgainstConfig(
+std::uint32_t ValidateRuntimeMetadataAgainstConfig(
     const Json& metadata, const DAQHardwareSettings& settings) {
     const Json hardware = RequireMetadataField(metadata, "hardware");
     const Json channels = RequireMetadataField(metadata, "channels");
@@ -467,6 +550,10 @@ void ValidateRuntimeMetadataAgainstConfig(
     (void)dc_offset_bits;
     const uint64_t schema = RequireMetadataUnsigned(
         metadata, "schema_version", 1U, 2U);
+    const std::uint32_t applied_waveform_dsp_schema =
+        WaveformDspSchemaFromMetadata(metadata);
+    const uint32_t record_length_granularity =
+        RecordLengthGranularityFromMetadata(metadata);
     std::optional<uint32_t> latest_status_register;
     std::optional<uint32_t> latest_failure_register;
     if (schema >= 2U) {
@@ -540,9 +627,18 @@ void ValidateRuntimeMetadataAgainstConfig(
             RequireMetadataUnsigned(hardware,
                                     "post_trigger_readback_percent", 0U,
                                     100U));
-        if (post_trigger_readback != post_trigger) {
+        const uint32_t predicted_readback =
+            record_length_granularity ==
+                    dt5730_constraints::
+                        kRecordLengthGranularitySamples
+                ? dt5730_constraints::PredictPostTriggerLayout(
+                      record_length, post_trigger)
+                      .predicted_readback_percent
+                : post_trigger;
+        if (post_trigger_readback != predicted_readback) {
             throw std::runtime_error(
-                "Runtime post-trigger readback differs from the request");
+                "Runtime post-trigger readback differs from the value "
+                "required by its record-length contract");
         }
     }
     const uint32_t external_mode = static_cast<uint32_t>(
@@ -555,6 +651,8 @@ void ValidateRuntimeMetadataAgainstConfig(
         RequireMetadataString(hardware, "pair_logic");
     const bool explicit_routing =
         RequireMetadataBool(hardware, "explicit_trigger_routing");
+    const auto [software_random_mode, software_random_rate_hz] =
+        SoftwareRandomTriggerFromMetadata(hardware);
     const uint32_t global_readback = static_cast<uint32_t>(
         RequireMetadataUnsigned(hardware, "global_trigger_mask_readback",
                                 0U, UINT32_MAX));
@@ -578,7 +676,8 @@ void ValidateRuntimeMetadataAgainstConfig(
         record_mask != settings.channel_mask ||
         record_mask_readback != record_mask ||
         record_length != settings.record_length ||
-        record_length % 8U != 0U || post_trigger != settings.post_trigger ||
+        record_length % record_length_granularity != 0U ||
+        post_trigger != settings.post_trigger ||
         external_mode != static_cast<uint32_t>(settings.ext_trigger_mode) ||
         self_mode != static_cast<uint32_t>(settings.self_trigger_mode) ||
         self_mask != settings.self_trigger_mask ||
@@ -588,7 +687,56 @@ void ValidateRuntimeMetadataAgainstConfig(
         throw std::runtime_error(
             "Runtime hardware metadata does not match the frozen config/readback");
     }
+    const double random_rate_tolerance = std::max(
+        1.0e-12,
+        1.0e-9 * std::max(std::abs(software_random_rate_hz),
+                          std::abs(settings.software_random_trigger_rate_hz)));
+    if (software_random_mode !=
+            static_cast<uint32_t>(settings.software_random_trigger_mode) ||
+        std::abs(software_random_rate_hz -
+                 settings.software_random_trigger_rate_hz) >
+            random_rate_tolerance) {
+      throw std::runtime_error(
+          "Runtime software-random trigger metadata does not match the "
+          "frozen config");
+    }
+    const bool software_random_enabled = software_random_mode != 0U;
+    if (external_mode == 0U && self_mode == 0U && !software_random_enabled) {
+      throw std::runtime_error(
+          "Runtime metadata disables external and self triggers without "
+          "enabling software random trigger");
+    }
+    if (software_random_enabled &&
+        (external_mode != 0U || self_mode != 0U || self_mask != 0U)) {
+      throw std::runtime_error(
+          "Runtime software random trigger is mixed with a physical trigger "
+          "source");
+    }
     if (schema >= 2U) {
+        if (applied_waveform_dsp_schema ==
+            cpnr::kWaveformDspSchemaPeakCenteredCharge) {
+            if (RequireMetadataString(hardware, "dsp_charge_anchor") !=
+                    cpnr::kPeakCenteredChargeAnchor ||
+                RequireMetadataUnsigned(
+                    hardware, "dsp_charge_window_pre_ns", 0U,
+                    UINT32_MAX) != cpnr::kPeakCenteredChargePreNs ||
+                RequireMetadataUnsigned(
+                    hardware, "dsp_charge_window_post_ns", 0U,
+                    UINT32_MAX) != cpnr::kPeakCenteredChargePostNs ||
+                RequireMetadataUnsigned(
+                    hardware, "dsp_charge_window_samples", 1U,
+                    UINT32_MAX) != cpnr::kPeakCenteredChargeWindowSamples ||
+                RequireMetadataString(
+                    hardware, "dsp_short_charge_semantics") !=
+                    cpnr::kPeakCenteredShortChargeSemantics ||
+                RequireMetadataString(hardware,
+                                      "dsp_pulse_time_semantics") !=
+                    cpnr::kPeakCenteredPulseTimeSemantics) {
+                throw std::runtime_error(
+                    "Runtime peak-centered charge metadata does not match "
+                    "WaveformDspSchema=3");
+            }
+        }
         if (RequireMetadataString(hardware, "connection_type") !=
                 settings.connection.type ||
             RequireMetadataUnsigned(hardware, "connection_link", 0U, 127U) !=
@@ -622,9 +770,7 @@ void ValidateRuntimeMetadataAgainstConfig(
                 "Runtime metadata unexpectedly claims an ExpectedSerial");
         }
         const auto& dsp = settings.software_dsp.waveform;
-        if (RequireMetadataUnsigned(hardware, "waveform_dsp_schema", 1U,
-                                    1U) != 1U ||
-            RequireMetadataUnsigned(hardware, "dsp_baseline_samples", 1U,
+        if (RequireMetadataUnsigned(hardware, "dsp_baseline_samples", 1U,
                                     UINT32_MAX) != dsp.baseline_samples ||
             RequireMetadataUnsigned(hardware, "dsp_short_gate_samples", 1U,
                                     UINT32_MAX) != dsp.short_gate_samples ||
@@ -696,7 +842,7 @@ void ValidateRuntimeMetadataAgainstConfig(
     const uint32_t expected_sources =
         expected_pair_requests |
         (external_mode != 0U ? (1U << 30) : 0U) |
-        (!explicit_routing ? (1U << 31) : 0U);
+        ((software_random_enabled || !explicit_routing) ? (1U << 31) : 0U);
     if ((global_readback & 0xC000000FU) != expected_sources ||
         (global_readback & (0x7U << 24)) != 0U) {
         throw std::runtime_error(
@@ -828,6 +974,7 @@ void ValidateRuntimeMetadataAgainstConfig(
             }
         }
     }
+    return applied_waveform_dsp_schema;
 }
 
 void ValidateCompletedRuntimeMetadataV2(const Json& metadata) {
@@ -1312,11 +1459,14 @@ int main(int argc, char **argv) {
     uint64_t recorded_raw_size_bytes = 0U;
     std::string recorded_raw_sha256;
     uint32_t expected_record_length = 0U;
+    uint32_t expected_record_length_granularity = 0U;
     uint32_t expected_channel_mask = 0U;
     uint64_t expected_recorded_events = 0U;
     uint64_t expected_lost_events = 0U;
     bool verify_runtime_stream_counters = false;
     DAQHardwareSettings selected_settings;
+    std::uint32_t applied_waveform_dsp_schema =
+        cpnr::kWaveformDspSchemaClampedCharge;
     bool trigger_is_falling = true;
     std::string recorded_raw_path;
     std::string recorded_config_path;
@@ -1352,10 +1502,37 @@ int main(int argc, char **argv) {
             config_contents =
                 ReadTextFile(config_file, "runtime config snapshot");
             runtime_metadata = ParseRuntimeMetadata(metadata_contents);
-            selected_settings = LoadDAQHardwareSettings(ConfigParser::FromText(
-                config_contents, AbsolutePath(config_file)));
-            ValidateRuntimeMetadataAgainstConfig(runtime_metadata,
-                                                 selected_settings);
+            expected_record_length_granularity =
+                RecordLengthGranularityFromMetadata(runtime_metadata);
+            const DAQRecordLengthContract record_length_contract =
+                expected_record_length_granularity ==
+                        dt5730_constraints::
+                            kRecordLengthGranularitySamples
+                    ? DAQRecordLengthContract::kCurrentX730
+                    : DAQRecordLengthContract::kLegacyMultipleOf8;
+            const std::uint32_t metadata_waveform_dsp_schema =
+                WaveformDspSchemaFromMetadata(runtime_metadata);
+            const DAQWaveformDspContract waveform_dsp_contract =
+                metadata_waveform_dsp_schema ==
+                        cpnr::kWaveformDspSchemaPeakCenteredCharge
+                    ? DAQWaveformDspContract::kPeakCentered
+                    : DAQWaveformDspContract::kLegacyThresholdGates;
+            selected_settings = LoadDAQHardwareSettings(
+                ConfigParser::FromText(
+                    config_contents, AbsolutePath(config_file)),
+                record_length_contract, waveform_dsp_contract);
+            applied_waveform_dsp_schema =
+                ValidateRuntimeMetadataAgainstConfig(runtime_metadata,
+                                                     selected_settings);
+            selected_settings.software_dsp.waveform.preserve_signed_charge =
+                applied_waveform_dsp_schema !=
+                cpnr::kWaveformDspSchemaClampedCharge;
+            selected_settings.software_dsp.waveform.integration_mode =
+                applied_waveform_dsp_schema ==
+                        cpnr::kWaveformDspSchemaPeakCenteredCharge
+                    ? cpnr::WaveformDspIntegrationMode::kPeakCenteredWindow
+                    : cpnr::WaveformDspIntegrationMode::
+                          kThresholdAnchoredGates;
             expected_record_length = selected_settings.record_length;
             expected_channel_mask = selected_settings.channel_mask;
             verify_runtime_stream_counters =
@@ -1659,7 +1836,9 @@ int main(int argc, char **argv) {
             fOut->TestBit(TFile::kWriteError);
 
         TParameter<int> p_run_num("RunNumber", run_number);
-        TParameter<int> p_dsp_schema("WaveformDspSchema", 1);
+        TParameter<int> p_dsp_schema(
+            "WaveformDspSchema",
+            static_cast<int>(applied_waveform_dsp_schema));
         TParameter<int> p_dsp_baseline(
             "DspBaselineSamples",
             static_cast<int>(selected_settings.software_dsp.waveform
@@ -1676,14 +1855,35 @@ int main(int argc, char **argv) {
             "DspPulseStartThresholdAdc",
             selected_settings.software_dsp.waveform
                 .pulse_start_threshold_adc);
+        TParameter<int> p_dsp_charge_pre_ns(
+            "DspChargeWindowPreNs",
+            static_cast<int>(cpnr::kPeakCenteredChargePreNs));
+        TParameter<int> p_dsp_charge_post_ns(
+            "DspChargeWindowPostNs",
+            static_cast<int>(cpnr::kPeakCenteredChargePostNs));
+        TParameter<int> p_dsp_charge_window_samples(
+            "DspChargeWindowSamples",
+            static_cast<int>(cpnr::kPeakCenteredChargeWindowSamples));
         TParameter<int> p_coincidence_window(
             "SoftwareCoincidenceWindowNs",
             static_cast<int>(selected_settings.software_dsp
                                  .coincidence_window_ns));
+        const bool peak_schema_write_failed =
+            applied_waveform_dsp_schema ==
+                    cpnr::kWaveformDspSchemaPeakCenteredCharge &&
+            (p_dsp_charge_pre_ns.Write() <= 0 ||
+             p_dsp_charge_post_ns.Write() <= 0 ||
+             p_dsp_charge_window_samples.Write() <= 0 ||
+             WriteStringObject("DspChargeAnchor",
+                               cpnr::kPeakCenteredChargeAnchor) <= 0 ||
+             WriteStringObject("DspShortChargeSemantics",
+                               cpnr::kPeakCenteredShortChargeSemantics) <= 0 ||
+             WriteStringObject("DspPulseTimeSemantics",
+                               cpnr::kPeakCenteredPulseTimeSemantics) <= 0);
         if (p_run_num.Write() <= 0 || p_dsp_schema.Write() <= 0 ||
             p_dsp_baseline.Write() <= 0 || p_dsp_short.Write() <= 0 ||
             p_dsp_long.Write() <= 0 || p_dsp_start.Write() <= 0 ||
-            p_coincidence_window.Write() <= 0 ||
+            p_coincidence_window.Write() <= 0 || peak_schema_write_failed ||
             fOut->TestBit(TFile::kWriteError)) {
             initial_write_failed = true;
         }
@@ -1733,8 +1933,11 @@ int main(int argc, char **argv) {
         current_event++;
         record_len_branch = header.RecordLength; 
 
-        if (header.RecordLength < 128U || header.RecordLength > 102400U ||
-            header.RecordLength % 8U != 0U ||
+        if (header.RecordLength <
+                dt5730_constraints::kMinimumRecordLengthSamples ||
+            header.RecordLength >
+                dt5730_constraints::kMaximumRecordLengthSamples ||
+            header.RecordLength % expected_record_length_granularity != 0U ||
             header.RecordLength != expected_record_length ||
             header.ChannelMask == 0U || (header.ChannelMask & ~0xFFU) != 0U ||
             header.ChannelMask != expected_channel_mask ||

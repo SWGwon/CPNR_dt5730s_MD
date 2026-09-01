@@ -1,4 +1,5 @@
 #include "DAQManager.h"
+#include "DT5730Constraints.h"
 #include "DT5730Status.h"
 #include "DT5730Timing.h"
 #include "Sha256.h"
@@ -54,11 +55,12 @@ void ReplaceFileText(const std::filesystem::path& path,
 void WriteConfig(const std::filesystem::path& path, uint32_t timeout_ms,
                  uint32_t minimum_free_mib = 1024,
                  uint32_t stop_free_mib = 512,
-                 uint32_t record_length = 512,
+                 uint32_t record_length = 520,
                  uint32_t channel_mask = 15,
                  uint32_t settling_time_ms = 0,
                  uint64_t max_lost_events = 0,
-                 double max_lost_fraction = 0.0) {
+                 double max_lost_fraction = 0.0,
+                 uint32_t post_trigger = 60) {
   std::ofstream output(path);
   if (!output) throw std::runtime_error("Cannot write mock config");
   output << std::setprecision(17);
@@ -73,7 +75,7 @@ void WriteConfig(const std::filesystem::path& path, uint32_t timeout_ms,
          << "RecordLength=" << record_length << "\n"
          << "ChannelMask=" << channel_mask << "\n"
          << "SelfTriggerMask=3\n"
-         << "PostTrigger=60\n"
+         << "PostTrigger=" << post_trigger << "\n"
          << "InputRangeMv=2000\n"
          << "ADCBits=14\n"
          << "TriggerPolarity=1\n"
@@ -108,6 +110,18 @@ void WriteConfig(const std::filesystem::path& path, uint32_t timeout_ms,
          << "DCOffset=3276\n";
 }
 
+void WriteRandomTriggerConfig(const std::filesystem::path& path,
+                              uint32_t timeout_ms, double rate_hz) {
+  WriteConfig(path, timeout_ms);
+  ReplaceFileText(path, "SelfTriggerMask=3", "SelfTriggerMask=0");
+  ReplaceFileText(path, "SelfTriggerMode=1", "SelfTriggerMode=0");
+  ReplaceFileText(path, "SelfTriggerMode=0",
+                  "SelfTriggerMode=0\n"
+                  "SoftwareRandomTriggerMode=1\n"
+                  "SoftwareRandomTriggerRateHz=" +
+                      std::to_string(rate_hz));
+}
+
 void CheckThrowsWith(const std::function<void()>& action,
                      const std::string& expected_text,
                      const std::string& description) {
@@ -132,6 +146,8 @@ int main() {
   std::filesystem::create_directories(test_dir);
   const std::string mock_executable =
       std::filesystem::canonical("/proc/self/exe").string();
+  constexpr std::uintmax_t kMockEventBytes =
+      sizeof(EventHeader) + 4U * 520U * sizeof(uint16_t);
 
   try {
     const auto config_path = test_dir / "stable.conf";
@@ -139,6 +155,12 @@ int main() {
     const auto metadata_path = test_dir / "stable.dat.run.json";
     WriteConfig(config_path, 250);
     caen_mock::SetUnstableBaseline(false);
+
+    uint32_t rounded_mock_record_length = 0U;
+    CAEN_DGTZ_SetRecordLength(1, 256U);
+    CAEN_DGTZ_GetRecordLength(1, &rounded_mock_record_length);
+    Check(rounded_mock_record_length == 260U,
+          "x730 mock rounds a 256-sample request upward to 260 samples");
 
     std::string metadata_before_start;
     {
@@ -193,6 +215,26 @@ int main() {
     const std::string metadata = ReadFile(metadata_path);
     Check(metadata.find("\"schema_version\": 2") != std::string::npos,
           "runtime JSON uses the completed lifecycle/timing schema v2");
+    Check(metadata.find("\"waveform_dsp_schema\": 3") !=
+                  std::string::npos &&
+              metadata.find(
+                  "\"dsp_charge_anchor\": \"polarity_corrected_peak\"") !=
+                  std::string::npos &&
+              metadata.find("\"dsp_charge_window_pre_ns\": 20") !=
+                  std::string::npos &&
+              metadata.find("\"dsp_charge_window_post_ns\": 40") !=
+                  std::string::npos &&
+              metadata.find("\"dsp_charge_window_samples\": 30") !=
+                  std::string::npos &&
+              metadata.find(
+                  "\"dsp_short_charge_semantics\": \"alias_of_charge\"") !=
+                  std::string::npos &&
+              metadata.find(
+                  "\"dsp_pulse_time_semantics\": "
+                  "\"polarity_corrected_peak_sample\"") !=
+                  std::string::npos,
+          "runtime JSON authenticates the schema-3 peak-centered charge "
+          "contract");
     Check(metadata.find("\"run_number\": 42") != std::string::npos,
           "runtime JSON records the run number");
     Check(metadata.find("\"config_sha256\": \"" +
@@ -220,7 +262,7 @@ int main() {
           "runtime JSON records successful acquisition completion");
     Check(metadata.find("\"zmq_send_hwm_messages\": 5000") !=
                   std::string::npos &&
-              metadata.find("\"zmq_send_hwm_approx_bytes\": 20600000") !=
+              metadata.find("\"zmq_send_hwm_approx_bytes\": 20920000") !=
                   std::string::npos,
           "runtime JSON records the byte-bounded monitoring queue capacity");
     Check(metadata.find("\"trigger_time_tag_raw_lsb_ns\": 8") !=
@@ -250,8 +292,12 @@ int main() {
     Check(metadata.find("\"pair_logic\": \"AND\"") != std::string::npos,
           "runtime JSON records AND routing");
     Check(metadata.find("\"record_mask_readback\": 15") !=
-              std::string::npos,
-          "runtime JSON records the channel-enable mask readback");
+                  std::string::npos &&
+              metadata.find(
+                  "\"record_length_granularity_samples\": 10") !=
+                  std::string::npos,
+          "runtime JSON records the channel-enable readback and x730 "
+          "record-length granularity");
     Check(metadata.find("\"measured_baseline_adc\": 16164") !=
               std::string::npos,
           "runtime JSON records the CH0 measured baseline");
@@ -276,6 +322,82 @@ int main() {
           "runtime JSON retains measured baseline for record-only channels");
     Check(std::filesystem::exists(output_path.string() + ".config.conf"),
           "runtime config snapshot is written beside raw output");
+
+    const auto random_output = test_dir / "random_trigger.dat";
+    const auto random_config = test_dir / "random_trigger.conf";
+    const auto random_metadata = test_dir / "random_trigger.dat.run.json";
+    WriteRandomTriggerConfig(random_config, 250, 1000.0);
+    {
+      DAQManager manager(
+          random_config.string(), random_output.string(), 1, 0, 43,
+          random_metadata.string(), mock_executable, "mock-commit",
+          "mock-build");
+      std::atomic<bool> keep_running{true};
+      manager.Start(keep_running);
+    }
+    const std::string random_json = ReadFile(random_metadata);
+    Check(std::filesystem::exists(random_output) &&
+              std::filesystem::file_size(random_output) == kMockEventBytes,
+          "software-random trigger produces one complete event at the event limit");
+    Check(caen_mock::state.software_triggers_sent == 1U,
+          "software-random physics run sends one trigger for one requested event");
+    Check((caen_mock::state.registers[0x810C] & (1U << 31)) != 0U &&
+              (caen_mock::state.registers[0x810C] & (1U << 30)) == 0U &&
+              (caen_mock::state.registers[0x810C] & 0x0FU) == 0U,
+          "software-random routing enables only the global software-trigger source");
+    Check(random_json.find("\"software_random_trigger_mode\": 1") !=
+                  std::string::npos &&
+              random_json.find(
+                  "\"software_random_trigger_rate_hz\": 1000") !=
+                  std::string::npos &&
+              random_json.find("\"software_random_trigger_seed\": null") ==
+                  std::string::npos &&
+              random_json.find("\"software_random_triggers_sent\": 1") !=
+                  std::string::npos &&
+              random_json.find(
+                  "\"software_random_trigger_effective_rate_hz\": null") ==
+                  std::string::npos,
+          "software-random provenance records mode, rate, seed, count, and "
+          "effective rate");
+
+    const auto quantized_config = test_dir / "quantized_post_trigger.conf";
+    const auto quantized_output = test_dir / "quantized_post_trigger.dat";
+    const auto quantized_metadata =
+        test_dir / "quantized_post_trigger.dat.run.json";
+    WriteConfig(quantized_config, 250, 1024, 512, 1030, 15, 0, 0,
+                0.0, 70);
+    {
+      DAQManager manager(
+          quantized_config.string(), quantized_output.string(), 0, 0, 71,
+          quantized_metadata.string(), mock_executable, "mock-commit",
+          "mock-build");
+    }
+    const std::string quantized_json = ReadFile(
+        quantized_metadata.string() +
+        ".status.hardware_verified_not_started.json");
+    Check(caen_mock::state.post_trigger_register == 90U &&
+              quantized_json.find("\"post_trigger_percent\": 70") !=
+                  std::string::npos &&
+              quantized_json.find(
+                  "\"post_trigger_readback_percent\": 69") !=
+                  std::string::npos,
+          "a 1030-sample/70-percent request accepts and records the expected "
+          "69-percent x730 readback");
+
+    caen_mock::SetPostTriggerReadbackFault(true);
+    CheckThrowsWith(
+        [&]() {
+          DAQManager manager(
+              quantized_config.string(),
+              (test_dir / "bad_post_trigger_readback.dat").string(), 0, 0,
+              72,
+              (test_dir / "bad_post_trigger_readback.dat.run.json").string(),
+              mock_executable, "mock-commit", "mock-build");
+        },
+        "requested 70, expected 69, observed 70",
+        "post-trigger verification rejects a value other than the predicted "
+        "quantized readback");
+    caen_mock::SetPostTriggerReadbackFault(false);
 
     const auto cancelled_output = test_dir / "cancelled.dat";
     const auto cancelled_metadata = test_dir / "cancelled.dat.run.json";
@@ -376,8 +498,6 @@ int main() {
       std::atomic<bool> keep_running{true};
       manager.Start(keep_running);
     }
-    constexpr std::uintmax_t kMockEventBytes =
-        sizeof(EventHeader) + 4U * 512U * sizeof(uint16_t);
     Check(std::filesystem::file_size(exact_limit_output) ==
               2U * kMockEventBytes,
           "a five-event CAEN block obeys an exact two-event output limit");
@@ -395,7 +515,7 @@ int main() {
               exact_limit_json.find("\"elapsed_time_sec\": 1.6e-08") !=
                   std::string::npos &&
               exact_limit_json.find(
-                  "\"recorded_window_to_elapsed_pct\": 12800") !=
+                  "\"recorded_window_to_elapsed_pct\": 13000") !=
                   std::string::npos,
           "timing summary uses the 8 ns raw TTT count and labels record-window "
           "load separately from dead time");
@@ -731,7 +851,7 @@ int main() {
           "pre-gap raw prefix without using it as the policy denominator");
 
     const auto bounded_loss_config = test_dir / "bounded_loss.conf";
-    WriteConfig(bounded_loss_config, 250, 1024, 512, 512, 15, 0, 1U,
+    WriteConfig(bounded_loss_config, 250, 1024, 512, 520, 15, 0, 1U,
                 0.5);
     const auto bounded_loss_output = test_dir / "bounded_loss.dat";
     const auto bounded_loss_metadata =
@@ -808,7 +928,7 @@ int main() {
 
     const auto fraction_boundary_config =
         test_dir / "loss_fraction_boundary.conf";
-    WriteConfig(fraction_boundary_config, 250, 1024, 512, 512, 15, 0,
+    WriteConfig(fraction_boundary_config, 250, 1024, 512, 520, 15, 0,
                 10U, 1.0 / 3.0);
     const auto fraction_equal_output =
         test_dir / "loss_fraction_equal.dat";
@@ -1234,7 +1354,7 @@ int main() {
     const auto setup_cancel_output = test_dir / "setup_cancel.dat";
     const auto setup_cancel_metadata =
         test_dir / "setup_cancel.dat.run.json";
-    WriteConfig(setup_cancel_config, 2000, 1024, 512, 512, 15, 1500);
+    WriteConfig(setup_cancel_config, 2000, 1024, 512, 520, 15, 1500);
     caen_mock::ResetLifecycleInstrumentation();
     std::atomic<bool> continue_setup{true};
     std::thread setup_canceller([&]() {
