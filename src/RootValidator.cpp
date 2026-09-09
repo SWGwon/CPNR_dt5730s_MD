@@ -3013,6 +3013,8 @@ Json ValidateRootFile(const std::string& input_path,
   std::set<std::uint32_t> observed_patterns;
   std::optional<std::uint64_t> first_ttt;
   std::optional<std::uint64_t> last_ttt;
+  // Keep presence separate from the payload.  GCC 11 at -O3 can otherwise
+  // report a false -Wmaybe-uninitialized for a guarded std::optional value.
   std::uint32_t previous_board_counter = 0U;
   bool previous_board_counter_available = false;
   bool scan_cancelled = false;
@@ -3807,17 +3809,23 @@ Json ValidateRootFile(const std::string& input_path,
   const std::optional<double> recorded_window_percent = current_timing_schema
       ? ReadParameter<double>(*file, "RecordedWindowToElapsed_pct")
       : std::nullopt;
-  std::optional<int> dead_time_available;
+  // Use an initialized scalar plus an explicit presence bit here as well.
+  // This is equivalent to optional<int>, but remains warning-clean across
+  // GCC versions when consumed by the long validation predicate below.
+  int dead_time_available = 0;
+  bool dead_time_available_present = false;
   if (current_timing_schema) {
-    dead_time_available =
+    const std::optional<int> observed_dead_time_available =
         ReadParameter<int>(*file, "DeadTimeMeasurementAvailable");
+    dead_time_available_present = observed_dead_time_available.has_value();
+    dead_time_available = observed_dead_time_available.value_or(0);
   }
   const std::optional<std::string> dead_time_method = current_timing_schema
       ? ReadStringObject(*file, "DeadTimeMethod")
       : std::nullopt;
   Json dead_time_available_json = nullptr;
-  if (dead_time_available.has_value()) {
-    dead_time_available_json = (*dead_time_available != 0);
+  if (dead_time_available_present) {
+    dead_time_available_json = (dead_time_available != 0);
   }
   std::optional<Long64_t> lost_events;
   std::optional<Long64_t> recorded_events;
@@ -3872,8 +3880,9 @@ Json ValidateRootFile(const std::string& input_path,
   const bool current_timing_numbers_valid =
       current_timing_schema && common_summary_numbers_valid &&
       ttt_raw_lsb_ns && ttt_resolution_ns && adc_sample_period_ns &&
-      recorded_window_sum && recorded_window_percent && dead_time_available &&
-      dead_time_method && std::isfinite(*recorded_window_sum) &&
+      recorded_window_sum && recorded_window_percent &&
+      dead_time_available_present && dead_time_method &&
+      std::isfinite(*recorded_window_sum) &&
       *recorded_window_sum >= 0.0 &&
       std::isfinite(*recorded_window_percent) &&
       *recorded_window_percent >= 0.0 &&
@@ -3881,7 +3890,7 @@ Json ValidateRootFile(const std::string& input_path,
       *ttt_resolution_ns ==
           dt5730_timing::kTriggerTimeTagObservableResolutionNs &&
       *adc_sample_period_ns == dt5730_timing::kAdcSamplePeriodNs &&
-      *dead_time_available == 0 &&
+      dead_time_available == 0 &&
       *dead_time_method ==
           "unavailable_no_hardware_busy_or_livetime_scaler";
   const bool legacy_timing_numbers_valid =
