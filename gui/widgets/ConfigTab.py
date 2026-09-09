@@ -15,6 +15,13 @@ from core.trigger_settings import (
     calculate_threshold_preview,
     millivolts_to_adc_delta,
 )
+from core.dc_offset_settings import (
+    DC_OFFSET_MODE_RAW,
+    DC_OFFSET_MODE_TARGET,
+    calculate_dc_offset_preview,
+    nominal_baseline_percent_from_dac,
+    parse_dc_offset_settings,
+)
 from core.dt5730_constraints import (
     ADC_SAMPLE_PERIOD_NS,
     MAX_RECORD_LENGTH,
@@ -45,6 +52,8 @@ class ConfigTab(QWidget):
     TRIGGER_SOURCE_SELF = "Self Trigger"
     TRIGGER_SOURCE_EXTERNAL = "External Trigger"
     TRIGGER_SOURCE_RANDOM = "Software Random"
+    DC_OFFSET_TARGET_LABEL = "Automatic target baseline"
+    DC_OFFSET_RAW_LABEL = "Advanced: raw 16-bit DAC (legacy)"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,7 +95,7 @@ class ConfigTab(QWidget):
             self.configDirtyChanged.emit(self.current_config_path, dirty)
 
     def sync_threshold_controls_from_config(self):
-        """Reflect the loaded runtime-threshold schema in the calculator."""
+        """Reflect the loaded runtime calibration schema in the controls."""
 
         input_range = self.config.get(
             "Digitizer", "InputRangeMv", fallback="2000"
@@ -127,6 +136,7 @@ class ConfigTab(QWidget):
             for value in requested_values[1:]
         ):
             self.spin_trg_mv.setValue(requested_values[0])
+        self.sync_dc_offset_controls_from_config()
         self.update_trigger_mask_calc()
         self.update_adc_simulator()
         self.update_time_simulator()
@@ -295,26 +305,110 @@ class ConfigTab(QWidget):
         time_group.setLayout(time_vbox)
         right_layout.addWidget(time_group)
 
-        sim_group = QGroupBox("Runtime Trigger Calibration (14-bit, per-channel baseline)")
+        sim_group = QGroupBox(
+            "Runtime Baseline & Trigger Calibration (14-bit ADC / 16-bit offset DAC)"
+        )
         sim_vbox = QVBoxLayout()
+
+        sim_vbox.addWidget(QLabel(
+            "DC-offset channels (defaults to every enabled readout channel):"
+        ))
+        offset_channel_grid = QGridLayout()
+        self.offset_ch_checks = []
+        for i in range(8):
+            chk = QCheckBox(f"CH{i}")
+            chk.stateChanged.connect(self.update_adc_simulator)
+            offset_channel_grid.addWidget(chk, i // 4, i % 4)
+            self.offset_ch_checks.append(chk)
+        sim_vbox.addLayout(offset_channel_grid)
+
         input_grid = QGridLayout()
-        input_grid.addWidget(QLabel("Plot baseline preview only (%):"), 0, 0)
-        self.spin_base_pct = QSpinBox(); self.spin_base_pct.setRange(10, 95); self.spin_base_pct.setValue(90)
+        input_grid.addWidget(QLabel("DC-offset mode:"), 0, 0)
+        self.combo_dc_offset_mode = QComboBox()
+        self.combo_dc_offset_mode.addItem(
+            self.DC_OFFSET_TARGET_LABEL, DC_OFFSET_MODE_TARGET
+        )
+        self.combo_dc_offset_mode.addItem(
+            self.DC_OFFSET_RAW_LABEL, DC_OFFSET_MODE_RAW
+        )
+        self.combo_dc_offset_mode.currentIndexChanged.connect(
+            self.on_dc_offset_mode_changed
+        )
+        input_grid.addWidget(self.combo_dc_offset_mode, 0, 1)
+
+        input_grid.addWidget(QLabel("Target baseline (% full scale):"), 1, 0)
+        self.spin_base_pct = QDoubleSpinBox()
+        self.spin_base_pct.setDecimals(1)
+        self.spin_base_pct.setSingleStep(0.5)
+        self.spin_base_pct.setRange(5.0, 95.0)
+        self.spin_base_pct.setValue(90.0)
+        self.spin_base_pct.setSuffix(" %")
         self.spin_base_pct.valueChanged.connect(self.update_adc_simulator)
-        input_grid.addWidget(self.spin_base_pct, 0, 1)
-        input_grid.addWidget(QLabel("Hardware threshold (mV):"), 1, 0)
+        input_grid.addWidget(self.spin_base_pct, 1, 1)
+
+        preset_layout = QHBoxLayout()
+        self.btn_offset_falling = QPushButton("Falling 90%")
+        self.btn_offset_center = QPushButton("Center 50%")
+        self.btn_offset_rising = QPushButton("Rising 10%")
+        self.btn_offset_falling.clicked.connect(
+            lambda: self.set_dc_offset_target_preset(90.0)
+        )
+        self.btn_offset_center.clicked.connect(
+            lambda: self.set_dc_offset_target_preset(50.0)
+        )
+        self.btn_offset_rising.clicked.connect(
+            lambda: self.set_dc_offset_target_preset(10.0)
+        )
+        preset_layout.addWidget(self.btn_offset_falling)
+        preset_layout.addWidget(self.btn_offset_center)
+        preset_layout.addWidget(self.btn_offset_rising)
+        input_grid.addLayout(preset_layout, 2, 0, 1, 2)
+
+        input_grid.addWidget(QLabel("Raw DCOffset DAC code:"), 3, 0)
+        self.spin_dc_offset_raw = QSpinBox()
+        self.spin_dc_offset_raw.setRange(0, 65535)
+        self.spin_dc_offset_raw.setValue(6554)
+        self.spin_dc_offset_raw.setToolTip(
+            "Legacy/manual mode only. This 16-bit value does not guarantee an "
+            "exact 14-bit ADC baseline."
+        )
+        self.spin_dc_offset_raw.valueChanged.connect(self.update_adc_simulator)
+        input_grid.addWidget(self.spin_dc_offset_raw, 3, 1)
+
+        input_grid.addWidget(QLabel("Hardware threshold (mV):"), 4, 0)
         self.spin_trg_mv = QDoubleSpinBox(); self.spin_trg_mv.setDecimals(3)
         self.spin_trg_mv.setRange(0.001, 2000.0); self.spin_trg_mv.setValue(15.0)
         self.spin_trg_mv.valueChanged.connect(self.update_adc_simulator)
-        input_grid.addWidget(self.spin_trg_mv, 1, 1)
-        input_grid.addWidget(QLabel("Input range (mVpp):"), 2, 0)
+        input_grid.addWidget(self.spin_trg_mv, 4, 1)
+        input_grid.addWidget(QLabel("Input range (mVpp):"), 5, 0)
         self.combo_input_range = QComboBox()
         self.combo_input_range.addItems(["2000", "500"])
         self.combo_input_range.currentTextChanged.connect(self.on_input_range_changed)
-        input_grid.addWidget(self.combo_input_range, 2, 1)
+        input_grid.addWidget(self.combo_input_range, 5, 1)
         sim_vbox.addLayout(input_grid)
-        self.lbl_res_offset = QLabel(); self.lbl_res_trg = QLabel()
-        sim_vbox.addWidget(QLabel("DCOffset policy:")); sim_vbox.addWidget(self.lbl_res_offset)
+
+        self.lbl_res_offset = QLabel(); self.lbl_res_offset.setWordWrap(True)
+        self.lbl_dc_offset_headroom = QLabel()
+        self.lbl_dc_offset_headroom.setWordWrap(True)
+        self.lbl_dc_offset_loaded = QLabel()
+        self.lbl_dc_offset_loaded.setWordWrap(True)
+        sim_vbox.addWidget(QLabel("DCOffset preview:"))
+        sim_vbox.addWidget(self.lbl_res_offset)
+        sim_vbox.addWidget(self.lbl_dc_offset_headroom)
+        sim_vbox.addWidget(self.lbl_dc_offset_loaded)
+
+        self.btn_apply_dc_offset = QPushButton(
+            "Store DC Offset Settings for Selected Readout Channels"
+        )
+        self.btn_apply_dc_offset.setToolTip(
+            "Automatic mode stores a target percentage. At startup the DAQ "
+            "measures and adjusts every selected channel independently; this "
+            "button does not communicate with hardware."
+        )
+        self.btn_apply_dc_offset.clicked.connect(self.apply_dc_offset_to_table)
+        sim_vbox.addWidget(self.btn_apply_dc_offset)
+
+        self.lbl_res_trg = QLabel(); self.lbl_res_trg.setWordWrap(True)
         sim_vbox.addWidget(QLabel("Runtime threshold request:")); sim_vbox.addWidget(self.lbl_res_trg)
         self.btn_apply_adc = QPushButton("Store mV Threshold for Self-Trigger Channels")
         self.btn_apply_adc.setToolTip(
@@ -347,6 +441,8 @@ class ConfigTab(QWidget):
         sim_vbox.addWidget(self.plot_sim)
         sim_group.setLayout(sim_vbox)
         right_layout.addWidget(sim_group, stretch=1)
+        self.on_dc_offset_mode_changed()
+
         layout.addLayout(right_layout, stretch=3)
 
     # ====================================================================
@@ -509,11 +605,24 @@ class ConfigTab(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setToolTip(structure_tooltip)
 
-        key = (section_item.text(), parameter_item.text())
-        if key not in self.CONTROLLED_TABLE_KEYS:
+        section = section_item.text()
+        parameter = parameter_item.text()
+        key = (section, parameter)
+        is_offset_control = (
+            section.startswith("Channel_")
+            and parameter in {
+                "DCOffsetMode", "BaselineTargetPercent", "DCOffset"
+            }
+        )
+        if key not in self.CONTROLLED_TABLE_KEYS and not is_offset_control:
             return
 
-        tooltip = "오른쪽의 Readout & Trigger 전용 컨트롤에서 변경하세요."
+        tooltip = (
+            "오른쪽의 Runtime Baseline & Trigger Calibration 전용 컨트롤에서 "
+            "변경하세요."
+            if is_offset_control else
+            "오른쪽의 Readout & Trigger 전용 컨트롤에서 변경하세요."
+        )
         value_item = self.table.item(row, 2)
         if value_item:
             value_item.setFlags(
@@ -628,6 +737,12 @@ class ConfigTab(QWidget):
     def on_readout_control_changed(self, *_):
         self.trigger_controls_load_error = None
         self.update_mask_calc()
+        try:
+            readout_mask = int(self.lbl_mask_res.text(), 10)
+        except ValueError:
+            readout_mask = 0
+        self.sync_offset_channel_availability(readout_mask)
+        self.update_adc_simulator()
 
     def on_trigger_control_changed(self, *_):
         self.trigger_controls_load_error = None
@@ -738,6 +853,7 @@ class ConfigTab(QWidget):
             QMessageBox.warning(self, "Invalid Readout Mask", "Readout mask는 0일 수 없습니다.")
             return
         self.set_table_value("Digitizer", "ChannelMask", self.lbl_mask_res.text())
+        self.sync_offset_channel_availability(int(self.lbl_mask_res.text(), 10))
         self.update_trigger_mask_calc()
 
     def apply_trigger_to_table(self):
@@ -904,6 +1020,328 @@ class ConfigTab(QWidget):
             self.set_table_value(section, parameter, str(value))
         self.update_time_simulator()
 
+    def set_dc_offset_target_preset(self, target_percent):
+        self.combo_dc_offset_mode.setCurrentIndex(
+            self.combo_dc_offset_mode.findData(DC_OFFSET_MODE_TARGET)
+        )
+        self.spin_base_pct.setValue(float(target_percent))
+
+    def on_dc_offset_mode_changed(self, *_):
+        is_target = (
+            self.combo_dc_offset_mode.currentData() == DC_OFFSET_MODE_TARGET
+        )
+        self.spin_base_pct.setEnabled(is_target)
+        for button in (
+            self.btn_offset_falling,
+            self.btn_offset_center,
+            self.btn_offset_rising,
+        ):
+            button.setEnabled(is_target)
+        self.spin_dc_offset_raw.setEnabled(not is_target)
+        self.update_adc_simulator()
+
+    def sync_offset_channel_availability(self, readout_mask, select_all=False):
+        """Keep offset selection constrained to enabled readout channels."""
+
+        if not hasattr(self, "offset_ch_checks"):
+            return
+        for ch, checkbox in enumerate(self.offset_ch_checks):
+            enabled = bool((readout_mask >> ch) & 1)
+            was_enabled = checkbox.isEnabled()
+            checkbox.blockSignals(True)
+            try:
+                checkbox.setEnabled(enabled)
+                if not enabled:
+                    checkbox.setChecked(False)
+                elif select_all or not was_enabled:
+                    checkbox.setChecked(True)
+            finally:
+                checkbox.blockSignals(False)
+
+    def sync_dc_offset_controls_from_config(self):
+        """Load channel offset values without changing the loaded table."""
+
+        if not hasattr(self, "offset_ch_checks"):
+            return
+        try:
+            channel_mask = self.config.getint(
+                "Digitizer", "ChannelMask", fallback=0
+            )
+        except (ValueError, configparser.Error):
+            channel_mask = 0
+        self.sync_offset_channel_availability(channel_mask, select_all=True)
+
+        loaded = []
+        errors = []
+        for ch in range(8):
+            if not ((channel_mask >> ch) & 1):
+                continue
+            section = f"Channel_{ch}"
+            try:
+                settings = parse_dc_offset_settings(
+                    self.config.get(section, "DCOffsetMode", fallback=None),
+                    self.config.get(
+                        section, "BaselineTargetPercent", fallback=None
+                    ),
+                    self.config.get(section, "DCOffset", fallback=None),
+                )
+                loaded.append((ch, settings))
+            except (ValueError, configparser.Error) as exc:
+                errors.append(f"CH{ch}: {exc}")
+
+        if not loaded:
+            self.lbl_dc_offset_loaded.setText(
+                "Loaded channels: no valid DC-offset configuration"
+            )
+            if errors:
+                self.lbl_dc_offset_loaded.setText(
+                    "Loaded offset error: " + "; ".join(errors)
+                )
+                self.lbl_dc_offset_loaded.setStyleSheet("color: #dc3545;")
+            self.update_adc_simulator()
+            return
+
+        first = loaded[0][1]
+        same_mode = all(item.mode == first.mode for _, item in loaded)
+        same_value = all(
+            (
+                math.isclose(
+                    item.target_percent, first.target_percent,
+                    rel_tol=0.0, abs_tol=1e-9,
+                )
+                if item.mode == DC_OFFSET_MODE_TARGET
+                and first.mode == DC_OFFSET_MODE_TARGET
+                else item.raw_dac == first.raw_dac
+            )
+            for _, item in loaded
+        ) if same_mode else False
+
+        self.combo_dc_offset_mode.blockSignals(True)
+        self.spin_base_pct.blockSignals(True)
+        self.spin_dc_offset_raw.blockSignals(True)
+        try:
+            mode_index = self.combo_dc_offset_mode.findData(first.mode)
+            if mode_index >= 0:
+                self.combo_dc_offset_mode.setCurrentIndex(mode_index)
+            if first.target_percent is not None:
+                self.spin_base_pct.setValue(first.target_percent)
+            if first.raw_dac is not None:
+                self.spin_dc_offset_raw.setValue(first.raw_dac)
+        finally:
+            self.spin_dc_offset_raw.blockSignals(False)
+            self.spin_base_pct.blockSignals(False)
+            self.combo_dc_offset_mode.blockSignals(False)
+        self.on_dc_offset_mode_changed()
+
+        descriptions = []
+        for ch, item in loaded:
+            if item.mode == DC_OFFSET_MODE_TARGET:
+                descriptions.append(f"CH{ch} target {item.target_percent:g}%")
+            else:
+                legacy = " legacy" if item.legacy_raw else ""
+                descriptions.append(f"CH{ch} raw {item.raw_dac}{legacy}")
+        if errors:
+            descriptions.extend(errors)
+        qualifier = "uniform" if same_mode and same_value and not errors else "mixed"
+        self.lbl_dc_offset_loaded.setText(
+            f"Loaded ({qualifier}): " + ", ".join(descriptions)
+        )
+        self.lbl_dc_offset_loaded.setStyleSheet(
+            "color: #dc3545;" if errors else
+            "color: #856404;" if qualifier == "mixed" else
+            "color: #6c757d;"
+        )
+
+    def selected_offset_channel_mask(self):
+        return sum(
+            (1 << ch)
+            for ch, checkbox in enumerate(self.offset_ch_checks)
+            if checkbox.isEnabled() and checkbox.isChecked()
+        )
+
+    def remove_table_value(self, target_section, target_param):
+        removed = False
+        for row in range(self.table.rowCount() - 1, -1, -1):
+            section_item = self.table.item(row, 0)
+            parameter_item = self.table.item(row, 1)
+            if (
+                section_item is not None
+                and parameter_item is not None
+                and section_item.text() == target_section
+                and parameter_item.text() == target_param
+            ):
+                self.table.removeRow(row)
+                removed = True
+        if removed:
+            self._set_config_dirty(True)
+        return removed
+
+    @staticmethod
+    def format_baseline_percent(value):
+        return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+    def apply_dc_offset_to_table(self):
+        """Store operator intent; hardware calibration occurs at DAQ startup."""
+
+        if self.table.rowCount() == 0:
+            return
+        try:
+            channel_mask = self.table_int_value("Digitizer", "ChannelMask")
+            selected_mask = self.selected_offset_channel_mask()
+            if selected_mask == 0:
+                raise ValueError("적용할 readout 채널을 하나 이상 선택하세요.")
+            if selected_mask & ~channel_mask:
+                raise ValueError("DC offset은 활성 readout 채널에만 적용할 수 있습니다.")
+            mode = self.combo_dc_offset_mode.currentData()
+            if mode == DC_OFFSET_MODE_TARGET:
+                value_text = self.format_baseline_percent(
+                    self.spin_base_pct.value()
+                )
+                parse_dc_offset_settings(mode, value_text, None)
+            elif mode == DC_OFFSET_MODE_RAW:
+                value_text = str(self.spin_dc_offset_raw.value())
+                parse_dc_offset_settings(mode, None, value_text)
+            else:
+                raise ValueError("DCOffsetMode를 선택하세요.")
+
+            self_trigger = self.table_int_value(
+                "Digitizer", "SelfTriggerMode"
+            )
+            trigger_mask_raw = self.optional_table_value(
+                "Digitizer", "SelfTriggerMask"
+            )
+            trigger_mask = (
+                int(trigger_mask_raw, 10)
+                if trigger_mask_raw is not None
+                else channel_mask if self_trigger else 0
+            )
+            converted_threshold_channels = [
+                ch for ch in range(8)
+                if mode == DC_OFFSET_MODE_TARGET
+                and ((selected_mask >> ch) & 1)
+                and self_trigger
+                and ((trigger_mask >> ch) & 1)
+                and self.optional_table_value(
+                    f"Channel_{ch}", "TriggerThreshold"
+                ) is not None
+            ]
+            threshold_text = None
+            if converted_threshold_channels:
+                requested_mv = self.spin_trg_mv.value()
+                millivolts_to_adc_delta(
+                    requested_mv,
+                    int(self.combo_input_range.currentText()),
+                    14,
+                )
+                threshold_text = (
+                    f"{requested_mv:.6f}".rstrip("0").rstrip(".")
+                )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid DC Offset", str(exc))
+            return
+
+        self.set_table_value("Digitizer", "InputRangeMv",
+                             self.combo_input_range.currentText())
+        self.set_table_value("Digitizer", "ADCBits", "14")
+
+        if mode == DC_OFFSET_MODE_TARGET:
+            trigger_defaults = {
+                "SettlingTimeMs": "3000",
+                "SettlingTimeoutMs": "15000",
+                "MeasurementEvents": "32",
+                "StabilityToleranceAdc": "2.0",
+                "StableMeasurements": "3",
+            }
+            offset_defaults = {
+                "TargetTolerancePercent": "0.5",
+                "MaxAdjustmentIterations": "8",
+                "DacBusyTimeoutMs": "1000",
+                "StepSettlingTimeMs": "3000",
+            }
+            for key, default_value in trigger_defaults.items():
+                if self.optional_table_value("TriggerCalibration", key) is None:
+                    self.set_table_value(
+                        "TriggerCalibration", key, default_value
+                    )
+            for key, default_value in offset_defaults.items():
+                if self.optional_table_value("DCOffsetCalibration", key) is None:
+                    self.set_table_value(
+                        "DCOffsetCalibration", key, default_value
+                    )
+
+        for ch in range(8):
+            if not ((selected_mask >> ch) & 1):
+                continue
+            section = f"Channel_{ch}"
+            self.set_table_value(section, "DCOffsetMode", mode)
+            if mode == DC_OFFSET_MODE_TARGET:
+                self.set_table_value(
+                    section, "BaselineTargetPercent", value_text
+                )
+                self.remove_table_value(section, "DCOffset")
+                if ch in converted_threshold_channels:
+                    self.replace_channel_threshold_with_mv(ch, threshold_text)
+            else:
+                self.set_table_value(section, "DCOffset", value_text)
+                self.remove_table_value(section, "BaselineTargetPercent")
+
+        channels = ", ".join(
+            f"CH{ch}" for ch in range(8) if (selected_mask >> ch) & 1
+        )
+        self.refresh_dc_offset_loaded_summary_from_table(channel_mask)
+        conversion_note = ""
+        if converted_threshold_channels:
+            converted = ", ".join(
+                f"CH{ch}" for ch in converted_threshold_channels
+            )
+            conversion_note = (
+                f"\n{converted}의 stale absolute TriggerThreshold를 현재 "
+                f"{self.spin_trg_mv.value():g} mV 요청으로 교체했습니다."
+            )
+        action = (
+            f"target baseline {value_text}%"
+            if mode == DC_OFFSET_MODE_TARGET
+            else f"raw DAC {value_text}"
+        )
+        QMessageBox.information(
+            self, "DC Offset Settings Stored",
+            f"{channels}에 {action} 설정을 저장할 준비가 됐습니다."
+            f"{conversion_note}\n설정 파일에 반영하려면 Save .conf를 누르세요."
+        )
+
+    def refresh_dc_offset_loaded_summary_from_table(self, channel_mask):
+        descriptions = []
+        errors = []
+        for ch in range(8):
+            if not ((channel_mask >> ch) & 1):
+                continue
+            section = f"Channel_{ch}"
+            try:
+                settings = parse_dc_offset_settings(
+                    self.optional_table_value(section, "DCOffsetMode"),
+                    self.optional_table_value(
+                        section, "BaselineTargetPercent"
+                    ),
+                    self.optional_table_value(section, "DCOffset"),
+                )
+                if settings.mode == DC_OFFSET_MODE_TARGET:
+                    descriptions.append(
+                        f"CH{ch} target {settings.target_percent:g}%"
+                    )
+                else:
+                    legacy = " legacy" if settings.legacy_raw else ""
+                    descriptions.append(
+                        f"CH{ch} raw {settings.raw_dac}{legacy}"
+                    )
+            except ValueError as exc:
+                errors.append(f"CH{ch}: {exc}")
+        self.lbl_dc_offset_loaded.setText(
+            "Pending table: " + ", ".join(descriptions + errors)
+        )
+        self.lbl_dc_offset_loaded.setStyleSheet(
+            "color: #dc3545;" if errors else "color: #856404;"
+        )
+
     def on_input_range_changed(self, value):
         try:
             input_range_mv = int(value)
@@ -912,21 +1350,70 @@ class ConfigTab(QWidget):
         minimum_mv = math.ceil(
             ((input_range_mv / (1 << 14)) / 2.0) * 1000.0
         ) / 1000.0
+        maximum_mv = (
+            ((1 << 14) - 1) * (input_range_mv / (1 << 14))
+        )
         self.spin_trg_mv.setMinimum(minimum_mv)
-        self.spin_trg_mv.setMaximum(float(input_range_mv) - 0.001)
+        self.spin_trg_mv.setMaximum(maximum_mv)
         self.update_adc_simulator()
 
     def update_adc_simulator(self):
-        base_pct = self.spin_base_pct.value() / 100.0
         requested_mv = self.spin_trg_mv.value()
         input_range_mv = int(self.combo_input_range.currentText())
         adc_bits = 14
         adc_codes = 1 << adc_bits
+        mode = self.combo_dc_offset_mode.currentData()
 
-        # The green line is only a plot aid. The DAC has analogue
-        # tolerances/over-range, so this preview must never be reused as a
-        # measured baseline for an absolute discriminator threshold.
-        adc_baseline_preview = int(round(base_pct * (adc_codes - 1)))
+        try:
+            if mode == DC_OFFSET_MODE_TARGET:
+                offset_preview = calculate_dc_offset_preview(
+                    self.spin_base_pct.value(), input_range_mv
+                )
+                base_percent = offset_preview.target_percent
+                adc_baseline_preview = offset_preview.target_adc
+                offset_text = (
+                    f"target={base_percent:.1f}% = {adc_baseline_preview} ADC; "
+                    f"initial nominal DAC={offset_preview.nominal_dac}. "
+                    "At startup each channel is measured and adjusted independently."
+                )
+                calibration_text = "closed-loop automatic placement"
+            else:
+                raw_dac = self.spin_dc_offset_raw.value()
+                base_percent = nominal_baseline_percent_from_dac(raw_dac)
+                adc_baseline_preview = int(math.floor(
+                    (base_percent / 100.0) * (adc_codes - 1) + 0.5
+                ))
+                offset_text = (
+                    f"raw DAC={raw_dac}; nominal preview≈{base_percent:.2f}% "
+                    f"({adc_baseline_preview} ADC). Actual baseline is not "
+                    "guaranteed in legacy raw mode."
+                )
+                calibration_text = "legacy raw code; no target-placement loop"
+        except ValueError as exc:
+            self.lbl_res_offset.setText(f"invalid DC-offset request: {exc}")
+            self.lbl_dc_offset_headroom.clear()
+            self.lbl_res_trg.setText("threshold preview unavailable")
+            self.btn_apply_dc_offset.setEnabled(False)
+            return
+
+        falling_headroom = (base_percent / 100.0) * input_range_mv
+        rising_headroom = (1.0 - base_percent / 100.0) * input_range_mv
+        selected_channels = ", ".join(
+            f"CH{ch}" for ch in range(8)
+            if (self.selected_offset_channel_mask() >> ch) & 1
+        ) or "none"
+        self.lbl_res_offset.setText(offset_text)
+        self.lbl_dc_offset_headroom.setText(
+            f"Falling headroom≈{falling_headroom:.1f} mV; "
+            f"rising headroom≈{rising_headroom:.1f} mV; "
+            f"apply to: {selected_channels} ({calibration_text})"
+        )
+        self.btn_apply_dc_offset.setEnabled(
+            self.table.rowCount() > 0 and self.selected_offset_channel_mask() != 0
+        )
+
+        # The line is an intent/nominal preview only. Absolute discriminator
+        # thresholds are always based on a measured per-channel baseline.
         polarity = 1
         raw_polarity = self.optional_table_value("Digitizer", "TriggerPolarity")
         if raw_polarity in {"0", "1"}:
@@ -939,17 +1426,11 @@ class ConfigTab(QWidget):
                 adc_bits, polarity
             )
         except ValueError as exc:
-            self.lbl_res_offset.setText(
-                "unchanged; runtime measures every channel after settling"
-            )
             self.lbl_res_trg.setText(f"invalid request: {exc}")
             self.line_base.setValue(adc_baseline_preview)
             self.line_trg.setValue(adc_baseline_preview)
             return
 
-        self.lbl_res_offset.setText(
-            "unchanged; runtime measures every channel after settling"
-        )
         self.lbl_res_trg.setText(
             f"request={requested_mv:.3f} mV, LSB={preview.lsb_mv:.6f} mV, "
             f"delta={preview.delta_adc} ADC; runtime: {direction}"
@@ -1229,21 +1710,27 @@ class ConfigTab(QWidget):
         )
 
         uses_mv_threshold = False
+        uses_target_offset = False
         for ch in range(8):
             if not ((channel_mask >> ch) & 1):
                 continue
             section = f"Channel_{ch}"
-            raw_offset = self.table_value(section, "DCOffset")
             try:
-                offset = int(raw_offset, 10)
+                offset_settings = parse_dc_offset_settings(
+                    self.optional_table_value(section, "DCOffsetMode"),
+                    self.optional_table_value(
+                        section, "BaselineTargetPercent"
+                    ),
+                    self.optional_table_value(section, "DCOffset"),
+                )
             except ValueError as exc:
                 raise ValueError(
-                    f"정수가 아닌 설정값입니다: [{section}] DCOffset={raw_offset}"
+                    f"[{section}] DC offset 설정 오류: {exc}"
                 ) from exc
-            if not 0 <= offset <= 65535:
-                raise ValueError(
-                    f"설정값 범위 오류: [{section}] DCOffset={offset} (허용 0..65535)"
-                )
+            uses_target_offset = (
+                uses_target_offset
+                or offset_settings.mode == DC_OFFSET_MODE_TARGET
+            )
 
             raw_absolute = self.optional_table_value(
                 section, "TriggerThreshold"
@@ -1256,6 +1743,16 @@ class ConfigTab(QWidget):
                 raise ValueError(
                     f"[{section}] TriggerThreshold(legacy)와 TriggerThresholdMv 중 "
                     "하나만 설정해야 합니다."
+                )
+            if (
+                participates_in_trigger
+                and offset_settings.mode == DC_OFFSET_MODE_TARGET
+                and raw_absolute is not None
+            ):
+                raise ValueError(
+                    f"[{section}] TargetBaseline 모드의 self-trigger 채널은 "
+                    "baseline 이동 후 stale해지는 absolute TriggerThreshold를 "
+                    "사용할 수 없습니다. TriggerThresholdMv를 사용하세요."
                 )
             if participates_in_trigger and raw_absolute is None and raw_mv is None:
                 raise ValueError(
@@ -1352,6 +1849,65 @@ class ConfigTab(QWidget):
                 raise ValueError("StableMeasurements는 2..100이어야 합니다.")
             if not math.isfinite(tolerance_adc) or tolerance_adc <= 0:
                 raise ValueError("StabilityToleranceAdc는 유한한 양수여야 합니다.")
+
+        has_dc_calibration_section = any(
+            self.table.item(row, 0) is not None
+            and self.table.item(row, 0).text() == "DCOffsetCalibration"
+            for row in range(self.table.rowCount())
+        )
+        if uses_target_offset or has_dc_calibration_section:
+            tolerance_raw = self.optional_table_value(
+                "DCOffsetCalibration", "TargetTolerancePercent"
+            ) or "0.5"
+            max_iterations_raw = self.optional_table_value(
+                "DCOffsetCalibration", "MaxAdjustmentIterations"
+            ) or "8"
+            busy_timeout_raw = self.optional_table_value(
+                "DCOffsetCalibration", "DacBusyTimeoutMs"
+            ) or "1000"
+            step_settling_raw = self.optional_table_value(
+                "DCOffsetCalibration", "StepSettlingTimeMs"
+            ) or "200"
+            trigger_timeout_raw = self.optional_table_value(
+                "TriggerCalibration", "SettlingTimeoutMs"
+            ) or "15000"
+            try:
+                target_tolerance = float(tolerance_raw)
+                max_iterations = int(max_iterations_raw, 10)
+                busy_timeout_ms = int(busy_timeout_raw, 10)
+                step_settling_ms = int(step_settling_raw, 10)
+                trigger_timeout_ms = int(trigger_timeout_raw, 10)
+            except ValueError as exc:
+                raise ValueError(
+                    "DCOffsetCalibration 설정 형식이 잘못됐습니다."
+                ) from exc
+            if not math.isfinite(target_tolerance) or not (
+                0.0 < target_tolerance <= 10.0
+            ):
+                raise ValueError(
+                    "[DCOffsetCalibration] TargetTolerancePercent는 "
+                    "0보다 크고 10 이하여야 합니다."
+                )
+            if not 1 <= max_iterations <= 32:
+                raise ValueError(
+                    "[DCOffsetCalibration] MaxAdjustmentIterations는 "
+                    "1..32여야 합니다."
+                )
+            if not 1 <= busy_timeout_ms <= 60000:
+                raise ValueError(
+                    "[DCOffsetCalibration] DacBusyTimeoutMs는 "
+                    "1..60000 ms여야 합니다."
+                )
+            if not 0 <= step_settling_ms <= 600000:
+                raise ValueError(
+                    "[DCOffsetCalibration] StepSettlingTimeMs는 "
+                    "0..600000 ms여야 합니다."
+                )
+            if uses_target_offset and step_settling_ms >= trigger_timeout_ms:
+                raise ValueError(
+                    "[DCOffsetCalibration] StepSettlingTimeMs는 "
+                    "[TriggerCalibration] SettlingTimeoutMs보다 작아야 합니다."
+                )
 
     def save_config(self):
         if not self.current_config_path: return

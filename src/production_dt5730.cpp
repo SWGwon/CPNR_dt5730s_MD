@@ -20,6 +20,7 @@
 #include <TSystem.h> 
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -522,6 +523,50 @@ void RequireMetadataNull(const Json& metadata, const std::string& key) {
     }
 }
 
+constexpr std::array<const char*, 8> kDcOffsetMetadataKeys = {
+    "dc_offset_mode",
+    "requested_baseline_percent",
+    "target_baseline_adc",
+    "initial_dc_offset_dac",
+    "final_dc_offset_dac",
+    "baseline_error_adc",
+    "dc_offset_adjustment_iterations",
+    "dc_offset_converged",
+};
+
+constexpr std::array<const char*, 4> kDcOffsetCalibrationMetadataKeys = {
+    "dc_offset_target_tolerance_percent",
+    "dc_offset_max_adjustment_iterations",
+    "dc_offset_dac_busy_timeout_ms",
+    "dc_offset_step_settling_time_ms",
+};
+
+bool HasCompleteMetadataExtension(
+    const Json& object, const std::string& description,
+    const std::array<const char*, 8>& keys) {
+    std::size_t present = 0U;
+    for (const char* key : keys) {
+        if (object.contains(key)) ++present;
+    }
+    if (present != 0U && present != keys.size()) {
+        throw std::runtime_error(description + " is partially present");
+    }
+    return present == keys.size();
+}
+
+bool HasCompleteMetadataExtension(
+    const Json& object, const std::string& description,
+    const std::array<const char*, 4>& keys) {
+    std::size_t present = 0U;
+    for (const char* key : keys) {
+        if (object.contains(key)) ++present;
+    }
+    if (present != 0U && present != keys.size()) {
+        throw std::runtime_error(description + " is partially present");
+    }
+    return present == keys.size();
+}
+
 std::uint32_t ValidateRuntimeMetadataAgainstConfig(
     const Json& metadata, const DAQHardwareSettings& settings) {
     const Json hardware = RequireMetadataField(metadata, "hardware");
@@ -548,6 +593,37 @@ std::uint32_t ValidateRuntimeMetadataAgainstConfig(
     const uint64_t dc_offset_bits =
         RequireMetadataUnsigned(hardware, "dc_offset_dac_bits", 16U, 16U);
     (void)dc_offset_bits;
+    const bool has_dc_offset_calibration_metadata =
+        HasCompleteMetadataExtension(
+            hardware, "Runtime DC-offset calibration settings extension",
+            kDcOffsetCalibrationMetadataKeys);
+    double dc_offset_target_tolerance_percent = 0.0;
+    uint32_t dc_offset_max_adjustment_iterations = 0U;
+    if (has_dc_offset_calibration_metadata) {
+        dc_offset_target_tolerance_percent = RequireMetadataNumber(
+            hardware, "dc_offset_target_tolerance_percent", 0.0, 10.0);
+        dc_offset_max_adjustment_iterations = static_cast<uint32_t>(
+            RequireMetadataUnsigned(
+                hardware, "dc_offset_max_adjustment_iterations", 1U, 32U));
+        const uint32_t busy_timeout = static_cast<uint32_t>(
+            RequireMetadataUnsigned(
+                hardware, "dc_offset_dac_busy_timeout_ms", 1U, 60000U));
+        const uint32_t step_settling = static_cast<uint32_t>(
+            RequireMetadataUnsigned(
+                hardware, "dc_offset_step_settling_time_ms", 0U, 600000U));
+        if (std::abs(dc_offset_target_tolerance_percent -
+                     settings.dc_offset_calibration
+                         .target_tolerance_percent) > 1e-12 ||
+            dc_offset_max_adjustment_iterations !=
+                settings.dc_offset_calibration.max_adjustment_iterations ||
+            busy_timeout !=
+                settings.dc_offset_calibration.dac_busy_timeout_ms ||
+            step_settling !=
+                settings.dc_offset_calibration.step_settling_time_ms) {
+            throw std::runtime_error(
+                "Runtime DC-offset calibration settings differ from config");
+        }
+    }
     const uint64_t schema = RequireMetadataUnsigned(
         metadata, "schema_version", 1U, 2U);
     const std::uint32_t applied_waveform_dsp_schema =
@@ -851,12 +927,22 @@ std::uint32_t ValidateRuntimeMetadataAgainstConfig(
 
     std::size_t expected_channel_count = 0U;
     bool measured_batch_expected = false;
+    bool target_baseline_expected = false;
     for (int ch = 0; ch < MAX_CH; ++ch) {
         if (((record_mask >> ch) & 1U) != 0U) ++expected_channel_count;
+        if (((record_mask >> ch) & 1U) != 0U &&
+            settings.channels[ch].dc_offset_mode ==
+                DAQDCOffsetMode::kTargetBaseline) {
+            target_baseline_expected = true;
+        }
         if (((self_mask >> ch) & 1U) != 0U &&
             settings.channels[ch].threshold_is_relative_mv) {
             measured_batch_expected = true;
         }
+    }
+    if (target_baseline_expected && !has_dc_offset_calibration_metadata) {
+        throw std::runtime_error(
+            "TargetBaseline config requires extended DC-offset runtime metadata");
     }
     if (channels.size() != expected_channel_count) {
         throw std::runtime_error(
@@ -864,6 +950,7 @@ std::uint32_t ValidateRuntimeMetadataAgainstConfig(
     }
 
     std::set<uint32_t> seen_channels;
+    std::optional<bool> dc_offset_extension_present;
     for (const Json& channel : channels) {
         if (!channel.is_object()) {
             throw std::runtime_error(
@@ -886,13 +973,100 @@ std::uint32_t ValidateRuntimeMetadataAgainstConfig(
                                     UINT32_MAX) != expected_range_register ||
             RequireMetadataUnsigned(channel, "input_range_readback", 0U, 1U) !=
                 expected_range_readback ||
-            RequireMetadataUnsigned(channel, "requested_dc_offset", 0U,
-                                    65535U) != settings.channels[ch].dc_offset ||
-            RequireMetadataUnsigned(channel, "readback_dc_offset", 0U,
-                                    65535U) != settings.channels[ch].dc_offset ||
             RequireMetadataString(channel, "polarity_readback") != polarity) {
             throw std::runtime_error(
                 "Runtime channel analog/readback metadata does not match config");
+        }
+        const uint32_t requested_dc_offset = static_cast<uint32_t>(
+            RequireMetadataUnsigned(channel, "requested_dc_offset", 0U,
+                                    65535U));
+        const uint32_t readback_dc_offset = static_cast<uint32_t>(
+            RequireMetadataUnsigned(channel, "readback_dc_offset", 0U,
+                                    65535U));
+        const bool has_dc_offset_metadata = HasCompleteMetadataExtension(
+            channel, "Runtime channel DC-offset calibration extension",
+            kDcOffsetMetadataKeys);
+        if (dc_offset_extension_present.has_value() &&
+            *dc_offset_extension_present != has_dc_offset_metadata) {
+            throw std::runtime_error(
+                "Runtime channels mix legacy and extended DC-offset schemas");
+        }
+        dc_offset_extension_present = has_dc_offset_metadata;
+        if (has_dc_offset_metadata != has_dc_offset_calibration_metadata) {
+            throw std::runtime_error(
+                "Runtime hardware/channel DC-offset metadata extensions differ");
+        }
+
+        if (!has_dc_offset_metadata) {
+            if (settings.channels[ch].dc_offset_mode !=
+                    DAQDCOffsetMode::kRawDac ||
+                requested_dc_offset != settings.channels[ch].dc_offset ||
+                readback_dc_offset != settings.channels[ch].dc_offset) {
+                throw std::runtime_error(
+                    "Legacy runtime DC-offset metadata differs from raw config");
+            }
+        } else {
+            const std::string dc_offset_mode =
+                RequireMetadataString(channel, "dc_offset_mode");
+            const uint32_t initial_dc_offset = static_cast<uint32_t>(
+                RequireMetadataUnsigned(channel, "initial_dc_offset_dac", 0U,
+                                        65535U));
+            const uint32_t final_dc_offset = static_cast<uint32_t>(
+                RequireMetadataUnsigned(channel, "final_dc_offset_dac", 0U,
+                                        65535U));
+            const uint32_t adjustment_iterations = static_cast<uint32_t>(
+                RequireMetadataUnsigned(
+                    channel, "dc_offset_adjustment_iterations", 0U,
+                    UINT32_MAX));
+            if (requested_dc_offset != final_dc_offset ||
+                readback_dc_offset != final_dc_offset) {
+                throw std::runtime_error(
+                    "Runtime DC-offset final write/readback aliases differ");
+            }
+
+            if (settings.channels[ch].dc_offset_mode ==
+                DAQDCOffsetMode::kRawDac) {
+                if (dc_offset_mode != "raw_dac_code" ||
+                    initial_dc_offset != settings.channels[ch].dc_offset ||
+                    final_dc_offset != settings.channels[ch].dc_offset ||
+                    adjustment_iterations != 0U) {
+                    throw std::runtime_error(
+                        "Runtime raw-DAC metadata differs from config");
+                }
+                RequireMetadataNull(channel, "requested_baseline_percent");
+                RequireMetadataNull(channel, "target_baseline_adc");
+                RequireMetadataNull(channel, "baseline_error_adc");
+                RequireMetadataNull(channel, "dc_offset_converged");
+            } else {
+                if (dc_offset_mode != "target_baseline_percent" ||
+                    initial_dc_offset != settings.channels[ch].dc_offset ||
+                    adjustment_iterations >
+                        2U * dc_offset_max_adjustment_iterations) {
+                    throw std::runtime_error(
+                        "Runtime target-baseline DAC metadata differs from config");
+                }
+                const double requested_percent = RequireMetadataNumber(
+                    channel, "requested_baseline_percent", 5.0, 95.0);
+                const uint32_t target_adc = static_cast<uint32_t>(
+                    RequireMetadataUnsigned(channel, "target_baseline_adc", 0U,
+                                            16383U));
+                const double baseline_error = RequireMetadataNumber(
+                    channel, "baseline_error_adc", -16383.0, 16383.0);
+                const bool converged =
+                    RequireMetadataBool(channel, "dc_offset_converged");
+                const double allowed_error =
+                    dc_offset_target_tolerance_percent * 16383.0 / 100.0;
+                if (std::abs(requested_percent -
+                             settings.channels[ch]
+                                 .baseline_target_percent) > 1e-12 ||
+                    target_adc != settings.channels[ch].target_baseline_adc ||
+                    !converged ||
+                    std::abs(baseline_error) > allowed_error + 1e-9) {
+                    throw std::runtime_error(
+                        "Runtime target-baseline request did not converge to "
+                        "the configured ADC target");
+                }
+            }
         }
 
         const std::string threshold_mode =
@@ -911,12 +1085,27 @@ std::uint32_t ValidateRuntimeMetadataAgainstConfig(
         const Json baseline_field =
             RequireMetadataField(channel, "measured_baseline_adc");
         double baseline = 0.0;
-        if (measured_batch_expected) {
+        if (measured_batch_expected ||
+            settings.channels[ch].dc_offset_mode ==
+                DAQDCOffsetMode::kTargetBaseline) {
             baseline = RequireMetadataNumber(
                 channel, "measured_baseline_adc", 0.0, 16383.0);
         } else if (!baseline_field.is_null()) {
             baseline = RequireMetadataNumber(
                 channel, "measured_baseline_adc", 0.0, 16383.0);
+        }
+        if (has_dc_offset_metadata &&
+            settings.channels[ch].dc_offset_mode ==
+                DAQDCOffsetMode::kTargetBaseline) {
+            const double baseline_error = RequireMetadataNumber(
+                channel, "baseline_error_adc", -16383.0, 16383.0);
+            if (std::abs(baseline_error -
+                         (baseline - static_cast<double>(
+                                         settings.channels[ch]
+                                             .target_baseline_adc))) > 1e-6) {
+                throw std::runtime_error(
+                    "Runtime target-baseline measured value/error is inconsistent");
+            }
         }
 
         if (!expected_trigger) {

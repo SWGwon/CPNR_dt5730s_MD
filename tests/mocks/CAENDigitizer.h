@@ -5,6 +5,7 @@
 #include "DT5730Constraints.h"
 #include "DT5730Status.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -80,6 +81,10 @@ constexpr uint32_t kExternalClockControlMask = 1U << 6U;
 
 struct State {
   bool unstable_baseline = false;
+  bool dc_offset_affects_baseline = false;
+  bool dc_offset_non_monotonic_response = false;
+  bool corrupt_dc_offset_readback = false;
+  bool dc_offset_dac_busy_stuck = false;
   bool corrupt_threshold_readback = false;
   bool corrupt_pair_logic_readback = false;
   bool corrupt_channel_mask_readback = false;
@@ -116,6 +121,8 @@ struct State {
   uint32_t software_triggers_sent = 0;
   CAEN_DGTZ_RunSyncMode_t run_sync_mode = CAEN_DGTZ_RUN_SYNC_Disabled;
   std::array<uint32_t, 8> dc_offsets{};
+  std::array<uint32_t, 8> dc_offset_write_counts{};
+  bool dc_offset_written_with_physical_trigger_enabled = false;
   std::array<uint32_t, 8> thresholds{};
   std::array<CAEN_DGTZ_TriggerPolarity_t, 8> polarities{};
   std::map<uint32_t, uint32_t> registers{
@@ -167,6 +174,12 @@ struct State {
 
   void ResetHardware() {
     const bool preserve_unstable = unstable_baseline;
+    const bool preserve_dc_offset_response = dc_offset_affects_baseline;
+    const bool preserve_dc_offset_non_monotonic =
+        dc_offset_non_monotonic_response;
+    const bool preserve_dc_offset_readback_fault =
+        corrupt_dc_offset_readback;
+    const bool preserve_dc_offset_busy_fault = dc_offset_dac_busy_stuck;
     const bool preserve_threshold_fault = corrupt_threshold_readback;
     const bool preserve_pair_fault = corrupt_pair_logic_readback;
     const bool preserve_channel_mask_fault = corrupt_channel_mask_readback;
@@ -189,6 +202,10 @@ struct State {
         event_header_board_failure_index;
     *this = State{};
     unstable_baseline = preserve_unstable;
+    dc_offset_affects_baseline = preserve_dc_offset_response;
+    dc_offset_non_monotonic_response = preserve_dc_offset_non_monotonic;
+    corrupt_dc_offset_readback = preserve_dc_offset_readback_fault;
+    dc_offset_dac_busy_stuck = preserve_dc_offset_busy_fault;
     corrupt_threshold_readback = preserve_threshold_fault;
     corrupt_pair_logic_readback = preserve_pair_fault;
     corrupt_channel_mask_readback = preserve_channel_mask_fault;
@@ -220,8 +237,23 @@ struct State {
     ++baseline_batch;
 
     for (std::size_t ch = 0; ch < traces.size(); ++ch) {
-      const uint16_t baseline =
+      uint16_t baseline =
           ch == 0U ? ch0_baseline : (ch == 1U ? ch1_baseline : 8192U);
+      if (dc_offset_affects_baseline) {
+        constexpr std::array<int32_t, 8> kChannelIntercepts{
+            17000, 17200, 16800, 17500, 16900, 17300, 17100, 17600};
+        const int32_t dac_response =
+            static_cast<int32_t>(dc_offsets[ch] / 4U);
+        int32_t measured =
+            kChannelIntercepts[ch] +
+            (dc_offset_non_monotonic_response ? dac_response
+                                              : -dac_response);
+        if (unstable_baseline) {
+          measured += static_cast<int32_t>(10U * (baseline_batch % 100U));
+        }
+        baseline = static_cast<uint16_t>(
+            std::clamp<int32_t>(measured, 0, 16383));
+      }
       const uint32_t trace_length =
           corrupt_event_record_length ? record_length / 2U : record_length;
       traces[ch].assign(trace_length, baseline);
@@ -262,6 +294,22 @@ inline void SetResetFailure(bool enabled) {
 
 inline void SetUnstableBaseline(bool enabled) {
   state.unstable_baseline = enabled;
+}
+
+inline void SetDCOffsetBaselineResponse(bool enabled) {
+  state.dc_offset_affects_baseline = enabled;
+}
+
+inline void SetDCOffsetNonMonotonicResponse(bool enabled) {
+  state.dc_offset_non_monotonic_response = enabled;
+}
+
+inline void SetDCOffsetReadbackFault(bool enabled) {
+  state.corrupt_dc_offset_readback = enabled;
+}
+
+inline void SetDCOffsetBusyFault(bool enabled) {
+  state.dc_offset_dac_busy_stuck = enabled;
 }
 
 inline void SetThresholdReadbackFault(bool enabled) {
@@ -437,6 +485,14 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_ReadRegister(
     *value = caen_mock::state.runtime_temperature_c;
     return CAEN_DGTZ_Success;
   }
+  const bool channel_status_register =
+      address >= 0x1088U && address <= 0x1788U &&
+      ((address - 0x1088U) % 0x100U) == 0U;
+  if (channel_status_register &&
+      caen_mock::state.dc_offset_dac_busy_stuck) {
+    *value = caen_mock::state.registers[address] | (1U << 2U);
+    return CAEN_DGTZ_Success;
+  }
   *value = caen_mock::state.registers[address];
   if (address == 0x1084U &&
       caen_mock::state.corrupt_pair_logic_readback) {
@@ -556,13 +612,22 @@ inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetSWTriggerMode(
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_SetChannelDCOffset(
     int, uint32_t channel, uint32_t value) {
+  const uint32_t global_trigger = caen_mock::state.registers[
+      caen_mock::kGlobalTriggerMaskRegister];
+  if ((global_trigger & ((1U << 30U) | 0x0FU)) != 0U) {
+    caen_mock::state.dc_offset_written_with_physical_trigger_enabled = true;
+  }
   caen_mock::state.dc_offsets.at(channel) = value;
+  ++caen_mock::state.dc_offset_write_counts.at(channel);
   return CAEN_DGTZ_Success;
 }
 
 inline CAEN_DGTZ_ErrorCode CAEN_DGTZ_GetChannelDCOffset(
     int, uint32_t channel, uint32_t* value) {
   *value = caen_mock::state.dc_offsets.at(channel);
+  if (caen_mock::state.corrupt_dc_offset_readback) {
+    *value = (*value + 1U) & 0xFFFFU;
+  }
   return CAEN_DGTZ_Success;
 }
 

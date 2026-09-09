@@ -23,8 +23,20 @@ struct DAQConnectionSettings {
   uint32_t expected_serial = 0;
 };
 
+enum class DAQDCOffsetMode {
+  // Backward-compatible expert mode: write the configured 16-bit DAC code
+  // exactly and verify its readback.
+  kRawDac,
+  // Operator mode: use the configured percentage as a measured 14-bit ADC
+  // baseline target and tune the per-channel DAC before trigger setup.
+  kTargetBaseline,
+};
+
 struct DAQChannelSettings {
+  DAQDCOffsetMode dc_offset_mode = DAQDCOffsetMode::kRawDac;
   uint32_t dc_offset = 0;
+  double baseline_target_percent = 0.0;
+  uint32_t target_baseline_adc = 0;
   bool has_trigger_threshold = false;
   // Legacy configurations provide an absolute ADC discriminator code.  New
   // configurations keep the user's voltage request and let DAQManager derive
@@ -40,6 +52,15 @@ struct DAQTriggerCalibrationSettings {
   uint32_t measurement_events = 32;
   double stability_tolerance_adc = 2.0;
   uint32_t stable_measurements = 3;
+};
+
+struct DAQDCOffsetCalibrationSettings {
+  // Placement tolerance is intentionally separate from the much tighter
+  // baseline-stability tolerance used by trigger calibration.
+  double target_tolerance_percent = 0.5;
+  uint32_t max_adjustment_iterations = 8;
+  uint32_t dac_busy_timeout_ms = 1000;
+  uint32_t step_settling_time_ms = 3000;
 };
 
 struct DAQStorageSettings {
@@ -79,11 +100,18 @@ struct DAQHardwareSettings {
   bool explicit_trigger_routing = false;
   DAQPairLogic pair_logic = DAQPairLogic::kOr;
   DAQTriggerCalibrationSettings trigger_calibration{};
+  DAQDCOffsetCalibrationSettings dc_offset_calibration{};
   DAQStorageSettings storage{};
   DAQSoftwareDspSettings software_dsp{};
   cpnr::LostEventPolicy lost_event_policy{};
   std::array<DAQChannelSettings, MAX_CH> channels{};
 };
+
+// Pure conversion helpers shared by parsing, runtime calibration, and tests.
+// The DAC result is only an initial seed; the physical baseline must be
+// measured and corrected independently for every channel.
+uint32_t BaselinePercentToAdc(double percent, uint32_t adc_bits);
+uint32_t BaselinePercentToInitialDac(double percent);
 
 enum class DAQRecordLengthContract {
   // Hardware acquisition contract for DT5730/x730 standard waveform firmware.

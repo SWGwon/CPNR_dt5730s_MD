@@ -32,6 +32,9 @@ const ConfigSchema& DAQConfigSchema() {
         {"TriggerCalibration",
          {"SettlingTimeMs", "SettlingTimeoutMs", "MeasurementEvents",
           "StabilityToleranceAdc", "StableMeasurements"}},
+        {"DCOffsetCalibration",
+         {"TargetTolerancePercent", "MaxAdjustmentIterations",
+          "DacBusyTimeoutMs", "StepSettlingTimeMs"}},
         {"Storage", {"MinimumFreeMiB", "StopFreeMiB"}},
         {"DataQuality", {"MaxLostEvents", "MaxLostFraction"}},
         {"SoftwareDSP",
@@ -40,8 +43,9 @@ const ConfigSchema& DAQConfigSchema() {
     };
     for (int channel = 0; channel < MAX_CH; ++channel) {
       result.emplace("Channel_" + std::to_string(channel),
-                     AllowedKeys{"DCOffset", "TriggerThreshold",
-                                 "TriggerThresholdMv"});
+                     AllowedKeys{"DCOffsetMode", "DCOffset",
+                                 "BaselineTargetPercent",
+                                 "TriggerThreshold", "TriggerThresholdMv"});
     }
     return result;
   }();
@@ -185,6 +189,27 @@ double OptionalFiniteDouble(const ConfigParser& config,
 }
 
 }  // namespace
+
+uint32_t BaselinePercentToAdc(double percent, uint32_t adc_bits) {
+  if (!std::isfinite(percent) || percent < 0.0 || percent > 100.0 ||
+      adc_bits == 0U || adc_bits >= 32U) {
+    throw std::invalid_argument(
+        "Baseline percentage/ADC resolution is outside the supported range");
+  }
+  const uint64_t maximum_adc = (uint64_t{1} << adc_bits) - 1U;
+  return static_cast<uint32_t>(std::llround(
+      percent * static_cast<double>(maximum_adc) / 100.0));
+}
+
+uint32_t BaselinePercentToInitialDac(double percent) {
+  if (!std::isfinite(percent) || percent < 0.0 || percent > 100.0) {
+    throw std::invalid_argument(
+        "Baseline percentage is outside the supported range");
+  }
+  constexpr uint32_t kMaximumDac = 65535U;
+  return static_cast<uint32_t>(std::llround(
+      (100.0 - percent) * static_cast<double>(kMaximumDac) / 100.0));
+}
 
 DAQHardwareSettings LoadDAQHardwareSettings(
     const ConfigParser& config,
@@ -391,6 +416,17 @@ DAQHardwareSettings LoadDAQHardwareSettings(
         "SettlingTimeMs");
   }
 
+  auto& dc_calibration = settings.dc_offset_calibration;
+  dc_calibration.target_tolerance_percent = OptionalFiniteDouble(
+      config, "DCOffsetCalibration", "TargetTolerancePercent", 0.5, 0.0,
+      10.0);
+  dc_calibration.max_adjustment_iterations = OptionalUnsigned(
+      config, "DCOffsetCalibration", "MaxAdjustmentIterations", 8, 1, 32);
+  dc_calibration.dac_busy_timeout_ms = OptionalUnsigned(
+      config, "DCOffsetCalibration", "DacBusyTimeoutMs", 1000, 1, 60000);
+  dc_calibration.step_settling_time_ms = OptionalUnsigned(
+      config, "DCOffsetCalibration", "StepSettlingTimeMs", 3000, 0,
+      600000);
   const uint32_t minimum_free_mib = OptionalUnsigned(
       config, "Storage", "MinimumFreeMiB", 1024, 64, 1048576);
   const uint32_t stop_free_mib = OptionalUnsigned(
@@ -577,8 +613,64 @@ DAQHardwareSettings LoadDAQHardwareSettings(
     if ((settings.channel_mask >> ch) & 1U) {
       const std::string section = "Channel_" + std::to_string(ch);
       auto& channel = settings.channels[ch];
-      channel.dc_offset = static_cast<uint32_t>(
-          config.GetRequiredInt(section, "DCOffset", 0, 65535));
+      const bool has_dc_offset = HasValue(config, section, "DCOffset");
+      const bool has_baseline_target =
+          HasValue(config, section, "BaselineTargetPercent");
+      const bool has_dc_offset_mode =
+          HasValue(config, section, "DCOffsetMode");
+      const std::string dc_offset_mode =
+          config.GetString(section, "DCOffsetMode", "");
+
+      if (!has_dc_offset_mode) {
+        if (has_baseline_target) {
+          throw std::runtime_error(
+              "[" + section +
+              "] BaselineTargetPercent requires DCOffsetMode=TargetBaseline");
+        }
+        if (!has_dc_offset) {
+          throw std::runtime_error(
+              "[" + section +
+              "] legacy/raw mode requires DCOffset=0..65535");
+        }
+        channel.dc_offset_mode = DAQDCOffsetMode::kRawDac;
+        channel.dc_offset = static_cast<uint32_t>(
+            config.GetRequiredInt(section, "DCOffset", 0, 65535));
+      } else if (dc_offset_mode == "RawDac") {
+        if (!has_dc_offset || has_baseline_target) {
+          throw std::runtime_error(
+              "[" + section +
+              "] DCOffsetMode=RawDac requires DCOffset and forbids "
+              "BaselineTargetPercent");
+        }
+        channel.dc_offset_mode = DAQDCOffsetMode::kRawDac;
+        channel.dc_offset = static_cast<uint32_t>(
+            config.GetRequiredInt(section, "DCOffset", 0, 65535));
+      } else if (dc_offset_mode == "TargetBaseline") {
+        if (has_dc_offset || !has_baseline_target) {
+          throw std::runtime_error(
+              "[" + section +
+              "] DCOffsetMode=TargetBaseline requires "
+              "BaselineTargetPercent and forbids DCOffset");
+        }
+        channel.dc_offset_mode = DAQDCOffsetMode::kTargetBaseline;
+        channel.baseline_target_percent =
+            config.GetDouble(section, "BaselineTargetPercent", 0.0);
+        if (!std::isfinite(channel.baseline_target_percent) ||
+            channel.baseline_target_percent < 5.0 ||
+            channel.baseline_target_percent > 95.0) {
+          throw std::runtime_error(
+              "[" + section +
+              "] BaselineTargetPercent must be finite and in range 5..95");
+        }
+        channel.target_baseline_adc = BaselinePercentToAdc(
+            channel.baseline_target_percent, settings.adc_bits);
+        channel.dc_offset = BaselinePercentToInitialDac(
+            channel.baseline_target_percent);
+      } else {
+        throw std::runtime_error(
+            "[" + section +
+            "] DCOffsetMode must be RawDac or TargetBaseline");
+      }
 
       const bool has_absolute = HasValue(config, section, "TriggerThreshold");
       const bool has_relative =
@@ -596,6 +688,15 @@ DAQHardwareSettings LoadDAQHardwareSettings(
             "[" + section +
             "] a self-trigger channel requires TriggerThresholdMv or "
             "TriggerThreshold");
+      }
+      if (participates_in_self_trigger &&
+          channel.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline &&
+          has_absolute) {
+        throw std::runtime_error(
+            "[" + section +
+            "] DCOffsetMode=TargetBaseline requires TriggerThresholdMv for "
+            "a self-trigger channel; an absolute TriggerThreshold would "
+            "change meaning when the baseline is moved");
       }
 
       if (has_relative) {
@@ -629,6 +730,19 @@ DAQHardwareSettings LoadDAQHardwareSettings(
             config.GetRequiredInt(section, "TriggerThreshold", 0, 16383));
       }
     }
+  }
+
+  const bool has_target_baseline_channel = std::any_of(
+      settings.channels.begin(), settings.channels.end(),
+      [](const DAQChannelSettings& channel) {
+        return channel.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline;
+      });
+  if (has_target_baseline_channel &&
+      dc_calibration.step_settling_time_ms >=
+          calibration.settling_timeout_ms) {
+    throw std::runtime_error(
+        "[DCOffsetCalibration] StepSettlingTimeMs must be smaller than "
+        "[TriggerCalibration] SettlingTimeoutMs");
   }
 
   return settings;

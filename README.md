@@ -70,7 +70,7 @@ CPNR_dt5730s/
 
 ### 2. Hardware Config & Master Architect Calculator
 ![Hardware Config](docs/images/config_tab.png)
-> DCOffset과 threshold 등을 표에서 편집합니다. mV threshold는 이론 baseline으로 absolute ADC 값을 만들지 않고 `.conf`에 요청값으로 저장되며, frontend가 DCOffset 적용·settling 뒤 software-trigger 파형에서 채널별 baseline을 측정해 실제 discriminator 값을 계산하고 readback합니다.
+> DC offset은 채널별 목표 baseline 위치(%)로 지정할 수 있고 raw 16-bit DAC code는 고급 호환 모드로 남아 있습니다. mV threshold는 이론 baseline으로 absolute ADC 값을 만들지 않고 `.conf`에 요청값으로 저장되며, frontend가 DC-offset 자동 조정·settling 뒤 software-trigger 파형에서 채널별 baseline을 측정해 실제 discriminator 값을 계산하고 readback합니다.
 
 ### 3. Live Monitor (Auto Multi-Channel Overlay)
 ![Live Monitor](docs/images/monitor_tab.png)
@@ -223,9 +223,11 @@ PairLogic=AND
 
 이 경우 CH2와 CH3의 임계값은 트리거 결정에 관여하지 않습니다. 다만 readout-only 채널도 연속으로 독립 기록되는 것은 아니며, CH0/CH1 coincidence로 global trigger가 승인될 때 같은 이벤트 시간 구간이 함께 저장됩니다.
 
-### Baseline-relative mV threshold
+### Measured baseline target and baseline-relative mV threshold
 
-DT5730S의 waveform ADC와 discriminator code는 14-bit이지만 DC offset을 만드는 별도 DAC 제어값은 16-bit입니다. DAC code만으로 실제 baseline을 정확히 예측하지 말고, 다음처럼 mV 요청값을 저장합니다.
+DT5730S의 waveform ADC와 discriminator code는 14-bit이지만 DC offset을 만드는 별도 DAC 제어값은 16-bit입니다. 이 DAC는 `0..65535`이고 값이 커질수록 ADC baseline은 내려갑니다. 명목상 90% baseline의 초기값은 `6554`이지만, DAC 범위가 ADC보다 약 5% 넓고 입력의 DC level 및 채널별 오차가 더해지므로 raw DAC code만으로 실제 baseline을 정확히 예측할 수 없습니다.
+
+일반 사용자는 `TargetBaseline` 모드에서 파형 화면상의 목표 위치를 `5..95%`로 지정합니다. 음극성/falling pulse에는 90%, 양극성/rising pulse에는 10%가 일반적인 시작점입니다. frontend는 모든 trigger source를 끈 채 명목 DAC seed를 쓰고, DAC busy/readback과 analog settling을 확인한 다음 software-trigger 파형의 채널별 median을 측정해 목표까지 제한된 횟수로 조정합니다. 목표에 수렴하지 않으면 physics acquisition은 시작하지 않습니다.
 
 ```ini
 [Digitizer]
@@ -240,12 +242,21 @@ MeasurementEvents=32
 StabilityToleranceAdc=2.0
 StableMeasurements=3
 
+[DCOffsetCalibration]
+TargetTolerancePercent=0.5
+MaxAdjustmentIterations=8
+DacBusyTimeoutMs=1000
+StepSettlingTimeMs=3000
+
 [Channel_0]
-DCOffset=6554
+DCOffsetMode=TargetBaseline
+BaselineTargetPercent=90.0
 TriggerThresholdMv=1.0
 ```
 
-2 Vpp/14-bit에서는 1 LSB가 `2000/16384 = 0.1220703125 mV`이므로 1 mV는 반올림해 8 ADC입니다. Falling edge라면 frontend가 `round(measured_baseline[ch]) - 8`, rising edge라면 `+ 8`을 채널별로 기록합니다. 범위·DCOffset·polarity·threshold 및 pair/global trigger register readback이 하나라도 요청값과 다르면 physics acquisition을 시작하지 않습니다. 기존 `TriggerThreshold=<absolute ADC>` 설정도 호환되지만 이 모드에서는 실측 baseline-relative 보정이 적용되지 않습니다.
+90%의 14-bit 목표값은 `round(0.9*16383) = 14745 ADC`입니다. 2 Vpp/14-bit에서는 1 LSB가 `2000/16384 = 0.1220703125 mV`이므로 1 mV는 반올림해 8 ADC입니다. Falling edge라면 frontend가 `round(measured_baseline[ch]) - 8`, rising edge라면 `+ 8`을 채널별로 기록합니다. 범위·최종 DAC·polarity·threshold 및 pair/global trigger register readback이 하나라도 요청값과 다르면 physics acquisition을 시작하지 않습니다.
+
+기존 설정은 생략형 `DCOffset=<code>` 또는 명시적인 `DCOffsetMode=RawDac`와 `DCOffset=<code>`로 계속 재현할 수 있습니다. `DCOffset`과 `BaselineTargetPercent`를 동시에 쓰면 어느 값을 신뢰할지 모호하므로 거부합니다. RawDac 모드는 code를 그대로 write/readback할 뿐 목표 baseline으로 자동 보정하지 않습니다. 기존 `TriggerThreshold=<absolute ADC>`도 호환되지만 실측 baseline-relative threshold 보정은 적용되지 않습니다.
 
 현재 production DSP schema 3은 `[SoftwareDSP] BaselineSamples`로 baseline을 구한 뒤
 polarity를 보정한 파형에서 높이가 가장 큰 샘플을 찾습니다. `Charge_CH*`는 그 peak를
@@ -361,7 +372,7 @@ GUI가 실행하는 hardware frontend의 고정 위치는 `./bin/frontend_dt5730
   -o /absolute/run.dat -r 21 -m /absolute/run.dat.run.json
 ```
 
-GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui`와 다르면 실행을 차단합니다. Runtime JSON에는 binary/config 경로, git/build 정보, input range, ADC bits, polarity, DC offset, 채널별 measured baseline/threshold write/readback과 trigger routing readback이 저장되고, production 변환 시 JSON과 config 전체가 ROOT의 `RunMetadata`와 `RunConfig`로 들어갑니다.
+GUI는 binary가 소스보다 오래됐거나 배포된 `bin/gui`가 source `gui`와 다르면 실행을 차단합니다. Runtime JSON에는 binary/config 경로, git/build 정보, input range, ADC bits, polarity, DC-offset mode/목표/초기·최종 DAC/수렴 결과, 채널별 measured baseline/threshold write/readback과 trigger routing readback이 저장되고, production 변환 시 JSON과 config 전체가 ROOT의 `RunMetadata`와 `RunConfig`로 들어갑니다.
 
 ### Raw 파일 finalization과 `.partial`
 
@@ -401,7 +412,8 @@ ZMQ는 모니터링용 보조 경로입니다. subscriber 지연은 PUB socket�
 - 요청/실제 raw·partial·config·metadata 경로, run number, 실행 binary 절대 경로, binary SHA-256, git commit, build timestamp
 - raw 크기/SHA-256/digest 방식, 기록·손실 event 수, 종료/실패 원인, 시작 전·후 파일시스템 여유 공간
 - input range, ADC bits, clock/sync, post-trigger, record/self-trigger mask, pair logic와 각 register readback
-- 채널별 DC offset/polarity, measured baseline, 요청 mV, delta ADC, threshold write/readback/effective mV
+- 채널별 DC-offset mode, 요청 baseline %, target ADC, initial/final DAC, measured baseline/error, 조정 횟수/수렴 여부와 polarity
+- 채널별 요청 threshold mV, delta ADC, threshold write/readback/effective mV
 - 실행 중 health/readout/ZMQ/config-check 횟수, channel별 최고 온도와 ZMQ send watermark
 
 Frontend는 시작 전과 종료 직전에 strict health/config readback을 수행하고, 실행 중에는 온도·board status·저장공간을 약 250 ms마다, 설정 불변성을 약 1초마다 검사합니다. 활성 채널 온도가 82 °C에 도달하거나 health/register 검증을 신뢰할 수 없으면 run을 실패 상태로 멈춥니다.
@@ -439,7 +451,7 @@ GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-
 
 ### GUI 탭(Tab)별 기능 명세서
 * **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, publish API failure 등) 및 컬러 파싱 터미널 창 제공.
-* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, self/external/software-random 소스와 평균 rate, pair AND/OR 논리, DCOffset, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. Absolute discriminator code는 frontend의 채널별 실측 baseline calibration으로 정합니다.
+* **⚙️ Hardware Config:** 기록/트리거 채널 마스크, self/external/software-random 소스와 평균 rate, pair AND/OR 논리, 채널별 target baseline % 또는 고급 raw DAC, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. 최종 DC-offset DAC와 absolute discriminator code는 frontend의 채널별 실측 calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형과 baseline-subtracted full-waveform signed charge 스펙트럼을 표시합니다. 활성 채널 자동 감지 오버레이와 기본 100,000개/Unlimited history를 지원하며, 이 preview 적분은 production ROOT schema 3의 peak-centered charge와 별개입니다.
 * **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, schema 3 polarity-corrected peak T0 기록, `[-20 ns,+40 ns)` signed charge, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
 * **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event 또는 제한 prefix를 검사합니다. file identity/SHA-256, ROOT recovery/schema/branch, EventID/TTT/counter/shape, summary, finite/range/saturation, baseline settling, threshold 실효값, routing, embedded config/metadata/binary provenance를 영역별 PASS/WARN/FAIL로 표시합니다. 검증 결과에는 production `Charge_CHn`의 채널별 히스토그램과 full/prefix/stride 표본 범위도 함께 표시됩니다. 선택적으로 모든 RAW header·sample·DSP 결과와 ROOT를 정확히 대조하며, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.

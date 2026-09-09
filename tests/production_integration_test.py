@@ -1,6 +1,7 @@
 import hashlib
 import configparser
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -50,6 +51,7 @@ def metadata_for(
     polarity: str = "falling",
     schema_version: int = 2,
     waveform_dsp_schema: int = 2,
+    include_dc_offset_extension: bool = True,
 ) -> dict:
     parsed_config = configparser.ConfigParser()
     parsed_config.optionxform = str
@@ -114,16 +116,79 @@ def metadata_for(
         recorded_events / elapsed if elapsed is not None and elapsed > 0
         else None
     )
+    calibration_values = {
+        "dc_offset_target_tolerance_percent": parsed_config.getfloat(
+            "DCOffsetCalibration", "TargetTolerancePercent", fallback=0.5
+        ),
+        "dc_offset_max_adjustment_iterations": parsed_config.getint(
+            "DCOffsetCalibration", "MaxAdjustmentIterations", fallback=8
+        ),
+        "dc_offset_dac_busy_timeout_ms": parsed_config.getint(
+            "DCOffsetCalibration", "DacBusyTimeoutMs", fallback=1000
+        ),
+        "dc_offset_step_settling_time_ms": parsed_config.getint(
+            "DCOffsetCalibration", "StepSettlingTimeMs", fallback=3000
+        ),
+    }
+
+    def offset_metadata(channel: int, raw_baseline: float) -> tuple[float, dict]:
+        section = f"Channel_{channel}"
+        mode = parsed_config.get(section, "DCOffsetMode", fallback="RawDac")
+        if mode == "TargetBaseline":
+            if not include_dc_offset_extension:
+                raise ValueError(
+                    "target-baseline fixture requires DC-offset extension"
+                )
+            percent = parsed_config.getfloat(section, "BaselineTargetPercent")
+            target = math.floor(percent * 16383.0 / 100.0 + 0.5)
+            initial = math.floor(
+                (100.0 - percent) * 65535.0 / 100.0 + 0.5
+            )
+            # A channel-dependent final value proves that conversion validates
+            # measured calibration rather than assuming one common DAC code.
+            final = min(65535, initial + 1024 + channel)
+            baseline = float(target)
+            return baseline, {
+                "dc_offset_mode": "target_baseline_percent",
+                "requested_baseline_percent": percent,
+                "target_baseline_adc": target,
+                "initial_dc_offset_dac": initial,
+                "final_dc_offset_dac": final,
+                "requested_dc_offset": final,
+                "readback_dc_offset": final,
+                "baseline_error_adc": 0.0,
+                "dc_offset_adjustment_iterations": 1,
+                "dc_offset_converged": True,
+            }
+        raw = parsed_config.getint(section, "DCOffset")
+        if not include_dc_offset_extension:
+            return raw_baseline, {
+                "requested_dc_offset": raw,
+                "readback_dc_offset": raw,
+            }
+        return raw_baseline, {
+            "dc_offset_mode": "raw_dac_code",
+            "requested_baseline_percent": None,
+            "target_baseline_adc": None,
+            "initial_dc_offset_dac": raw,
+            "final_dc_offset_dac": raw,
+            "requested_dc_offset": raw,
+            "readback_dc_offset": raw,
+            "baseline_error_adc": None,
+            "dc_offset_adjustment_iterations": 0,
+            "dc_offset_converged": None,
+        }
+
     channels = []
-    for channel, baseline in ((0, 16164.0), (1, 16255.0)):
+    for channel, raw_baseline in ((0, 16164.0), (1, 16255.0)):
+        baseline, offset = offset_metadata(channel, raw_baseline)
         written = round(baseline) + (-8 if polarity == "falling" else 8)
         channels.append({
             "channel": channel,
             "trigger_enabled": True,
             "input_range_register": 0x1028 + 0x100 * channel,
             "input_range_readback": 0,
-            "requested_dc_offset": 6554,
-            "readback_dc_offset": 6554,
+            **offset,
             "polarity_readback": polarity,
             "threshold_mode": "baseline_relative_mv",
             "measured_baseline_adc": baseline,
@@ -133,17 +198,17 @@ def metadata_for(
             "readback_threshold_adc": written,
             "effective_threshold_mv": abs(baseline - written) * 2000 / 16384,
         })
-    for channel in (2, 3):
+    for channel, raw_baseline in ((2, 8192.0), (3, 8192.0)):
+        baseline, offset = offset_metadata(channel, raw_baseline)
         channels.append({
             "channel": channel,
             "trigger_enabled": False,
             "input_range_register": 0x1028 + 0x100 * channel,
             "input_range_readback": 0,
-            "requested_dc_offset": 6554,
-            "readback_dc_offset": 6554,
+            **offset,
             "polarity_readback": polarity,
             "threshold_mode": "not_used_record_only",
-            "measured_baseline_adc": 8192.0,
+            "measured_baseline_adc": baseline,
             "requested_threshold_mv": None,
             "delta_adc": None,
             "written_threshold_adc": None,
@@ -234,6 +299,7 @@ def metadata_for(
             "input_range_mvpp": 2000,
             "adc_bits": 14,
             "dc_offset_dac_bits": 16,
+            **(calibration_values if include_dc_offset_extension else {}),
             "latest_acquisition_status_register": 384,
             "latest_board_failure_status_register": 0,
             "waveform_dsp_schema": waveform_dsp_schema,
@@ -354,6 +420,24 @@ def run_converter(
     )
 
 
+def configured_fixture_baselines(config: Path = CONFIG) -> tuple[int, ...]:
+    parsed = configparser.ConfigParser()
+    parsed.optionxform = str
+    if not parsed.read(config, encoding="utf-8"):
+        raise ValueError(f"cannot read fixture config: {config}")
+    legacy = (16164, 16255, 8192, 8192)
+    result = []
+    for channel, fallback in enumerate(legacy):
+        section = f"Channel_{channel}"
+        if parsed.get(section, "DCOffsetMode", fallback="RawDac") == \
+                "TargetBaseline":
+            percent = parsed.getfloat(section, "BaselineTargetPercent")
+            result.append(math.floor(percent * 16383.0 / 100.0 + 0.5))
+        else:
+            result.append(fallback)
+    return tuple(result)
+
+
 def write_polarity_fixture(
     path: Path,
     polarity: str,
@@ -362,7 +446,7 @@ def write_polarity_fixture(
     opposite_record_only_pulse: bool = False,
 ) -> None:
     record_length = 520
-    baselines = (16164, 16255, 8192, 8192)
+    baselines = configured_fixture_baselines()
     pulse_delta = -64 if polarity == "falling" else 64
     patterns = (0xA55A, 0x5AA5)
     with path.open("wb") as stream:
@@ -388,6 +472,50 @@ def write_polarity_fixture(
 
 
 class ProductionIntegrationTests(unittest.TestCase):
+    def test_legacy_raw_dc_offset_metadata_remains_convertible(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cpnr_legacy_dc_offset_metadata_"
+        ) as temp:
+            directory = Path(temp)
+            parsed = configparser.ConfigParser()
+            parsed.optionxform = str
+            self.assertTrue(parsed.read(CONFIG, encoding="utf-8"))
+            parsed.remove_section("DCOffsetCalibration")
+            for channel in range(4):
+                section = f"Channel_{channel}"
+                parsed[section].pop("DCOffsetMode", None)
+                parsed[section].pop("BaselineTargetPercent", None)
+                parsed[section]["DCOffset"] = "6554"
+            config = directory / "legacy_raw.conf"
+            with config.open("w", encoding="utf-8") as stream:
+                parsed.write(stream)
+
+            raw = directory / "legacy_raw.dat"
+            write_polarity_fixture(raw, "falling")
+            metadata = directory / "legacy_raw.run.json"
+            document = metadata_for(
+                raw,
+                metadata,
+                90,
+                config=config,
+                include_dc_offset_extension=False,
+            )
+            self.assertNotIn("dc_offset_mode", document["channels"][0])
+            self.assertNotIn(
+                "dc_offset_target_tolerance_percent", document["hardware"]
+            )
+            metadata.write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8"
+            )
+            output = directory / "legacy_raw.root"
+            result = run_converter(
+                raw, metadata, output, 90, config=config
+            )
+            self.assertEqual(
+                result.returncode, 0, result.stdout + result.stderr
+            )
+            self.assertTrue(output.is_file())
+
     def test_event_id_ttt_and_loss_policy_fail_closed(self):
         with tempfile.TemporaryDirectory(prefix="cpnr_semantic_raw_test_") as temp:
             directory = Path(temp)
@@ -674,7 +802,7 @@ if (pulse2 != 0.0 || t0_2 != -1.0) gSystem->Exit(7);
             config.write_text(config_text, encoding="utf-8")
 
             record_length = 520
-            baselines = (16164, 16255, 8192, 8192)
+            baselines = configured_fixture_baselines(config)
             raw = directory / "peak.dat"
             with raw.open("wb") as stream:
                 stream.write(struct.pack(
@@ -1031,6 +1159,7 @@ if (read_string("RunMetadataSha256") != {metadata_digest}) gSystem->Exit(7);
                         0,
                         result.stdout + result.stderr,
                     )
+                    expected_baselines = configured_fixture_baselines(config)
                     root_path = json.dumps(str(output))
                     expression = f'''
 TFile f({root_path});
@@ -1061,7 +1190,7 @@ tree->SetBranchAddress("Baseline_CH0", &baseline0);
 tree->SetBranchAddress("Baseline_CH1", &baseline1);
 tree->GetEntry(0);
 if (pattern != 0xA55A || counter != 100) gSystem->Exit(4);
-if (baseline0 != 16164.0 || baseline1 != 16255.0) gSystem->Exit(5);
+if (baseline0 != {expected_baselines[0]:.1f} || baseline1 != {expected_baselines[1]:.1f}) gSystem->Exit(5);
 if (short0 != 512.0 || short1 != 512.0) gSystem->Exit(20);
 if (charge0 != 512.0 || charge1 != 512.0) gSystem->Exit(6);
 if (pulse0 != 64.0 || pulse1 != 64.0) gSystem->Exit(7);
@@ -1236,6 +1365,49 @@ if (!dsp_schema || dsp_schema->GetVal() != 2 || !dsp_baseline || dsp_baseline->G
                         value["acquisition_end_unix_time"] + 1,
                     ),
                     "timestamps are not ordered",
+                ),
+                (
+                    "dc_offset_partial_extension",
+                    lambda value: value["channels"][0].pop(
+                        "baseline_error_adc"
+                    ),
+                    "DC-offset calibration extension is partially present",
+                ),
+                (
+                    "dc_offset_final_alias",
+                    lambda value: value["channels"][0].__setitem__(
+                        "requested_dc_offset",
+                        value["channels"][0]["requested_dc_offset"] + 1,
+                    ),
+                    "final write/readback aliases differ",
+                ),
+                (
+                    "dc_offset_target_request",
+                    lambda value: value["channels"][0].__setitem__(
+                        "requested_baseline_percent", 89.0
+                    ),
+                    "target-baseline request did not converge",
+                ),
+                (
+                    "dc_offset_not_converged",
+                    lambda value: value["channels"][0].__setitem__(
+                        "dc_offset_converged", False
+                    ),
+                    "target-baseline request did not converge",
+                ),
+                (
+                    "dc_offset_error_outside_tolerance",
+                    lambda value: value["channels"][0].__setitem__(
+                        "baseline_error_adc", 100.0
+                    ),
+                    "target-baseline request did not converge",
+                ),
+                (
+                    "dc_offset_calibration_settings",
+                    lambda value: value["hardware"].__setitem__(
+                        "dc_offset_target_tolerance_percent", 0.6
+                    ),
+                    "DC-offset calibration settings differ from config",
                 ),
             )
             for label, mutate, expected_error in v2_tamper_cases:

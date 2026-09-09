@@ -122,6 +122,30 @@ void WriteRandomTriggerConfig(const std::filesystem::path& path,
                       std::to_string(rate_hz));
 }
 
+void WriteTargetBaselineConfig(const std::filesystem::path& path,
+                               uint32_t timeout_ms,
+                               uint32_t max_adjustment_iterations = 8U,
+                               uint32_t dac_busy_timeout_ms = 20U) {
+  WriteConfig(path, timeout_ms, 1024, 512, 520, 15, 0);
+  ReplaceFileText(
+      path, "[Storage]",
+      "[DCOffsetCalibration]\n"
+      "TargetTolerancePercent=0.5\n"
+      "MaxAdjustmentIterations=" +
+          std::to_string(max_adjustment_iterations) +
+          "\nDacBusyTimeoutMs=" + std::to_string(dac_busy_timeout_ms) +
+          "\nStepSettlingTimeMs=0\n"
+          "[Storage]");
+  for (int channel = 0; channel < 4; ++channel) {
+    ReplaceFileText(path,
+                    "[Channel_" + std::to_string(channel) +
+                        "]\nDCOffset=3276",
+                    "[Channel_" + std::to_string(channel) +
+                        "]\nDCOffsetMode=TargetBaseline\n"
+                        "BaselineTargetPercent=90");
+  }
+}
+
 void CheckThrowsWith(const std::function<void()>& action,
                      const std::string& expected_text,
                      const std::string& description) {
@@ -322,6 +346,119 @@ int main() {
           "runtime JSON retains measured baseline for record-only channels");
     Check(std::filesystem::exists(output_path.string() + ".config.conf"),
           "runtime config snapshot is written beside raw output");
+
+    const auto target_config = test_dir / "target_baseline.conf";
+    const auto target_output = test_dir / "target_baseline.dat";
+    const auto target_metadata = test_dir / "target_baseline.dat.run.json";
+    WriteTargetBaselineConfig(target_config, 250);
+    caen_mock::SetDCOffsetBaselineResponse(true);
+    {
+      DAQManager manager(
+          target_config.string(), target_output.string(), 0, 0, 73,
+          target_metadata.string(), mock_executable, "mock-commit",
+          "mock-build");
+    }
+    const std::string target_json = ReadFile(
+        target_metadata.string() +
+        ".status.hardware_verified_not_started.json");
+    Check(caen_mock::state.dc_offsets[0] == 9022U &&
+              caen_mock::state.dc_offsets[1] == 9822U &&
+              caen_mock::state.dc_offsets[2] == 8222U &&
+              caen_mock::state.dc_offsets[3] == 11022U,
+          "90-percent target independently tunes every active channel to a distinct DAC code");
+    Check(caen_mock::state.dc_offset_write_counts[0] >= 2U &&
+              caen_mock::state.dc_offset_write_counts[1] >= 2U &&
+              caen_mock::state.dc_offset_write_counts[2] >= 2U &&
+              caen_mock::state.dc_offset_write_counts[3] >= 2U,
+          "closed-loop placement measures and adjusts trigger and record-only channels");
+    Check(!caen_mock::state
+               .dc_offset_written_with_physical_trigger_enabled,
+          "all DC-offset writes occur while external and self-trigger sources are disabled");
+    Check(caen_mock::state.thresholds[0] == 14737U &&
+              caen_mock::state.thresholds[1] == 14737U,
+          "relative thresholds are derived from the final tuned per-channel baselines");
+    Check(target_json.find(
+              "\"dc_offset_mode\": \"target_baseline_percent\"") !=
+                  std::string::npos &&
+              target_json.find("\"requested_baseline_percent\": 90") !=
+                  std::string::npos &&
+              target_json.find("\"target_baseline_adc\": 14745") !=
+                  std::string::npos &&
+              target_json.find("\"initial_dc_offset_dac\": 6554") !=
+                  std::string::npos &&
+              target_json.find("\"final_dc_offset_dac\": 9022") !=
+                  std::string::npos &&
+              target_json.find("\"requested_dc_offset\": 9022") !=
+                  std::string::npos &&
+              target_json.find("\"readback_dc_offset\": 9022") !=
+                  std::string::npos &&
+              target_json.find("\"baseline_error_adc\": 0") !=
+                  std::string::npos &&
+              target_json.find(
+                  "\"dc_offset_adjustment_iterations\": 1") !=
+                  std::string::npos &&
+              target_json.find("\"dc_offset_converged\": true") !=
+                  std::string::npos,
+          "runtime metadata records target intent, initial/final DAC, measured error, and convergence");
+    Check(target_json.find(
+              "\"dc_offset_target_tolerance_percent\": 0.5") !=
+                  std::string::npos &&
+              target_json.find(
+                  "\"dc_offset_max_adjustment_iterations\": 8") !=
+                  std::string::npos &&
+              target_json.find(
+                  "\"dc_offset_dac_busy_timeout_ms\": 20") !=
+                  std::string::npos &&
+              target_json.find(
+                  "\"dc_offset_step_settling_time_ms\": 0") !=
+                  std::string::npos,
+          "runtime metadata records the complete DC-offset calibration policy");
+    caen_mock::SetDCOffsetBaselineResponse(false);
+
+    const auto nonconvergent_config =
+        test_dir / "target_baseline_nonconvergent.conf";
+    WriteTargetBaselineConfig(nonconvergent_config, 250, 1U);
+    CheckThrowsWith(
+        [&]() {
+          DAQManager manager(
+              nonconvergent_config.string(),
+              (test_dir / "target_baseline_nonconvergent.dat").string(), 0,
+              0, 74,
+              (test_dir /
+               "target_baseline_nonconvergent.dat.run.json").string(),
+              mock_executable, "mock-commit", "mock-build");
+        },
+        "failed to converge",
+        "target-baseline mode fails closed when the physical baseline does not respond to DAC writes");
+
+    const auto busy_config = test_dir / "target_baseline_busy.conf";
+    WriteTargetBaselineConfig(busy_config, 250, 1U, 1U);
+    caen_mock::SetDCOffsetBusyFault(true);
+    CheckThrowsWith(
+        [&]() {
+          DAQManager manager(
+              busy_config.string(),
+              (test_dir / "target_baseline_busy.dat").string(), 0, 0, 75,
+              (test_dir / "target_baseline_busy.dat.run.json").string(),
+              mock_executable, "mock-commit", "mock-build");
+        },
+        "DAC remained busy",
+        "a stuck DC-offset DAC busy bit prevents acquisition setup");
+    caen_mock::SetDCOffsetBusyFault(false);
+
+    caen_mock::SetDCOffsetReadbackFault(true);
+    CheckThrowsWith(
+        [&]() {
+          DAQManager manager(
+              busy_config.string(),
+              (test_dir / "target_baseline_readback.dat").string(), 0, 0,
+              76,
+              (test_dir / "target_baseline_readback.dat.run.json").string(),
+              mock_executable, "mock-commit", "mock-build");
+        },
+        "DC-offset readback mismatch",
+        "a mismatched DC-offset DAC readback prevents acquisition setup");
+    caen_mock::SetDCOffsetReadbackFault(false);
 
     const auto random_output = test_dir / "random_trigger.dat";
     const auto random_config = test_dir / "random_trigger.conf";

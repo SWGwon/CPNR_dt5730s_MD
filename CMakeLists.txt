@@ -182,6 +182,9 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_runtime_paths.py)
   add_test(NAME gui_trigger_threshold_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_trigger_settings.py)
+  add_test(NAME gui_dc_offset_settings_regression
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v
+              tests/test_dc_offset_settings.py)
   add_test(NAME gui_process_output_regression
       COMMAND ${Python3_EXECUTABLE} -m unittest -v tests/test_process_output.py)
   add_test(NAME gui_root_validation_output_regression
@@ -192,6 +195,7 @@ if(BUILD_TESTING)
               tests/test_database_manager.py)
   set_tests_properties(
       gui_runtime_path_regression gui_trigger_threshold_regression
+      gui_dc_offset_settings_regression
       gui_process_output_regression gui_root_validation_output_regression
       gui_database_manager_regression
       PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -15,6 +15,10 @@ from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager, DatabaseError
 from core.process_output import parse_drop_count
 from core.trigger_settings import millivolts_to_adc_delta
+from core.dc_offset_settings import (
+    DC_OFFSET_MODE_TARGET,
+    parse_dc_offset_settings,
+)
 from core.dt5730_constraints import (
     MAX_RECORD_LENGTH,
     MAX_PROVENANCE_GATE_SAMPLES,
@@ -1232,10 +1236,25 @@ class DaqTab(QWidget):
                     + ". 여러 pair를 선택하면 각 pair의 AND 결과는 서로 OR로 결합됩니다."
                 )
         uses_mv_threshold = False
+        uses_target_offset = False
         for ch in range(8):
             if (channel_mask >> ch) & 1:
                 section = f"Channel_{ch}"
-                required_int(section, "DCOffset", 0, 65535)
+                channel_data = config_data.get(section, {})
+                try:
+                    offset_settings = parse_dc_offset_settings(
+                        channel_data.get("DCOffsetMode"),
+                        channel_data.get("BaselineTargetPercent"),
+                        channel_data.get("DCOffset"),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"[{section}] DC offset 설정 오류: {exc}"
+                    ) from exc
+                uses_target_offset = (
+                    uses_target_offset
+                    or offset_settings.mode == DC_OFFSET_MODE_TARGET
+                )
                 has_absolute = (
                     section in config_data
                     and "TriggerThreshold" in config_data[section]
@@ -1251,6 +1270,16 @@ class DaqTab(QWidget):
                     raise ValueError(
                         f"[{section}] TriggerThreshold(legacy)와 TriggerThresholdMv 중 "
                         "하나만 설정해야 합니다."
+                    )
+                if (
+                    participates_in_trigger
+                    and offset_settings.mode == DC_OFFSET_MODE_TARGET
+                    and has_absolute
+                ):
+                    raise ValueError(
+                        f"[{section}] TargetBaseline 모드의 self-trigger 채널은 "
+                        "baseline 이동 후 stale해지는 absolute TriggerThreshold를 "
+                        "사용할 수 없습니다. TriggerThresholdMv를 사용하세요."
                     )
                 if participates_in_trigger and not has_absolute and not has_mv:
                     raise ValueError(
@@ -1300,6 +1329,49 @@ class DaqTab(QWidget):
             required_int(
                 "TriggerCalibration", "StableMeasurements", 2, 100
             )
+
+        if uses_target_offset or "DCOffsetCalibration" in config_data:
+            tolerance_raw = config_data.get("DCOffsetCalibration", {}).get(
+                "TargetTolerancePercent", "0.5"
+            )
+            try:
+                target_tolerance = float(tolerance_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "실수가 아닌 설정값입니다: [DCOffsetCalibration] "
+                    f"TargetTolerancePercent={tolerance_raw}"
+                ) from exc
+            if not math.isfinite(target_tolerance) or not (
+                0.0 < target_tolerance <= 10.0
+            ):
+                raise ValueError(
+                    "설정값 범위 오류: [DCOffsetCalibration] "
+                    "TargetTolerancePercent는 0보다 크고 10 이하여야 합니다."
+                )
+            optional_int(
+                "DCOffsetCalibration", "MaxAdjustmentIterations",
+                8, 1, 32,
+            )
+            optional_int(
+                "DCOffsetCalibration", "DacBusyTimeoutMs",
+                1000, 1, 60000,
+            )
+            step_settling_ms = optional_int(
+                "DCOffsetCalibration", "StepSettlingTimeMs",
+                3000, 0, 600000,
+            )
+            trigger_settling_timeout_ms = optional_int(
+                "TriggerCalibration", "SettlingTimeoutMs",
+                15000, 1, 600000,
+            )
+            if (
+                uses_target_offset
+                and step_settling_ms >= trigger_settling_timeout_ms
+            ):
+                raise ValueError(
+                    "[DCOffsetCalibration] StepSettlingTimeMs는 "
+                    "[TriggerCalibration] SettlingTimeoutMs보다 작아야 합니다."
+                )
 
         default_baseline = min(
             150, post_trigger_truth.actual_pre_samples

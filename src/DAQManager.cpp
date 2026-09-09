@@ -37,8 +37,10 @@ constexpr uint32_t kGlobalTriggerMaskRegister = 0x810C;
 constexpr uint32_t kPairTriggerLogicBase = 0x1084;
 constexpr uint32_t kPairRegisterStride = 0x200;
 constexpr uint32_t kInputRangeBase = 0x1028;
+constexpr uint32_t kChannelStatusBase = 0x1088;
 constexpr uint32_t kChannelRegisterStride = 0x100;
 constexpr uint32_t kInputRangeMask = 0x1;
+constexpr uint32_t kDCOffsetDacBusyMask = 1U << 2;
 constexpr uint32_t kPairTriggerRequestMask = 0x0F;
 constexpr uint32_t kPairLogicFieldMask = 0x07;
 constexpr uint32_t kMajorityLevelMask = 0x07U << 24;
@@ -48,6 +50,8 @@ constexpr uint32_t kExternalClockSelectMask = 1U << 6;
 constexpr int kDppFirmwareMajorBase = 128;
 constexpr uint64_t kZmqQueueByteBudget = 64U * 1024U * 1024U;
 constexpr uint32_t kZmqMaximumHwmMessages = 5000U;
+constexpr uint32_t kMaximumDCOffsetDac = 65535U;
+constexpr int64_t kMaximumDCOffsetAdjustmentStep = 16384;
 
 class FatalAcquisitionError : public std::runtime_error {
  public:
@@ -1101,17 +1105,42 @@ void DAQManager::SetupHardware() {
       (record_length + 1024) * sizeof(uint16_t) * MAX_CH;
   raw_buffer_pool_.resize(max_safe_size);
 
-  uint32_t calibration_mask = 0;
+  uint32_t threshold_calibration_mask = 0;
+  uint32_t dc_offset_target_mask = 0;
   for (int ch = 0; ch < MAX_CH; ++ch) {
     if (((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
         hardware_settings_.channels[ch].threshold_is_relative_mv) {
-      calibration_mask |= 1U << ch;
+      threshold_calibration_mask |= 1U << ch;
+    }
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+        hardware_settings_.channels[ch].dc_offset_mode ==
+            DAQDCOffsetMode::kTargetBaseline) {
+      dc_offset_target_mask |= 1U << ch;
     }
   }
+  const uint32_t calibration_mask =
+      threshold_calibration_mask | dc_offset_target_mask;
 
   std::array<double, MAX_CH> baselines{};
+  bool baselines_available = false;
+  if (dc_offset_target_mask != 0U) {
+    baselines = TuneTargetBaselineOffsets(handle);
+    baselines_available = true;
+  }
+  // A raw-DAC channel can still request a baseline-relative trigger.  If it
+  // was not part of the offset target loop, include it in a stable batch
+  // before calculating its discriminator code.
+  if ((threshold_calibration_mask & ~dc_offset_target_mask) != 0U) {
+    baselines = WaitForStableBaselines(
+        handle, calibration_mask,
+        baselines_available ? 0U
+                            : hardware_settings_.trigger_calibration
+                                  .settling_time_ms,
+        "trigger threshold calibration");
+    baselines_available = true;
+  }
+
   if (calibration_mask != 0U) {
-    baselines = WaitForStableBaselines(handle);
     ProgramAndVerifyThresholds(handle, baselines);
 
     // Measure once more immediately before installing the trigger route.  A
@@ -1122,28 +1151,49 @@ void DAQManager::SetupHardware() {
                     std::chrono::milliseconds(hardware_settings_
                                                   .trigger_calibration
                                                   .settling_timeout_ms));
-    if (!BaselinesAreStable(baselines, final_baselines, calibration_mask,
-                            hardware_settings_.trigger_calibration
-                                .stability_tolerance_adc)) {
-      std::cout << "\033[1;33m[Trigger Calibration]\033[0m Baseline moved "
-                   "before acquisition; repeating settling and calibration.\n";
-      baselines = WaitForStableBaselines(handle);
+    std::string target_failure;
+    if (!BaselinesAreStable(
+            baselines, final_baselines, calibration_mask,
+            hardware_settings_.trigger_calibration.stability_tolerance_adc) ||
+        !TargetBaselinesWithinTolerance(final_baselines, &target_failure)) {
+      std::cout << "\033[1;33m[Calibration]\033[0m Baseline moved or left "
+                   "its target before acquisition; repeating calibration";
+      if (!target_failure.empty()) std::cout << " (" << target_failure << ")";
+      std::cout << ".\n";
+      if (dc_offset_target_mask != 0U) {
+        baselines = TuneTargetBaselineOffsets(handle);
+        if ((threshold_calibration_mask & ~dc_offset_target_mask) != 0U) {
+          baselines = WaitForStableBaselines(
+              handle, calibration_mask, 0U,
+              "mixed DC-offset/trigger threshold recalibration");
+        }
+      } else {
+        baselines = WaitForStableBaselines(
+            handle, calibration_mask,
+            hardware_settings_.trigger_calibration.settling_time_ms,
+            "trigger threshold recalibration");
+      }
       ProgramAndVerifyThresholds(handle, baselines);
       final_baselines = MeasureBaselineBatch(
           handle, std::chrono::steady_clock::now() +
                       std::chrono::milliseconds(hardware_settings_
                                                     .trigger_calibration
                                                     .settling_timeout_ms));
+      target_failure.clear();
       if (!BaselinesAreStable(
               baselines, final_baselines, calibration_mask,
-              hardware_settings_.trigger_calibration.stability_tolerance_adc)) {
+              hardware_settings_.trigger_calibration.stability_tolerance_adc) ||
+          !TargetBaselinesWithinTolerance(final_baselines, &target_failure)) {
         throw std::runtime_error(
             "Baseline moved again immediately before acquisition; refusing "
-            "to start with an invalid hardware threshold");
+            "to start with an invalid DC offset or hardware threshold" +
+            (target_failure.empty() ? std::string{} :
+                                      ": " + target_failure));
       }
     }
     ProgramAndVerifyThresholds(handle, final_baselines);
   } else {
+    (void)baselines_available;
     ProgramAndVerifyThresholds(handle, baselines);
   }
 
@@ -1175,7 +1225,15 @@ void DAQManager::ConfigureInputRangeAndOffsets(int handle) {
     runtime.enabled = true;
     runtime.participates_in_trigger =
         ((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U;
-    runtime.requested_dc_offset = hardware_settings_.channels[ch].dc_offset;
+    const auto& configured = hardware_settings_.channels[ch];
+    runtime.dc_offset_target_mode =
+        configured.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline;
+    runtime.requested_baseline_percent =
+        configured.baseline_target_percent;
+    runtime.target_baseline_adc = configured.target_baseline_adc;
+    runtime.initial_dc_offset_dac = configured.dc_offset;
+    runtime.final_dc_offset_dac = configured.dc_offset;
+    runtime.requested_dc_offset = configured.dc_offset;
     runtime.input_range_register =
         kInputRangeBase + kChannelRegisterStride * ch;
 
@@ -1185,16 +1243,7 @@ void DAQManager::ConfigureInputRangeAndOffsets(int handle) {
     runtime.input_range_readback =
         ReadRegister(handle, runtime.input_range_register) & kInputRangeMask;
 
-    CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(
-        handle, ch, runtime.requested_dc_offset));
-    CAEN_CHECK(CAEN_DGTZ_GetChannelDCOffset(
-        handle, ch, &runtime.readback_dc_offset));
-    if (runtime.readback_dc_offset != runtime.requested_dc_offset) {
-      throw std::runtime_error(
-          "CH" + std::to_string(ch) + " DC-offset readback mismatch: wrote " +
-          std::to_string(runtime.requested_dc_offset) + ", read " +
-          std::to_string(runtime.readback_dc_offset));
-    }
+    WriteAndVerifyDCOffset(handle, ch, runtime.initial_dc_offset_dac);
 
     CAEN_CHECK(CAEN_DGTZ_SetTriggerPolarity(handle, ch,
                                              requested_polarity));
@@ -1212,12 +1261,259 @@ void DAQManager::ConfigureInputRangeAndOffsets(int handle) {
               << " input_range=" << hardware_settings_.input_range_mv
               << " mVpp (register " << Hex32(runtime.input_range_register)
               << " readback=" << runtime.input_range_readback << ")"
-              << ", DCOffset=" << runtime.requested_dc_offset
+              << ", DCOffset mode="
+              << (runtime.dc_offset_target_mode ? "target-baseline"
+                                                : "raw-DAC")
+              << ", initial DAC=" << runtime.initial_dc_offset_dac
               << " readback=" << runtime.readback_dc_offset
+              << (runtime.dc_offset_target_mode
+                      ? ", target=" +
+                            std::to_string(runtime.requested_baseline_percent) +
+                            "% (" +
+                            std::to_string(runtime.target_baseline_adc) +
+                            " ADC)"
+                      : "")
               << ", polarity="
               << (runtime.polarity_readback == 1 ? "falling" : "rising")
               << "\n";
   }
+}
+
+void DAQManager::WaitForDCOffsetReady(int handle, int channel) {
+  const uint32_t status_register =
+      kChannelStatusBase + kChannelRegisterStride *
+                               static_cast<uint32_t>(channel);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            hardware_settings_.dc_offset_calibration
+                                .dac_busy_timeout_ms);
+  while ((ReadRegister(handle, status_register) & kDCOffsetDacBusyMask) !=
+         0U) {
+    CheckSetupCancellation();
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          "CH" + std::to_string(channel) +
+          " DC-offset DAC remained busy at register " +
+          Hex32(status_register) + " for DacBusyTimeoutMs=" +
+          std::to_string(hardware_settings_.dc_offset_calibration
+                             .dac_busy_timeout_ms));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void DAQManager::WriteAndVerifyDCOffset(int handle, int channel,
+                                       uint32_t value) {
+  if (value > kMaximumDCOffsetDac) {
+    throw std::logic_error("DC-offset DAC request exceeds 16-bit range");
+  }
+  WaitForDCOffsetReady(handle, channel);
+  CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(
+      handle, static_cast<uint32_t>(channel), value));
+  WaitForDCOffsetReady(handle, channel);
+
+  auto& runtime = runtime_channels_[channel];
+  uint32_t readback = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetChannelDCOffset(
+      handle, static_cast<uint32_t>(channel), &readback));
+  if (readback != value) {
+    throw std::runtime_error(
+        "CH" + std::to_string(channel) +
+        " DC-offset readback mismatch: wrote " + std::to_string(value) +
+        ", read " + std::to_string(readback));
+  }
+  runtime.requested_dc_offset = value;
+  runtime.final_dc_offset_dac = value;
+  runtime.readback_dc_offset = readback;
+}
+
+bool DAQManager::TargetBaselinesWithinTolerance(
+    const std::array<double, MAX_CH>& baselines,
+    std::string* failure_detail) const {
+  const double maximum_adc =
+      static_cast<double>((uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+  const double tolerance_adc =
+      hardware_settings_.dc_offset_calibration.target_tolerance_percent *
+      maximum_adc / 100.0;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U ||
+        hardware_settings_.channels[ch].dc_offset_mode !=
+            DAQDCOffsetMode::kTargetBaseline) {
+      continue;
+    }
+    const double error = baselines[ch] -
+                         static_cast<double>(hardware_settings_.channels[ch]
+                                                 .target_baseline_adc);
+    if (!std::isfinite(baselines[ch]) || std::abs(error) > tolerance_adc) {
+      if (failure_detail != nullptr) {
+        std::ostringstream detail;
+        detail << "CH" << ch << " measured=" << std::fixed
+               << std::setprecision(3) << baselines[ch]
+               << " ADC, target="
+               << hardware_settings_.channels[ch].target_baseline_adc
+               << " ADC, error=" << error << " ADC, tolerance="
+               << tolerance_adc << " ADC";
+        *failure_detail = detail.str();
+      }
+      return false;
+    }
+  }
+  if (failure_detail != nullptr) failure_detail->clear();
+  return true;
+}
+
+std::array<double, MAX_CH> DAQManager::TuneTargetBaselineOffsets(int handle) {
+  uint32_t target_mask = 0U;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+        hardware_settings_.channels[ch].dc_offset_mode ==
+            DAQDCOffsetMode::kTargetBaseline) {
+      target_mask |= 1U << ch;
+      runtime_channels_[ch].dc_offset_converged = false;
+    }
+  }
+  if (target_mask == 0U) {
+    throw std::logic_error(
+        "Target-baseline tuning called without a target-mode channel");
+  }
+
+  std::array<uint32_t, MAX_CH> previous_dac{};
+  std::array<double, MAX_CH> previous_baseline{};
+  std::array<bool, MAX_CH> has_previous_observation{};
+  const double maximum_adc =
+      static_cast<double>((uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+  const double nominal_adc_per_dac =
+      -maximum_adc / static_cast<double>(kMaximumDCOffsetDac);
+  const double tolerance_adc =
+      hardware_settings_.dc_offset_calibration.target_tolerance_percent *
+      maximum_adc / 100.0;
+  const uint32_t max_adjustments =
+      hardware_settings_.dc_offset_calibration.max_adjustment_iterations;
+
+  std::array<double, MAX_CH> baselines{};
+  for (uint32_t adjustment_round = 0U;
+       adjustment_round <= max_adjustments; ++adjustment_round) {
+    const uint32_t settling_ms =
+        adjustment_round == 0U
+            ? hardware_settings_.trigger_calibration.settling_time_ms
+            : hardware_settings_.dc_offset_calibration
+                  .step_settling_time_ms;
+    baselines = WaitForStableBaselines(
+        handle, target_mask, settling_ms, "DC-offset target calibration");
+
+    bool all_converged = true;
+    std::ostringstream failure_summary;
+    bool first_failure = true;
+    for (int ch = 0; ch < MAX_CH; ++ch) {
+      if (((target_mask >> ch) & 1U) == 0U) continue;
+      auto& runtime = runtime_channels_[ch];
+      runtime.baseline_measured = true;
+      runtime.measured_baseline_adc = baselines[ch];
+      runtime.baseline_error_adc =
+          baselines[ch] - static_cast<double>(runtime.target_baseline_adc);
+      runtime.dc_offset_converged =
+          std::abs(runtime.baseline_error_adc) <= tolerance_adc;
+      if (!runtime.dc_offset_converged) {
+        all_converged = false;
+        if (!first_failure) failure_summary << "; ";
+        first_failure = false;
+        failure_summary << "CH" << ch << " measured=" << std::fixed
+                        << std::setprecision(3) << baselines[ch]
+                        << " target=" << runtime.target_baseline_adc
+                        << " error=" << runtime.baseline_error_adc
+                        << " ADC DAC=" << runtime.readback_dc_offset;
+      }
+    }
+
+    if (all_converged) {
+      for (int ch = 0; ch < MAX_CH; ++ch) {
+        if (((target_mask >> ch) & 1U) == 0U) continue;
+        const auto& runtime = runtime_channels_[ch];
+        std::cout << "\033[1;32m[DC Offset Calibration]\033[0m CH" << ch
+                  << " requested=" << std::fixed << std::setprecision(3)
+                  << runtime.requested_baseline_percent << "% target="
+                  << runtime.target_baseline_adc << " ADC, measured="
+                  << runtime.measured_baseline_adc << " ADC, error="
+                  << runtime.baseline_error_adc << " ADC, initial DAC="
+                  << runtime.initial_dc_offset_dac << ", final DAC="
+                  << runtime.final_dc_offset_dac << " readback="
+                  << runtime.readback_dc_offset << ", adjustments="
+                  << runtime.dc_offset_adjustment_iterations << "\n";
+      }
+      return baselines;
+    }
+
+    if (adjustment_round == max_adjustments) {
+      throw std::runtime_error(
+          "DC-offset target calibration failed to converge within " +
+          std::to_string(max_adjustments) + " adjustment iterations: " +
+          failure_summary.str());
+    }
+
+    for (int ch = 0; ch < MAX_CH; ++ch) {
+      if (((target_mask >> ch) & 1U) == 0U ||
+          runtime_channels_[ch].dc_offset_converged) {
+        continue;
+      }
+      auto& runtime = runtime_channels_[ch];
+      const uint32_t current_dac = runtime.readback_dc_offset;
+      double adc_per_dac = nominal_adc_per_dac;
+      if (has_previous_observation[ch] &&
+          previous_dac[ch] != current_dac) {
+        const double observed_slope =
+            (baselines[ch] - previous_baseline[ch]) /
+            (static_cast<double>(current_dac) -
+             static_cast<double>(previous_dac[ch]));
+        // Only trust a measured slope that is resolvably negative.  A
+        // positive, sufficiently large response is non-physical for this
+        // board mapping and is safer to reject than to chase toward a rail.
+        if (observed_slope < -1e-5) {
+          adc_per_dac = observed_slope;
+        } else if (std::abs(baselines[ch] - previous_baseline[ch]) >
+                   tolerance_adc) {
+          throw std::runtime_error(
+              "CH" + std::to_string(ch) +
+              " DC-offset response is non-monotonic; refusing further DAC "
+              "adjustment");
+        }
+      }
+
+      const double unbounded_adjustment =
+          -runtime.baseline_error_adc / adc_per_dac;
+      int64_t adjustment = static_cast<int64_t>(
+          std::llround(std::clamp(
+              unbounded_adjustment,
+              -static_cast<double>(kMaximumDCOffsetAdjustmentStep),
+              static_cast<double>(kMaximumDCOffsetAdjustmentStep))));
+      if (adjustment == 0) {
+        adjustment = runtime.baseline_error_adc > 0.0 ? 1 : -1;
+      }
+      const int64_t candidate = std::clamp<int64_t>(
+          static_cast<int64_t>(current_dac) + adjustment, 0,
+          static_cast<int64_t>(kMaximumDCOffsetDac));
+      if (candidate == static_cast<int64_t>(current_dac)) {
+        throw std::runtime_error(
+            "CH" + std::to_string(ch) +
+            " cannot reach the requested baseline before the 16-bit "
+            "DC-offset DAC rail");
+      }
+
+      previous_dac[ch] = current_dac;
+      previous_baseline[ch] = baselines[ch];
+      has_previous_observation[ch] = true;
+      WriteAndVerifyDCOffset(handle, ch,
+                             static_cast<uint32_t>(candidate));
+      ++runtime.dc_offset_adjustment_iterations;
+      std::cout << "\033[1;36m[DC Offset Adjustment]\033[0m CH" << ch
+                << " measured=" << std::fixed << std::setprecision(3)
+                << baselines[ch] << " ADC, target="
+                << runtime.target_baseline_adc << " ADC, previous DAC="
+                << current_dac << ", written/readback DAC="
+                << runtime.readback_dc_offset << "\n";
+    }
+  }
+
+  throw std::logic_error("Unreachable DC-offset calibration state");
 }
 
 std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
@@ -1307,7 +1603,12 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
                 "Baseline event has a missing or malformed CH" +
                 std::to_string(ch) + " waveform");
           }
-          for (uint32_t sample = 0; sample < trace_size; ++sample) {
+          // DC-offset and trigger calibration must estimate the quiet
+          // pre-trigger baseline, not the pulse-bearing part of the trace.
+          const uint32_t baseline_samples = std::min<uint32_t>(
+              trace_size,
+              hardware_settings_.software_dsp.waveform.baseline_samples);
+          for (uint32_t sample = 0; sample < baseline_samples; ++sample) {
             const uint16_t code = trace[sample];
             if (code >= adc_codes) {
               throw std::runtime_error(
@@ -1345,27 +1646,26 @@ std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
   return baselines;
 }
 
-std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(int handle) {
+std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(
+    int handle, uint32_t channel_mask, uint32_t initial_settling_time_ms,
+    const std::string& context) {
+  if (channel_mask == 0U ||
+      (channel_mask & ~hardware_settings_.channel_mask) != 0U) {
+    throw std::logic_error(
+        "Stable-baseline measurement mask is empty or outside ChannelMask");
+  }
   const auto& calibration = hardware_settings_.trigger_calibration;
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(
                             calibration.settling_timeout_ms);
   const auto settling_end = std::min(
       deadline, std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(calibration.settling_time_ms));
+                    std::chrono::milliseconds(initial_settling_time_ms));
   while (std::chrono::steady_clock::now() < settling_end) {
     CheckSetupCancellation();
     std::this_thread::sleep_until(std::min(
         settling_end, std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(50)));
-  }
-
-  uint32_t calibration_mask = 0;
-  for (int ch = 0; ch < MAX_CH; ++ch) {
-    if (((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
-        hardware_settings_.channels[ch].threshold_is_relative_mv) {
-      calibration_mask |= 1U << ch;
-    }
   }
 
   std::vector<BaselineMeasurement> measurements;
@@ -1374,10 +1674,10 @@ std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(int handle) {
     measurements.push_back(MeasureBaselineBatch(handle, deadline));
     if (measurements.size() <= 10U ||
         measurements.size() % 50U == 0U) {
-      std::cout << "\033[1;36m[Baseline]\033[0m measurement "
-                << measurements.size();
+      std::cout << "\033[1;36m[Baseline]\033[0m " << context
+                << " measurement " << measurements.size();
       for (int ch = 0; ch < MAX_CH; ++ch) {
-        if (((calibration_mask >> ch) & 1U) != 0U) {
+        if (((channel_mask >> ch) & 1U) != 0U) {
           std::cout << " CH" << ch << "=" << std::fixed
                     << std::setprecision(3) << measurements.back()[ch]
                     << " ADC";
@@ -1389,7 +1689,7 @@ std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(int handle) {
     if (measurements.size() >= calibration.stable_measurements) {
       try {
         return RequireSettledBaselines(
-            measurements, calibration_mask,
+            measurements, channel_mask,
             calibration.stability_tolerance_adc,
             calibration.stable_measurements);
       } catch (const std::runtime_error&) {
@@ -1398,7 +1698,8 @@ std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(int handle) {
     }
   }
   throw std::runtime_error(
-      "Baseline settling failed before SettlingTimeoutMs=" +
+      "Baseline settling failed during " + context +
+      " before SettlingTimeoutMs=" +
       std::to_string(calibration.settling_timeout_ms));
 }
 
@@ -1407,11 +1708,14 @@ void DAQManager::ProgramAndVerifyThresholds(
   const double lsb_mv =
       static_cast<double>(hardware_settings_.input_range_mv) /
       static_cast<double>(1U << hardware_settings_.adc_bits);
-  bool relative_baselines_available = false;
+  bool measured_baselines_available = false;
   for (int ch = 0; ch < MAX_CH; ++ch) {
-    if (((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
-        hardware_settings_.channels[ch].threshold_is_relative_mv) {
-      relative_baselines_available = true;
+    const auto& channel = hardware_settings_.channels[ch];
+    if ((((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
+         channel.threshold_is_relative_mv) ||
+        (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+         channel.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline)) {
+      measured_baselines_available = true;
       break;
     }
   }
@@ -1421,9 +1725,21 @@ void DAQManager::ProgramAndVerifyThresholds(
 
     const auto& configured = hardware_settings_.channels[ch];
     auto& runtime = runtime_channels_[ch];
-    if (relative_baselines_available) {
+    if (measured_baselines_available) {
       runtime.baseline_measured = true;
       runtime.measured_baseline_adc = baselines[ch];
+      if (runtime.dc_offset_target_mode) {
+        runtime.baseline_error_adc =
+            baselines[ch] - static_cast<double>(runtime.target_baseline_adc);
+        const double maximum_adc = static_cast<double>(
+            (uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+        const double tolerance_adc =
+            hardware_settings_.dc_offset_calibration
+                .target_tolerance_percent *
+            maximum_adc / 100.0;
+        runtime.dc_offset_converged =
+            std::abs(runtime.baseline_error_adc) <= tolerance_adc;
+      }
     }
     if (!runtime.participates_in_trigger) {
       std::cout << "\033[1;36m[Trigger Threshold]\033[0m CH" << ch
@@ -2150,6 +2466,20 @@ void DAQManager::WriteRuntimeArtifacts() {
            << hardware_settings_.input_range_mv << ",\n"
            << "    \"adc_bits\": " << board_adc_bits_ << ",\n"
            << "    \"dc_offset_dac_bits\": 16,\n"
+           << "    \"dc_offset_target_tolerance_percent\": "
+           << hardware_settings_.dc_offset_calibration
+                  .target_tolerance_percent
+           << ",\n"
+           << "    \"dc_offset_max_adjustment_iterations\": "
+           << hardware_settings_.dc_offset_calibration
+                  .max_adjustment_iterations
+           << ",\n"
+           << "    \"dc_offset_dac_busy_timeout_ms\": "
+           << hardware_settings_.dc_offset_calibration.dac_busy_timeout_ms
+           << ",\n"
+           << "    \"dc_offset_step_settling_time_ms\": "
+           << hardware_settings_.dc_offset_calibration.step_settling_time_ms
+           << ",\n"
            << "    \"trigger_time_tag_raw_lsb_ns\": "
            << dt5730_timing::kTriggerTimeTagRawLsbNs << ",\n"
            << "    \"trigger_time_tag_observable_resolution_ns\": "
@@ -2268,6 +2598,41 @@ void DAQManager::WriteRuntimeArtifacts() {
              << runtime.requested_dc_offset
              << ", \"readback_dc_offset\": "
              << runtime.readback_dc_offset
+             << ", \"dc_offset_mode\": \""
+             << (runtime.dc_offset_target_mode
+                     ? "target_baseline_percent"
+                     : "raw_dac_code")
+             << "\", \"requested_baseline_percent\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << runtime.requested_baseline_percent;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"target_baseline_adc\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << runtime.target_baseline_adc;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"initial_dc_offset_dac\": "
+             << runtime.initial_dc_offset_dac
+             << ", \"final_dc_offset_dac\": "
+             << runtime.final_dc_offset_dac
+             << ", \"baseline_error_adc\": ";
+    if (runtime.dc_offset_target_mode && runtime.baseline_measured) {
+      metadata << runtime.baseline_error_adc;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"dc_offset_adjustment_iterations\": "
+             << runtime.dc_offset_adjustment_iterations
+             << ", \"dc_offset_converged\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << (runtime.dc_offset_converged ? "true" : "false");
+    } else {
+      metadata << "null";
+    }
+    metadata
              << ", \"polarity_readback\": \""
              << (runtime.polarity_readback == 1 ? "falling" : "rising")
              << "\", \"threshold_mode\": \""

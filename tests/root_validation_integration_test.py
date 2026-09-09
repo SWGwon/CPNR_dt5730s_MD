@@ -77,6 +77,7 @@ def metadata_for(
     polarity: str = "falling",
     pair_logic: str = "AND",
     waveform_dsp_schema: int = 2,
+    include_dc_offset_extension: bool = True,
 ) -> dict:
     parsed_config = configparser.ConfigParser()
     parsed_config.optionxform = str
@@ -140,16 +141,76 @@ def metadata_for(
         recorded_events / elapsed if elapsed is not None and elapsed > 0
         else None
     )
+    calibration_values = {
+        "dc_offset_target_tolerance_percent": parsed_config.getfloat(
+            "DCOffsetCalibration", "TargetTolerancePercent", fallback=0.5
+        ),
+        "dc_offset_max_adjustment_iterations": parsed_config.getint(
+            "DCOffsetCalibration", "MaxAdjustmentIterations", fallback=8
+        ),
+        "dc_offset_dac_busy_timeout_ms": parsed_config.getint(
+            "DCOffsetCalibration", "DacBusyTimeoutMs", fallback=1000
+        ),
+        "dc_offset_step_settling_time_ms": parsed_config.getint(
+            "DCOffsetCalibration", "StepSettlingTimeMs", fallback=3000
+        ),
+    }
+
+    def offset_metadata(channel: int, raw_baseline: float) -> tuple[float, dict]:
+        section = f"Channel_{channel}"
+        mode = parsed_config.get(section, "DCOffsetMode", fallback="RawDac")
+        if mode == "TargetBaseline":
+            if not include_dc_offset_extension:
+                raise ValueError(
+                    "target-baseline fixture requires DC-offset extension"
+                )
+            percent = parsed_config.getfloat(section, "BaselineTargetPercent")
+            target = math.floor(percent * 16383.0 / 100.0 + 0.5)
+            initial = math.floor(
+                (100.0 - percent) * 65535.0 / 100.0 + 0.5
+            )
+            final = min(65535, initial + 1024 + channel)
+            return float(target), {
+                "dc_offset_mode": "target_baseline_percent",
+                "requested_baseline_percent": percent,
+                "target_baseline_adc": target,
+                "initial_dc_offset_dac": initial,
+                "final_dc_offset_dac": final,
+                "requested_dc_offset": final,
+                "readback_dc_offset": final,
+                "baseline_error_adc": 0.0,
+                "dc_offset_adjustment_iterations": 1,
+                "dc_offset_converged": True,
+            }
+        raw = parsed_config.getint(section, "DCOffset")
+        if not include_dc_offset_extension:
+            return raw_baseline, {
+                "requested_dc_offset": raw,
+                "readback_dc_offset": raw,
+            }
+        return raw_baseline, {
+            "dc_offset_mode": "raw_dac_code",
+            "requested_baseline_percent": None,
+            "target_baseline_adc": None,
+            "initial_dc_offset_dac": raw,
+            "final_dc_offset_dac": raw,
+            "requested_dc_offset": raw,
+            "readback_dc_offset": raw,
+            "baseline_error_adc": None,
+            "dc_offset_adjustment_iterations": 0,
+            "dc_offset_converged": None,
+        }
+
     channels = []
-    for channel, baseline in ((0, 16164.0), (1, 16255.0)):
+    for channel, raw_baseline in ((0, 16164.0), (1, 16255.0)):
+        baseline, offset = offset_metadata(channel, raw_baseline)
         written = round(baseline) + (-8 if polarity == "falling" else 8)
         channels.append({
             "channel": channel,
             "trigger_enabled": True,
             "input_range_register": 0x1028 + 0x100 * channel,
             "input_range_readback": 0,
-            "requested_dc_offset": 6554,
-            "readback_dc_offset": 6554,
+            **offset,
             "polarity_readback": polarity,
             "threshold_mode": "baseline_relative_mv",
             "measured_baseline_adc": baseline,
@@ -161,14 +222,14 @@ def metadata_for(
                 abs(baseline - written) * 2000.0 / 16384.0
             ),
         })
-    for channel, baseline in ((2, 8192.0), (3, 8192.0)):
+    for channel, raw_baseline in ((2, 8192.0), (3, 8192.0)):
+        baseline, offset = offset_metadata(channel, raw_baseline)
         channels.append({
             "channel": channel,
             "trigger_enabled": False,
             "input_range_register": 0x1028 + 0x100 * channel,
             "input_range_readback": 0,
-            "requested_dc_offset": 6554,
-            "readback_dc_offset": 6554,
+            **offset,
             "polarity_readback": polarity,
             "threshold_mode": "not_used_record_only",
             "measured_baseline_adc": baseline,
@@ -260,6 +321,7 @@ def metadata_for(
             "input_range_mvpp": 2000,
             "adc_bits": 14,
             "dc_offset_dac_bits": 16,
+            **(calibration_values if include_dc_offset_extension else {}),
             "latest_acquisition_status_register": 384,
             "latest_board_failure_status_register": 0,
             "waveform_dsp_schema": waveform_dsp_schema,
@@ -313,19 +375,41 @@ def metadata_for(
     return result
 
 
+def configured_fixture_baselines(config: Path = CONFIG) -> tuple[int, ...]:
+    parsed = configparser.ConfigParser()
+    parsed.optionxform = str
+    if not parsed.read(config, encoding="utf-8"):
+        raise ValueError(f"cannot read fixture config: {config}")
+    legacy = (16164, 16255, 8192, 8192)
+    result = []
+    for channel, fallback in enumerate(legacy):
+        section = f"Channel_{channel}"
+        if (
+            parsed.get(section, "DCOffsetMode", fallback="RawDac")
+            == "TargetBaseline"
+        ):
+            percent = parsed.getfloat(section, "BaselineTargetPercent")
+            result.append(math.floor(percent * 16383.0 / 100.0 + 0.5))
+        else:
+            result.append(fallback)
+    return tuple(result)
+
+
 def write_raw_fixture(
     path: Path,
     event_count: int = 256,
     *,
+    config: Path = CONFIG,
     overlapping_trigger_pulses: bool = True,
     polarity: str = "falling",
     pulse_amplitude: int = 16,
     board_counters: list[int] | tuple[int, ...] | None = None,
     ttt_phase: int = 0,
+    baseline_offsets: dict[int, int] | None = None,
 ) -> None:
     record_length = 520
     channel_mask = 0xF
-    baselines = (16164, 16255, 8192, 8192)
+    baselines = configured_fixture_baselines(config)
     if board_counters is not None and len(board_counters) != event_count:
         raise ValueError("board_counters length must equal event_count")
     if ttt_phase not in (0, 1):
@@ -345,6 +429,10 @@ def write_raw_fixture(
                 else board_counters[event_id],
             ))
             for channel, baseline in enumerate(baselines):
+                baseline += (
+                    baseline_offsets.get(channel, 0)
+                    if baseline_offsets is not None else 0
+                )
                 waveform = [baseline] * record_length
                 if channel in (0, 1):
                     # Place a clean falling pulse after the 128-sample baseline
@@ -378,12 +466,14 @@ def write_raw_fixture(
 def write_peak_centered_raw_fixture(
     path: Path,
     event_count: int = 32,
+    *,
+    config: Path = CONFIG,
 ) -> None:
     """Write falling pulses whose schema-3 integral is exactly 41 ADC.sample."""
 
     record_length = 520
     channel_mask = 0xF
-    baselines = (16164, 16255, 8192, 8192)
+    baselines = configured_fixture_baselines(config)
     with path.open("wb") as stream:
         for event_id in range(event_count):
             stream.write(struct.pack(
@@ -1509,7 +1599,35 @@ class RootValidationIntegrationTests(unittest.TestCase):
             self.assertEqual(lost_check["status"], "PASS", lost_check)
             self.assertEqual(report["summary"].get("waveform_dsp_schema"), 2)
             expected_charges = {0: 128.0, 1: 128.0, 2: -128.0, 3: 0.0}
-            for channel in report["channels"]:
+            for channel in report["channels"][:4]:
+                dc_offset = channel.get("dc_offset", {})
+                self.assertTrue(
+                    dc_offset.get("metadata_extension_available"), channel
+                )
+                self.assertEqual(
+                    dc_offset.get("mode"), "target_baseline_percent", channel
+                )
+                self.assertEqual(
+                    dc_offset.get("requested_baseline_percent"), 90.0, channel
+                )
+                self.assertEqual(
+                    dc_offset.get("target_baseline_adc"), 14745, channel
+                )
+                self.assertEqual(
+                    dc_offset.get("measured_baseline_adc"), 14745.0, channel
+                )
+                self.assertEqual(
+                    dc_offset.get("baseline_error_adc"), 0.0, channel
+                )
+                self.assertEqual(
+                    dc_offset.get("adjustment_iterations"), 1, channel
+                )
+                self.assertIs(dc_offset.get("converged"), True, channel)
+                self.assertNotEqual(
+                    dc_offset.get("initial_dac"),
+                    dc_offset.get("final_dac"),
+                    channel,
+                )
                 metrics = channel.get("metrics", {})
                 self.assertEqual(
                     metrics.get("waveform_dsp_mismatches"),
@@ -1557,6 +1675,65 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 validation.stderr,
                 re.compile(r"\[ValidationProgress\]\s+100(?:\.0+)?%"),
             )
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_legacy_raw_dc_offset_metadata_remains_valid(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cpnr_validator_legacy_dc_offset_"
+        ) as temp:
+            directory = Path(temp)
+            parsed = configparser.ConfigParser()
+            parsed.optionxform = str
+            self.assertTrue(parsed.read(CONFIG, encoding="utf-8"))
+            parsed.remove_section("DCOffsetCalibration")
+            for channel in range(4):
+                section = f"Channel_{channel}"
+                parsed[section].pop("DCOffsetMode", None)
+                parsed[section].pop("BaselineTargetPercent", None)
+                parsed[section]["DCOffset"] = "6554"
+            config = directory / "legacy_raw.conf"
+            with config.open("w", encoding="utf-8") as stream:
+                parsed.write(stream)
+
+            raw = directory / "legacy_run091.dat"
+            write_raw_fixture(raw, config=config)
+            metadata = directory / "legacy_run091.dat.run.json"
+            metadata.write_text(
+                json.dumps(
+                    metadata_for(
+                        raw,
+                        metadata,
+                        91,
+                        config=config,
+                        include_dc_offset_extension=False,
+                    ),
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "legacy_run091_prod.root"
+            conversion = run_converter(
+                raw, metadata, output, 91, config=config, save_waveforms=True
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            identity = read_only_identity(output)
+            validation = run_validator(output)
+            report = decode_report_with_exit(validation)
+            self.assertEqual(report["overall_status"], "PASS", report)
+            for channel in report["channels"][:4]:
+                dc_offset = channel["dc_offset"]
+                self.assertIs(
+                    dc_offset["metadata_extension_available"], False
+                )
+                self.assertEqual(dc_offset["mode"], "legacy_raw_dac_code")
+                self.assertEqual(dc_offset["initial_dac"], 6554)
+                self.assertEqual(dc_offset["final_dac"], 6554)
+                self.assertIsNone(dc_offset["adjustment_iterations"])
+                self.assertIsNone(dc_offset["converged"])
             self.assert_validation_was_read_only(output, identity)
 
             sampled_validation = run_validator(output, max_events=32)
@@ -1613,6 +1790,7 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 if check.get("name") == "analysis_coverage"
             )
             self.assertEqual(coverage["status"], "WARN", coverage)
+            expected_charges = {0: 128.0, 1: 128.0, 2: -128.0, 3: 0.0}
             for channel in sampled_report["channels"]:
                 channel_id = channel["channel"]
                 if channel_id in expected_charges:
@@ -2358,9 +2536,16 @@ class RootValidationIntegrationTests(unittest.TestCase):
             metadata = directory / "fixture_run024.dat.run.json"
             document = metadata_for(raw, metadata, 24)
             for channel in document["channels"][:2]:
-                stale_baseline = channel["measured_baseline_adc"] - 100.0
+                # Keep the calibration result within the configured 0.5%
+                # target-placement tolerance, but move it far enough that the
+                # 8-ADC discriminator distance is observably stale relative to
+                # the event-file baseline.
+                stale_baseline = channel["measured_baseline_adc"] - 20.0
                 stale_threshold = round(stale_baseline) - 8
                 channel["measured_baseline_adc"] = stale_baseline
+                channel["baseline_error_adc"] = (
+                    stale_baseline - channel["target_baseline_adc"]
+                )
                 channel["written_threshold_adc"] = stale_threshold
                 channel["readback_threshold_adc"] = stale_threshold
                 channel["effective_threshold_mv"] = (
@@ -2393,9 +2578,57 @@ class RootValidationIntegrationTests(unittest.TestCase):
                 )
                 self.assertGreater(
                     threshold_check["observed"]["calibration_drift_adc"],
-                    90.0,
+                    15.0,
                     threshold_check,
                 )
+            self.assert_validation_was_read_only(output, identity)
+
+    def test_record_only_channel_drift_fails_dc_offset_target(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cpnr_dc_offset_target_drift_"
+        ) as temp:
+            directory = Path(temp)
+            raw = directory / "fixture_run092.dat"
+            write_raw_fixture(
+                raw, event_count=64, baseline_offsets={2: 100}
+            )
+            metadata = directory / "fixture_run092.dat.run.json"
+            metadata.write_text(
+                json.dumps(metadata_for(raw, metadata, 92), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            output = directory / "fixture_run092_prod.root"
+            conversion = run_converter(
+                raw, metadata, output, 92, save_waveforms=True
+            )
+            self.assertEqual(
+                conversion.returncode,
+                0,
+                conversion.stdout + conversion.stderr,
+            )
+            identity = read_only_identity(output)
+            validation = run_validator(output)
+            report = decode_report_with_exit(validation)
+            self.assertEqual(report["overall_status"], "FAIL", report)
+            target_check = next(
+                check for check in report["checks"]
+                if check.get("name") == "channel_2_dc_offset_target"
+            )
+            self.assertEqual(target_check["status"], "FAIL", target_check)
+            self.assertEqual(
+                target_check["observed"]["actual_error_adc"],
+                100.0,
+                target_check,
+            )
+            channel = next(
+                value for value in report["channels"]
+                if value.get("channel") == 2
+            )
+            self.assertEqual(
+                channel["metrics"]["actual_dc_offset_target_error_adc"],
+                100.0,
+                channel,
+            )
             self.assert_validation_was_read_only(output, identity)
 
     def test_array_disguised_as_scalar_is_rejected_before_binding(self):

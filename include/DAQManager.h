@@ -44,11 +44,19 @@ private:
     bool threshold_programmed = false;
     bool baseline_measured = false;
     bool measured_threshold = false;
+    bool dc_offset_target_mode = false;
+    bool dc_offset_converged = false;
     uint32_t requested_dc_offset = 0;
+    uint32_t initial_dc_offset_dac = 0;
+    uint32_t final_dc_offset_dac = 0;
     uint32_t readback_dc_offset = 0;
     uint32_t input_range_register = 0;
     uint32_t input_range_readback = 0;
     int polarity_readback = -1;
+    double requested_baseline_percent = 0.0;
+    uint32_t target_baseline_adc = 0;
+    double baseline_error_adc = 0.0;
+    uint32_t dc_offset_adjustment_iterations = 0;
     double measured_baseline_adc = 0.0;
     double requested_threshold_mv = 0.0;
     uint32_t delta_adc = 0;
@@ -59,9 +67,17 @@ private:
 
   void SetupHardware();
   void ConfigureInputRangeAndOffsets(int handle);
+  void WaitForDCOffsetReady(int handle, int channel);
+  void WriteAndVerifyDCOffset(int handle, int channel, uint32_t value);
+  std::array<double, MAX_CH> TuneTargetBaselineOffsets(int handle);
   std::array<double, MAX_CH> MeasureBaselineBatch(
       int handle, std::chrono::steady_clock::time_point deadline);
-  std::array<double, MAX_CH> WaitForStableBaselines(int handle);
+  std::array<double, MAX_CH> WaitForStableBaselines(
+      int handle, uint32_t channel_mask, uint32_t initial_settling_time_ms,
+      const std::string &context);
+  bool TargetBaselinesWithinTolerance(
+      const std::array<double, MAX_CH> &baselines,
+      std::string *failure_detail = nullptr) const;
   void ProgramAndVerifyThresholds(
       int handle, const std::array<double, MAX_CH> &baselines);
   void ConfigureAndVerifyTriggerRouting(int handle);

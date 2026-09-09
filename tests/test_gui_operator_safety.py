@@ -398,6 +398,194 @@ class GuiOperatorSafetyTests(unittest.TestCase):
             self.assertTrue(tab.is_dirty())
             tab.deleteLater()
 
+    def test_dc_offset_target_ui_applies_every_readout_channel_and_preflights(self):
+        from core.dc_offset_settings import DC_OFFSET_MODE_TARGET
+        from widgets.ConfigTab import ConfigTab
+        from widgets import DaqTab as daq_module
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_ls_coin.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "target_baseline.conf"
+            shutil.copy2(source, config_path)
+
+            config_tab = ConfigTab()
+            config_tab.load_file(str(config_path))
+            self.assertFalse(config_tab.is_dirty())
+            self.assertEqual(
+                config_tab.combo_dc_offset_mode.currentData(),
+                DC_OFFSET_MODE_TARGET,
+            )
+            for ch, checkbox in enumerate(config_tab.offset_ch_checks):
+                self.assertEqual(checkbox.isEnabled(), ch < 4)
+                self.assertEqual(checkbox.isChecked(), ch < 4)
+
+            config_tab.set_dc_offset_target_preset(90.0)
+            with mock.patch(
+                "widgets.ConfigTab.QMessageBox.information"
+            ) as information:
+                config_tab.apply_dc_offset_to_table()
+            information.assert_called_once()
+
+            for ch in range(4):
+                section = f"Channel_{ch}"
+                self.assertEqual(
+                    config_tab.table_value(section, "DCOffsetMode"),
+                    DC_OFFSET_MODE_TARGET,
+                )
+                self.assertEqual(
+                    config_tab.table_value(
+                        section, "BaselineTargetPercent"
+                    ),
+                    "90",
+                )
+                self.assertIsNone(
+                    config_tab.optional_table_value(section, "DCOffset")
+                )
+            self.assertEqual(
+                config_tab.table_value(
+                    "DCOffsetCalibration", "TargetTolerancePercent"
+                ),
+                "0.5",
+            )
+            self.assertIn("14745 ADC", config_tab.lbl_res_offset.text())
+            self.assertIn("initial nominal DAC=6554",
+                          config_tab.lbl_res_offset.text())
+            self.assertIn("Falling headroom≈1800.0 mV",
+                          config_tab.lbl_dc_offset_headroom.text())
+            self.assertTrue(config_tab.is_dirty())
+            config_tab.validate_trigger_table()
+
+            with mock.patch(
+                "widgets.ConfigTab.QMessageBox.critical"
+            ) as critical:
+                config_tab.save_config()
+            critical.assert_not_called()
+            self.assertFalse(config_tab.is_dirty())
+
+            with (
+                mock.patch.object(
+                    daq_module, "find_project_root", return_value=Path(directory)
+                ),
+                mock.patch.object(
+                    daq_module, "DatabaseManager", DummyDatabaseManager
+                ),
+            ):
+                daq_tab = daq_module.DaqTab()
+            daq_tab.config_input.setText(str(config_path))
+            self.assertEqual(
+                daq_tab.validate_config_before_start(),
+                str(config_path.resolve()),
+            )
+            daq_tab.disk_timer.stop()
+            daq_tab.deleteLater()
+            config_tab.deleteLater()
+
+    def test_dc_offset_ui_preserves_mixed_channels_and_converts_stale_threshold(self):
+        from core.dc_offset_settings import DC_OFFSET_MODE_TARGET
+        from widgets.ConfigTab import ConfigTab
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_ls_coin.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "mixed_baseline.conf"
+            shutil.copy2(source, config_path)
+            legacy_text = config_path.read_text(encoding="utf-8").replace(
+                "DCOffsetMode = TargetBaseline\n"
+                "BaselineTargetPercent = 90.0",
+                "DCOffset = 6554",
+            )
+            config_path.write_text(legacy_text, encoding="utf-8")
+            # Exercise the safety migration from an absolute discriminator.
+            text = config_path.read_text(encoding="utf-8")
+            text = text.replace("TriggerThresholdMv = 1.0",
+                                "TriggerThreshold = 15555", 1)
+            config_path.write_text(text, encoding="utf-8")
+
+            tab = ConfigTab()
+            tab.load_file(str(config_path))
+            for ch in (1, 2, 3):
+                tab.offset_ch_checks[ch].setChecked(False)
+            tab.spin_trg_mv.setValue(1.0)
+            tab.set_dc_offset_target_preset(85.0)
+            with mock.patch(
+                "widgets.ConfigTab.QMessageBox.information"
+            ) as information:
+                tab.apply_dc_offset_to_table()
+
+            self.assertEqual(
+                tab.table_value("Channel_0", "DCOffsetMode"),
+                DC_OFFSET_MODE_TARGET,
+            )
+            self.assertEqual(
+                tab.table_value("Channel_0", "BaselineTargetPercent"), "85"
+            )
+            self.assertIsNone(
+                tab.optional_table_value("Channel_0", "TriggerThreshold")
+            )
+            self.assertEqual(
+                tab.table_value("Channel_0", "TriggerThresholdMv"), "1"
+            )
+            for ch in (1, 2, 3):
+                self.assertIsNone(
+                    tab.optional_table_value(
+                        f"Channel_{ch}", "DCOffsetMode"
+                    )
+                )
+                self.assertEqual(
+                    tab.table_value(f"Channel_{ch}", "DCOffset"), "6554"
+                )
+            self.assertIn("Pending table", tab.lbl_dc_offset_loaded.text())
+            self.assertIn("CH0 target 85%", tab.lbl_dc_offset_loaded.text())
+            self.assertIn("CH1 raw 6554 legacy",
+                          tab.lbl_dc_offset_loaded.text())
+            self.assertIn("stale absolute", information.call_args.args[2])
+            tab.validate_trigger_table()
+            tab.deleteLater()
+
+    def test_target_offset_preflight_rejects_stale_absolute_and_bad_tolerance(self):
+        from widgets import DaqTab as daq_module
+
+        source = Path(__file__).resolve().parents[1] / "config" / (
+            "dt5730s_ls_coin.conf"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "invalid_target.conf"
+            shutil.copy2(source, config_path)
+            text = config_path.read_text(encoding="utf-8")
+            text = text.replace(
+                "TriggerThresholdMv = 1.0",
+                "TriggerThreshold = 15555",
+                1,
+            )
+            config_path.write_text(text, encoding="utf-8")
+            with (
+                mock.patch.object(
+                    daq_module, "find_project_root", return_value=Path(directory)
+                ),
+                mock.patch.object(
+                    daq_module, "DatabaseManager", DummyDatabaseManager
+                ),
+            ):
+                tab = daq_module.DaqTab()
+            tab.config_input.setText(str(config_path))
+            with self.assertRaisesRegex(ValueError, "stale.*TriggerThreshold"):
+                tab.validate_config_before_start()
+
+            text = config_path.read_text(encoding="utf-8").replace(
+                "TriggerThreshold = 15555", "TriggerThresholdMv = 1.0", 1
+            )
+            config_path.write_text(text, encoding="utf-8")
+            self.replace_config_value(
+                config_path, "TargetTolerancePercent", "0"
+            )
+            with self.assertRaisesRegex(ValueError, "0.*10"):
+                tab.validate_config_before_start()
+            tab.disk_timer.stop()
+            tab.deleteLater()
+
     def test_software_random_trigger_controls_apply_and_pass_daq_preflight(self):
         from core.dt5730_constraints import (
             MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,

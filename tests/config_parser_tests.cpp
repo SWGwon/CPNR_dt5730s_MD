@@ -447,6 +447,109 @@ int main() {
               !record_only_settings.channels[3].has_trigger_threshold,
           "record-only channels do not require discriminator thresholds");
 
+    const std::string target_baseline_config =
+        "[Digitizer]\nRecordLength=1030\nChannelMask=15\n"
+        "SelfTriggerMask=3\nPostTrigger=70\nInputRangeMv=2000\n"
+        "ADCBits=14\nTriggerPolarity=1\nExtTriggerMode=0\n"
+        "SelfTriggerMode=1\n[HardwareCoincidence]\nPairLogic=AND\n"
+        "[DCOffsetCalibration]\nTargetTolerancePercent=0.5\n"
+        "MaxAdjustmentIterations=8\nDacBusyTimeoutMs=1000\n"
+        "StepSettlingTimeMs=200\n"
+        "[Channel_0]\nDCOffsetMode=TargetBaseline\n"
+        "BaselineTargetPercent=90\nTriggerThresholdMv=1.0\n"
+        "[Channel_1]\nDCOffsetMode=TargetBaseline\n"
+        "BaselineTargetPercent=85\nTriggerThresholdMv=1.0\n"
+        "[Channel_2]\nDCOffsetMode=TargetBaseline\n"
+        "BaselineTargetPercent=90\n"
+        "[Channel_3]\nDCOffsetMode=TargetBaseline\n"
+        "BaselineTargetPercent=90\n";
+    const auto target_baseline_settings = LoadDAQHardwareSettings(
+        ConfigParser::FromText(target_baseline_config,
+                               "target-baseline-config-test"));
+    Check(target_baseline_settings.channels[0].dc_offset_mode ==
+                  DAQDCOffsetMode::kTargetBaseline &&
+              target_baseline_settings.channels[0].target_baseline_adc ==
+                  14745U &&
+              target_baseline_settings.channels[0].dc_offset == 6554U,
+          "90-percent target produces a 14-bit target and nominal 16-bit DAC seed");
+    Check(target_baseline_settings.channels[1].target_baseline_adc ==
+                  BaselinePercentToAdc(85.0, 14) &&
+              target_baseline_settings.channels[1].dc_offset ==
+                  BaselinePercentToInitialDac(85.0),
+          "baseline targets remain independent per channel");
+    Check(target_baseline_settings.dc_offset_calibration
+                      .target_tolerance_percent == 0.5 &&
+              target_baseline_settings.dc_offset_calibration
+                      .max_adjustment_iterations == 8U &&
+              target_baseline_settings.dc_offset_calibration
+                      .dac_busy_timeout_ms == 1000U &&
+              target_baseline_settings.dc_offset_calibration
+                      .step_settling_time_ms == 200U,
+          "DC-offset closed-loop calibration controls are parsed");
+
+    std::string target_with_raw = target_baseline_config;
+    target_with_raw.replace(
+        target_with_raw.find("BaselineTargetPercent=90"),
+        std::string("BaselineTargetPercent=90").size(),
+        "BaselineTargetPercent=90\nDCOffset=6554");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              target_with_raw, "target-with-raw-test"));
+        },
+        "forbids DCOffset",
+        "target baseline and a raw DAC code are mutually exclusive");
+
+    std::string target_without_percent = target_baseline_config;
+    target_without_percent.erase(
+        target_without_percent.find("BaselineTargetPercent=90\n"),
+        std::string("BaselineTargetPercent=90\n").size());
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              target_without_percent, "target-without-percent-test"));
+        },
+        "requires BaselineTargetPercent",
+        "target mode requires an explicit percentage");
+
+    std::string unsafe_target = target_baseline_config;
+    unsafe_target.replace(unsafe_target.find("BaselineTargetPercent=90"),
+                          std::string("BaselineTargetPercent=90").size(),
+                          "BaselineTargetPercent=4.9");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              unsafe_target, "unsafe-target-percent-test"));
+        },
+        "range 5..95", "target baseline rejects unsafe rail proximity");
+
+    std::string target_absolute_threshold = target_baseline_config;
+    target_absolute_threshold.replace(
+        target_absolute_threshold.find("TriggerThresholdMv=1.0"),
+        std::string("TriggerThresholdMv=1.0").size(),
+        "TriggerThreshold=14700");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              target_absolute_threshold,
+              "target-absolute-threshold-test"));
+        },
+        "requires TriggerThresholdMv",
+        "target-mode self trigger rejects a baseline-dependent absolute threshold");
+
+    std::string zero_target_tolerance = target_baseline_config;
+    zero_target_tolerance.replace(
+        zero_target_tolerance.find("TargetTolerancePercent=0.5"),
+        std::string("TargetTolerancePercent=0.5").size(),
+        "TargetTolerancePercent=0");
+    CheckThrows(
+        [&]() {
+          (void)LoadDAQHardwareSettings(ConfigParser::FromText(
+              zero_target_tolerance, "zero-target-tolerance-test"));
+        },
+        "TargetTolerancePercent",
+        "zero placement tolerance is rejected before hardware is opened");
+
     const auto sub_lsb_threshold_path = test_dir / "sub_lsb_threshold.conf";
     std::string sub_lsb_threshold = valid_daq_config;
     sub_lsb_threshold.replace(
