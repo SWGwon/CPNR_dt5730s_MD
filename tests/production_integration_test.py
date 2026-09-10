@@ -472,6 +472,118 @@ def write_polarity_fixture(
 
 
 class ProductionIntegrationTests(unittest.TestCase):
+    def test_run_number_uses_terminal_suffix_in_verified_conversion(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_suffix_") as temp:
+            directory = Path(temp) / "campaign_run999"
+            directory.mkdir()
+            for prefix in ("1800V", "Cs137", "sample_run2", "sample_run0",
+                           "sample_run2147483648", "sample_RUN2", "sample_run2V",
+                           "sample_run_2", "sample_run-2", "sample_run2.5mV"):
+                for suffix in ("", "_part17", "_th14000"):
+                    with self.subTest(prefix=prefix, suffix=suffix):
+                        raw = directory / f"{prefix}_run021{suffix}.dat"
+                        raw.write_bytes(b"")
+                        metadata = Path(str(raw) + ".run.json")
+                        metadata.write_text(json.dumps(metadata_for(raw, metadata, 21)))
+                        output = raw.with_suffix(".root")
+                        result = run_converter(raw, metadata, output, 21)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # A real terminal mismatch must still fail even if an earlier
+            # token happens to agree with CLI/metadata.
+            raw = directory / "sample_run021_run022_part17.dat"
+            raw.write_bytes(b"")
+            metadata = Path(str(raw) + ".run.json")
+            metadata.write_text(json.dumps(metadata_for(raw, metadata, 21)))
+            output = raw.with_suffix(".root")
+            result = run_converter(raw, metadata, output, 21)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("input filename says 22", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_dat_only_conversion_records_assumptions_not_fake_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_basic_") as temp:
+            directory = Path(temp)
+            for polarity, basename, run in (
+                ("falling", "sample_run2_run021_part17", 21),
+                ("rising", "Cs137", 0),
+            ):
+                raw = directory / (basename + ".dat")
+                write_polarity_fixture(raw, polarity)
+                before = read_only_identity(raw)
+                output = directory / (basename + "_prod.root")
+                result = subprocess.run([
+                    str(PRODUCTION), str(raw), "--polarity", polarity,
+                    "--baseline-samples", "100", "-w",
+                ], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("NOT verified", result.stderr)
+                self.assertEqual(read_only_identity(raw), before)
+                baseline = configured_fixture_baselines()[0]
+                root_check = subprocess.run([
+                    str(ROOT), "-l", "-b", "-q", "-e",
+                    f'TFile f("{output}"); '
+                    f'auto *r=dynamic_cast<TParameter<int>*>(f.Get("RunNumber")); '
+                    f'if (!r || r->GetVal() != {run}) gSystem->Exit(1); '
+                    'if (f.Get("RunMetadata") || f.Get("RunConfig")) gSystem->Exit(2); '
+                    'auto *b=dynamic_cast<TObjString*>(f.Get("BasicConversion")); '
+                    f'if (!b || !b->GetString().Contains("{polarity}") || '
+                    f'!b->GetString().Contains("{sha256(raw)}")) gSystem->Exit(3); '
+                    'auto *t=dynamic_cast<TTree*>(f.Get("phys_tree")); '
+                    'if (!t || t->GetEntries()!=2) gSystem->Exit(4); '
+                    'double bl=0,ph=0,q=0,t0=0; '
+                    't->SetBranchAddress("Baseline_CH0",&bl); '
+                    't->SetBranchAddress("PulseHeight_CH0",&ph); '
+                    't->SetBranchAddress("Charge_CH0",&q); '
+                    't->SetBranchAddress("PulseStart_T0_CH0",&t0); t->GetEntry(0); '
+                    f'if (bl!={baseline} || ph!=64 || q!=512 || t0!=400) gSystem->Exit(5);',
+                ], text=True, capture_output=True)
+                self.assertEqual(root_check.returncode, 0, root_check.stdout + root_check.stderr)
+                # Basic mode uses the same no-clobber output protection.
+                root_before = read_only_identity(output)
+                again = subprocess.run([str(PRODUCTION), str(raw)], text=True, capture_output=True)
+                self.assertNotEqual(again.returncode, 0)
+                self.assertEqual(read_only_identity(output), root_before)
+
+    def test_basic_mode_is_explicit_for_broken_bundles_and_rejects_corrupt_dat(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_basic_safety_") as temp:
+            directory = Path(temp)
+            raw = directory / "sample_run021.dat"
+            write_polarity_fixture(raw, "falling")
+            original = raw.read_bytes()
+            metadata = Path(str(raw) + ".run.json")
+            metadata.write_text("{broken metadata}")
+            output = directory / "out.root"
+            command = [str(PRODUCTION), str(raw), "-o", str(output)]
+            for extra in ([], ["-m", str(metadata)], ["--basic", "-m", str(metadata)]):
+                result = subprocess.run(command + extra, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(output.exists())
+            result = subprocess.run(command + ["--basic"], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(raw.read_bytes(), original)
+            self.assertEqual(metadata.read_text(), "{broken metadata}")
+            for label, payload, extra in (
+                ("truncated", original[:-1], []),
+                ("partial_header", original + b"partial", []),
+                ("invalid_record", original[:12] + struct.pack("<I", 513) + original[16:], []),
+                ("invalid_mask", original[:16] + b"\0\0" + original[18:], []),
+                ("baseline_too_long", original, ["--baseline-samples", "520"]),
+                ("baseline_zero", original, ["--baseline-samples", "0"]),
+                ("baseline_overflow", original, ["--baseline-samples", "102401"]),
+                ("bad_polarity", original, ["--polarity", "unknown"]),
+            ):
+                with self.subTest(label=label):
+                    damaged = directory / (label + ".dat")
+                    damaged.write_bytes(payload)
+                    before = read_only_identity(damaged)
+                    target = directory / (label + ".root")
+                    result = subprocess.run([
+                        str(PRODUCTION), str(damaged), "--basic", "-o", str(target), *extra,
+                    ], text=True, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(read_only_identity(damaged), before)
+
     def test_legacy_raw_dc_offset_metadata_remains_convertible(self):
         with tempfile.TemporaryDirectory(
             prefix="cpnr_legacy_dc_offset_metadata_"

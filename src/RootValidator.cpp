@@ -1166,10 +1166,13 @@ MetadataState ValidateMetadata(TFile& file, CheckCollector* checks,
   state.present = metadata_contents.has_value();
   (*metadata_report)["present"] = state.present;
   if (!state.present) {
-    checks->Add("FAIL", "provenance", "runtime_metadata", nullptr,
+    const bool basic = ReadStringObject(file, "ConversionMode") ==
+                       std::optional<std::string>("basic");
+    checks->Add(basic ? "WARN" : "FAIL", "provenance", "runtime_metadata", nullptr,
                 "RunMetadata and current provenance objects",
-                "Legacy ROOT file: runtime metadata is absent, so hardware "
-                "settings and source identity cannot be authenticated.");
+                basic
+                    ? "Intentional DAT-only conversion: acquisition settings, completion and original source identity are NOT authenticated."
+                    : "Legacy ROOT file: runtime metadata is absent, so hardware settings and source identity cannot be authenticated.");
     return state;
   }
 
@@ -2672,8 +2675,11 @@ Json ValidateRootFile(const std::string& input_path,
   std::optional<std::string> config_contents;
   MetadataState metadata = ValidateMetadata(
       *file, &checks, &report["metadata"], &config_contents);
-  report["legacy"] = !metadata.present;
-  const bool falling_polarity =
+  const bool basic_conversion = !metadata.present &&
+      ReadStringObject(*file, "ConversionMode") == std::optional<std::string>("basic");
+  report["legacy"] = !metadata.present && !basic_conversion;
+  report["metadata"]["basic_conversion"] = basic_conversion;
+  bool falling_polarity =
       !metadata.hardware.valid || metadata.hardware.polarity == "falling";
   const std::optional<int> waveform_dsp_schema =
       ReadParameter<int>(*file, "WaveformDspSchema");
@@ -2729,6 +2735,40 @@ Json ValidateRootFile(const std::string& input_path,
     } catch (const std::exception&) {
       // The provenance consistency check below reports the exact parser
       // failure.  Keep validation running to expose independent defects.
+    }
+  }
+  if (basic_conversion) {
+    try {
+      const auto contents = ReadStringObject(*file, "BasicConversion");
+      if (!contents) throw std::runtime_error("BasicConversion settings are absent");
+      const Json basic = Json::parse(*contents);
+      RequireUnsigned(basic, "schema_version", "BasicConversion", 1U, 1U);
+      RequireUnsigned(basic, "waveform_dsp_schema", "BasicConversion",
+                      cpnr::kWaveformDspSchemaPeakCenteredCharge,
+                      cpnr::kWaveformDspSchemaPeakCenteredCharge);
+      if (RequireBool(basic, "acquisition_settings_verified", "BasicConversion") ||
+          !waveform_dsp_schema ||
+          *waveform_dsp_schema != cpnr::kWaveformDspSchemaPeakCenteredCharge) {
+        throw std::runtime_error("Basic conversion must be unverified DSP schema 3");
+      }
+      const std::string polarity = RequireString(basic, "polarity", "BasicConversion");
+      if (polarity != "falling" && polarity != "rising") {
+        throw std::runtime_error("BasicConversion polarity must be falling or rising");
+      }
+      DAQHardwareSettings analysis_settings;
+      analysis_settings.software_dsp.waveform.baseline_samples = RequireUnsigned(
+          basic, "baseline_samples", "BasicConversion", 1U,
+          dt5730_constraints::kMaximumRecordLengthSamples);
+      embedded_settings = analysis_settings;
+      waveform_dsp_settings = analysis_settings.software_dsp.waveform;
+      falling_polarity = polarity == "falling";
+      checks.Add("WARN", "provenance", "basic_analysis_settings", basic,
+                 "operator-selected analysis assumptions, not hardware readback",
+                 "DSP checks use the explicitly recorded basic-conversion assumptions; no hardware-setting verification is claimed.");
+    } catch (const std::exception& error) {
+      checks.Add("FAIL", "schema", "basic_analysis_settings", error.what(),
+                 "valid BasicConversion analysis settings",
+                 "Cannot interpret the DAT-only conversion settings.");
     }
   }
   if (!scan_explicit_waveform_dsp && metadata.hardware.valid) {
@@ -2821,6 +2861,9 @@ Json ValidateRootFile(const std::string& input_path,
   if (!run_number) {
     checks.Add("FAIL", "provenance", "run_number", nullptr,
                "positive TParameter<int>", "RunNumber object is missing or has the wrong type.");
+  } else if (basic_conversion && *run_number == 0) {
+    checks.Add("WARN", "provenance", "run_number", 0, "known run number",
+               "DAT-only conversion: no run number was supplied or found in the filename suffix.");
   } else {
     const bool positive = *run_number > 0;
     const bool metadata_match =
@@ -2832,7 +2875,9 @@ Json ValidateRootFile(const std::string& input_path,
                !positive
                    ? "RunNumber must be positive; zero is legacy/untraceable."
                    : metadata_match
-                         ? "ROOT and runtime metadata run numbers agree."
+                         ? basic_conversion
+                               ? "Run number was supplied or inferred from the filename; acquisition provenance is not authenticated."
+                               : "ROOT and runtime metadata run numbers agree."
                          : "ROOT and runtime metadata run numbers disagree.");
   }
   report["summary"]["run_number"] =
@@ -2923,8 +2968,9 @@ Json ValidateRootFile(const std::string& input_path,
     checks.Add(waveform_dsp_errors.empty() ? "PASS" : "FAIL", "schema",
                "waveform_dsp_contract", waveform_dsp_errors, Json::array(),
                waveform_dsp_errors.empty()
-                   ? "Applied ROOT DSP schema and parameters exactly match "
-                     "the authenticated runtime metadata and config."
+                   ? basic_conversion
+                         ? "Applied ROOT DSP schema and parameters match the recorded analysis assumptions (not authenticated hardware settings)."
+                         : "Applied ROOT DSP schema and parameters exactly match the authenticated runtime metadata and config."
                    : "ROOT DSP schema/parameters are missing, mistyped, or "
                      "disagree with runtime metadata or RunConfigExact.");
   } else if (waveform_dsp_object_present) {
@@ -2964,7 +3010,7 @@ Json ValidateRootFile(const std::string& input_path,
   }
 
   const char* const count_parameter_type =
-      metadata.present ? "TParameter<Long64_t>" : "TParameter<int>";
+      metadata.present || basic_conversion ? "TParameter<Long64_t>" : "TParameter<int>";
   const std::optional<int> timing_schema =
       ReadParameter<int>(*file, "TimingSummarySchema");
   const bool timing_schema_object_present =
@@ -3077,7 +3123,7 @@ Json ValidateRootFile(const std::string& input_path,
     const bool board_counter_present =
         tree->GetBranch("BoardEventCounter") != nullptr;
     const bool inspect_audit_branches =
-        metadata.present || pattern_present || board_counter_present;
+        metadata.present || basic_conversion || pattern_present || board_counter_present;
     if (inspect_audit_branches) {
       specifications.push_back({"Pattern", "UShort_t", kUShort_t});
       specifications.push_back(
@@ -3141,7 +3187,7 @@ Json ValidateRootFile(const std::string& input_path,
         audit_branch_errors.empty();
     has_audit_branches = audit_branch_set_valid;
     const bool audit_schema_valid =
-        metadata.present ? audit_branch_set_valid
+        metadata.present || basic_conversion ? audit_branch_set_valid
                          : (!inspect_audit_branches || audit_branch_set_valid);
     scalar_schema_valid = scalar_schema_valid && branch_errors.empty() &&
                           audit_schema_valid;
@@ -3152,7 +3198,7 @@ Json ValidateRootFile(const std::string& input_path,
                           ? "All 44 required scalar branches have expected leaf types and entry counts."
                           : "All 36 legacy scalar branches have expected leaf types and entry counts.")
                    : "Required scalar branches are missing, mistyped, or have inconsistent entries.");
-    checks.Add(metadata.present
+    checks.Add(metadata.present || basic_conversion
                    ? (audit_schema_valid ? "PASS" : "FAIL")
                    : (inspect_audit_branches
                           ? (audit_schema_valid ? "PASS" : "FAIL")
@@ -3161,10 +3207,10 @@ Json ValidateRootFile(const std::string& input_path,
                {{"pattern_present", pattern_present},
                 {"board_event_counter_present", board_counter_present},
                 {"errors", audit_branch_errors}},
-               metadata.present
+               metadata.present || basic_conversion
                    ? Json("Pattern/UShort_t and BoardEventCounter/UInt_t")
                    : Json("both audit branches together when present"),
-               !metadata.present && !inspect_audit_branches
+               !metadata.present && !basic_conversion && !inspect_audit_branches
                    ? "Legacy format predates raw-header audit branches."
                    : audit_schema_valid
                          ? "Raw Pattern and BoardEventCounter audit fields are preserved with exact scalar types."
@@ -3845,7 +3891,7 @@ Json ValidateRootFile(const std::string& input_path,
         {"baseline_settling",
          metric_subsampled ? "stride_sampled" : "all_scanned_events"},
         {"legacy_trigger_extrema",
-         metadata.present
+         metadata.present || basic_conversion
              ? "not_applicable"
              : metric_subsampled ? "stride_sampled" : "all_scanned_events"},
         {"baseline_stream_extrema", "all_scanned_events"}}},
@@ -3869,7 +3915,7 @@ Json ValidateRootFile(const std::string& input_path,
          {"baseline_quantiles_sampled", metric_subsampled},
          {"baseline_settling_sampled", metric_subsampled},
          {"legacy_trigger_extrema_sampled",
-          !metadata.present && metric_subsampled},
+          !metadata.present && !basic_conversion && metric_subsampled},
          {"baseline_stream_extrema_all_scanned_events", true}},
         {{"sample_stride", 1},
          {"positive_robust_metric_verdicts", "all events"}},
@@ -4097,7 +4143,7 @@ Json ValidateRootFile(const std::string& input_path,
   }
   std::optional<Long64_t> lost_events;
   std::optional<Long64_t> recorded_events;
-  if (metadata.present) {
+  if (metadata.present || basic_conversion) {
     lost_events = ReadParameter<Long64_t>(*file, "LostEvents_count");
     recorded_events =
         ReadParameter<Long64_t>(*file, "RecordedEvents_count");
@@ -4737,7 +4783,7 @@ Json ValidateRootFile(const std::string& input_path,
                          : "Rising-edge trigger evidence requires archived waveforms because PulseHeight stores only falling minima.");
   }
 
-  if (!metadata.present && !legacy_pair_extrema.empty()) {
+  if (!metadata.present && !basic_conversion && !legacy_pair_extrema.empty()) {
     if (partial_event_scan) {
       checks.Add("SKIP", "trigger", "legacy_trigger_inference",
                  {{"events_scanned", scanned},

@@ -3,7 +3,8 @@ import os
 import html
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
-                             QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
+                             QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox,
+                             QComboBox)
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess, QTimer
 from core.DatabaseManager import DatabaseManager
 from core.runtime_paths import (
@@ -74,6 +75,7 @@ class ProductionTab(QWidget):
         io_group.setStyleSheet("QGroupBox { font-weight: bold; color: #17a2b8; }")
         io_layout = QGridLayout()
         self.input_edit = QLineEdit()
+        self.input_edit.textEdited.connect(self._raw_input_edited)
         self.btn_browse_in = QPushButton("Browse Raw")
         self.btn_browse_in.clicked.connect(self.browse_input)
         self.output_edit = QLineEdit()
@@ -100,7 +102,8 @@ class ProductionTab(QWidget):
         io_layout.addWidget(self.btn_browse_metadata, 3, 2)
 
         self.spin_run_number = QSpinBox()
-        self.spin_run_number.setRange(1, 99999)
+        self.spin_run_number.setRange(0, 2147483647)
+        self.spin_run_number.setSpecialValueText("Auto (metadata / filename suffix)")
         io_layout.addWidget(QLabel("Run Number:"), 4, 0)
         io_layout.addWidget(self.spin_run_number, 4, 1)
 
@@ -111,6 +114,28 @@ class ProductionTab(QWidget):
         )
         io_layout.addWidget(QLabel("Resolved production:"), 5, 0)
         io_layout.addWidget(self.lbl_production_identity, 5, 1, 1, 2)
+        self.chk_verify_metadata = QCheckBox("Verify original run config + metadata (optional)")
+        self.chk_verify_metadata.toggled.connect(self.toggle_metadata_ui)
+        io_layout.addWidget(self.chk_verify_metadata, 6, 0, 1, 3)
+        basic_layout = QHBoxLayout()
+        self.combo_basic_polarity = QComboBox()
+        self.combo_basic_polarity.addItems(["falling", "rising"])
+        self.spin_basic_baseline = QSpinBox()
+        self.spin_basic_baseline.setRange(1, 102400)
+        self.spin_basic_baseline.setValue(150)
+        basic_layout.addWidget(QLabel("Basic analysis polarity:"))
+        basic_layout.addWidget(self.combo_basic_polarity)
+        basic_layout.addWidget(QLabel("Baseline samples (from record start):"))
+        basic_layout.addWidget(self.spin_basic_baseline)
+        io_layout.addLayout(basic_layout, 7, 0, 1, 3)
+        self.lbl_basic_note = QLabel(
+            "DAT-only: acquisition settings/completion are NOT verified. "
+            "Select pulse polarity and a pulse-free baseline window. "
+            "Schema 3: peak [-20,+40) ns charge (ADC·sample); "
+            "height/baseline in ADC counts, no assumed mV range."
+        )
+        self.lbl_basic_note.setWordWrap(True)
+        io_layout.addWidget(self.lbl_basic_note, 8, 0, 1, 3)
         io_group.setLayout(io_layout); layout.addWidget(io_group)
 
         opt_group = QGroupBox("Conversion Options & Time-Machine Debugger")
@@ -161,6 +186,24 @@ class ProductionTab(QWidget):
     def toggle_debug_ui(self, state):
         self.spin_debug_start.setEnabled(self.chk_debug_mode.isChecked())
 
+    def toggle_metadata_ui(self, checked):
+        for widget in (self.config_edit, self.metadata_edit,
+                       self.btn_browse_config, self.btn_browse_metadata):
+            widget.setEnabled(checked)
+        self.combo_basic_polarity.setEnabled(not checked)
+        self.spin_basic_baseline.setEnabled(not checked)
+        self.lbl_basic_note.setVisible(not checked)
+
+    def _raw_input_edited(self, _text):
+        # Never reuse a previous DAQ's run number, output or sidecars for a
+        # manually selected input. set_run_context supplies verified identity.
+        self.completed_run_context = None
+        self.spin_run_number.setValue(0)
+        self.output_edit.clear()
+        self.config_edit.clear()
+        self.metadata_edit.clear()
+        self.chk_verify_metadata.setChecked(False)
+
     def set_debug_controls_enabled(self, enabled):
         self.btn_prev.setEnabled(enabled); self.btn_next.setEnabled(enabled); self.spin_jump.setEnabled(enabled); self.btn_jump.setEnabled(enabled); self.btn_quit.setEnabled(enabled)
 
@@ -170,8 +213,22 @@ class ProductionTab(QWidget):
         self.config_edit.setText(self.settings.value("last_prod_config", ""))
         self.metadata_edit.setText(self.settings.value("last_prod_metadata", ""))
         self.spin_run_number.setValue(
-            int(self.settings.value("last_prod_run_number", 1))
+            int(self.settings.value("last_prod_run_number", 0))
         )
+        self.chk_verify_metadata.setChecked(
+            self.settings.value(
+                "verify_metadata",
+                bool(self.config_edit.text() and self.metadata_edit.text()),
+                type=bool,
+            )
+        )
+        self.combo_basic_polarity.setCurrentText(
+            self.settings.value("basic_polarity", "falling")
+        )
+        self.spin_basic_baseline.setValue(
+            int(self.settings.value("basic_baseline_samples", 150))
+        )
+        self.toggle_metadata_ui(self.chk_verify_metadata.isChecked())
         self.chk_save_waveforms.setChecked(self.settings.value("last_save_wave", False, type=bool))
         self.refresh_runtime_identity()
 
@@ -181,6 +238,9 @@ class ProductionTab(QWidget):
         self.settings.setValue("last_prod_config", self.config_edit.text())
         self.settings.setValue("last_prod_metadata", self.metadata_edit.text())
         self.settings.setValue("last_prod_run_number", self.spin_run_number.value())
+        self.settings.setValue("verify_metadata", self.chk_verify_metadata.isChecked())
+        self.settings.setValue("basic_polarity", self.combo_basic_polarity.currentText())
+        self.settings.setValue("basic_baseline_samples", self.spin_basic_baseline.value())
         self.settings.setValue("last_save_wave", self.chk_save_waveforms.isChecked())
 
     def refresh_runtime_identity(self):
@@ -200,7 +260,14 @@ class ProductionTab(QWidget):
     def browse_input(self):
         last_dir = os.path.dirname(os.path.join(self.proj_dir, self.input_edit.text())) if self.input_edit.text() else self.data_dir
         fname, _ = QFileDialog.getOpenFileName(self, "Open Raw Data", last_dir, "Data Files (*.dat)")
-        if fname: self.input_edit.setText(os.path.relpath(fname, self.proj_dir)); self.save_settings()
+        if fname:
+            self._raw_input_edited(fname)
+            self.input_edit.setText(os.path.relpath(fname, self.proj_dir))
+            for field, suffix in ((self.config_edit, ".config.conf"),
+                                  (self.metadata_edit, ".run.json")):
+                if os.path.isfile(fname + suffix):
+                    field.setText(fname + suffix)
+            self.save_settings()
 
     def browse_output(self):
         last_dir = os.path.dirname(os.path.join(self.proj_dir, self.output_edit.text())) if self.output_edit.text() else self.data_dir
@@ -241,6 +308,7 @@ class ProductionTab(QWidget):
         self.metadata_edit.setText(context.get("metadata_path", ""))
         run_number = int(context.get("run_number", 1))
         self.spin_run_number.setValue(max(1, run_number))
+        self.chk_verify_metadata.setChecked(True)
         self.output_edit.clear()
         self.save_settings()
         metadata_note = "ready" if context.get("metadata_exists") else "MISSING"
@@ -264,10 +332,11 @@ class ProductionTab(QWidget):
         config_value = self.config_edit.text().strip()
         metadata_value = self.metadata_edit.text().strip()
         output_value = self.output_edit.text().strip()
-        if not raw_value or not config_value or not metadata_value:
+        verified = self.chk_verify_metadata.isChecked()
+        if not raw_value or (verified and (not config_value or not metadata_value)):
             self.log_console.append(
-                "<span style='color:red;'>[Error] Raw input, exact run config, "
-                "and runtime metadata are all required.</span>"
+                "<span style='color:red;'>[Error] Select a DAT input. "
+                "Verified mode also requires the exact run config and metadata.</span>"
             )
             return
 
@@ -278,19 +347,19 @@ class ProductionTab(QWidget):
             )
             config_path = require_file(
                 resolve_path(self.proj_dir, config_value), description="run config snapshot"
-            )
+            ) if verified else None
             metadata_path = require_file(
                 resolve_path(self.proj_dir, metadata_value), description="runtime metadata"
-            )
+            ) if verified else None
             executable = os.path.join(self.bin_dir, "production_dt5730")
             executable_identity = verify_binary_fresh(
                 executable, production_sources(self.proj_dir)
             )
-            config_identity = file_identity(config_path)
-            metadata_identity = file_identity(metadata_path)
+            config_identity = file_identity(config_path) if verified else None
+            metadata_identity = file_identity(metadata_path) if verified else None
             context = self.completed_run_context or {}
             context_raw = context.get("raw_file")
-            if context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
+            if verified and context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
                 expected_config = resolve_path(
                     self.proj_dir, context.get("config_path", "")
                 )
@@ -337,12 +406,15 @@ class ProductionTab(QWidget):
                 debug_event_id=(
                     self.spin_debug_start.value() if is_debug_mode else None
                 ),
+                basic=not verified,
+                polarity=self.combo_basic_polarity.currentText(),
+                baseline_samples=self.spin_basic_baseline.value(),
             )
-            verify_expected_hashes({
-                executable: executable_identity["sha256"],
-                str(config_path): config_identity["sha256"],
-                str(metadata_path): metadata_identity["sha256"],
-            })
+            expected_hashes = {executable: executable_identity["sha256"]}
+            if verified:
+                expected_hashes[str(config_path)] = config_identity["sha256"]
+                expected_hashes[str(metadata_path)] = metadata_identity["sha256"]
+            verify_expected_hashes(expected_hashes)
         except (OSError, RuntimeValidationError) as exc:
             self.log_console.append(
                 f"<span style='color:red;'>[Error] Conversion launch blocked: "
@@ -415,12 +487,18 @@ class ProductionTab(QWidget):
         self.log_console.append(
             f"<b>[Runtime] Production:</b> {identity_summary(executable_identity)}"
         )
-        self.log_console.append(
-            f"<b>[Runtime] Config:</b> {identity_summary(config_identity)}"
-        )
-        self.log_console.append(
-            f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
-        )
+        if verified:
+            self.log_console.append(
+                f"<b>[Runtime] Config:</b> {identity_summary(config_identity)}"
+            )
+            self.log_console.append(
+                f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
+            )
+        else:
+            self.log_console.append(
+                "<b>[Warning] Basic DAT-only conversion:</b> acquisition "
+                "settings/completion and historical integrity are NOT verified."
+            )
         self.log_console.append(f"<b>[System] Starting:</b> {executable} {' '.join(args)}")
         if self._active_db_run_id is not None and not is_debug_mode:
             try:

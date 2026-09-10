@@ -403,7 +403,7 @@ ZMQ는 모니터링용 보조 경로입니다. subscriber 지연은 PUB socket�
 
 도구는 24-byte little-endian header, 0부터 연속인 `EventID`, config의 `RecordLength`/`ChannelMask`, payload 길이와 ADC bit 범위를 검사합니다. 첫 truncated/invalid event 직전에서 멈추며, 결과와 `<output>.recovery.json`을 둘 다 fsync한 뒤 no-clobber 방식으로 함께 게시합니다. manifest에는 원본·config의 device/inode/time/SHA-256, 복구 event/byte 수, 폐기한 tail, 도구 binary/git/build 정보가 들어갑니다. 출력이나 manifest가 이미 있으면 어느 것도 덮어쓰지 않습니다.
 
-복구 파일은 원래 run의 `completed` raw가 아닙니다. 기존 failed metadata를 고쳐서 completed로 가장하지 마십시오. Production converter가 `acquisition_status=completed`, raw size/SHA 및 config readback 일치를 요구하므로 recovered prefix의 분석·승격은 recovery manifest를 보존한 별도 검토 절차로 다뤄야 합니다.
+복구 파일은 원래 run의 `completed` raw가 아닙니다. 기존 failed metadata를 고쳐서 completed로 가장하지 마십시오. Production의 검증 모드는 `acquisition_status=completed`, raw size/SHA 및 config readback 일치를 요구합니다. 복구 manifest를 보존하고 `--basic`으로 완전한 이벤트 prefix를 분석할 수 있지만, 이것이 원래 run의 완료나 무손실을 증명하지는 않습니다. 잘린 마지막 이벤트는 기본 변환에서도 거부하므로 먼저 recovery 도구로 완전한 prefix를 별도 추출하십시오.
 
 ### Runtime provenance, health, relocation
 
@@ -418,7 +418,27 @@ ZMQ는 모니터링용 보조 경로입니다. subscriber 지연은 PUB socket�
 
 Frontend는 시작 전과 종료 직전에 strict health/config readback을 수행하고, 실행 중에는 온도·board status·저장공간을 약 250 ms마다, 설정 불변성을 약 1초마다 검사합니다. 활성 채널 온도가 82 °C에 도달하거나 health/register 검증을 신뢰할 수 없으면 run을 실패 상태로 멈춥니다.
 
-run bundle을 다른 디스크나 호스트로 옮길 때는 raw, `<raw>.config.conf`, `<raw>.run.json`을 함께 복사하고 production에 세 경로를 명시하십시오.
+### DAT-only 기본 변환과 검증 변환
+
+메타데이터는 파형을 ROOT로 변환하는 데 필수는 아닙니다. GUI에서 DAT를 선택하고 **Run ROOT Conversion**을 누르면 됩니다. **Verify original run config + metadata**를 선택하면 기존의 엄격한 검증을 수행합니다. DAQ 완료 context를 자동 전달받을 때는 이 검증 옵션이 켜집니다. 다른 DAT를 선택하면 이전 run 번호·출력 경로·context를 초기화합니다.
+
+```bash
+# sidecar 없이 DAT만 있는 경우 (기본: falling, 선두 150 samples baseline)
+./bin/production_dt5730 sample_run2_run021_part17.dat
+
+# sidecar 유무와 무관하게 명시적으로 기본 분석; rising 펄스 예시
+./bin/production_dt5730 input.dat --basic --polarity rising --baseline-samples 100 -w
+```
+
+기본 분석은 DSP schema 3의 peak 중심 `[-20,+40) ns` signed charge를 사용합니다. polarity와 baseline 구간은 사용자가 실제 파형에 맞게 선택해야 합니다. baseline sample 수는 record length보다 작아야 합니다. 데이터에 없는 input range·hardware threshold·routing·DC offset은 추정해서 넣지 않습니다. 높이/baseline은 ADC count, charge는 ADC·sample 단위이며 mV/pC로 자동 환산하지 않습니다.
+
+기본 ROOT에는 가짜 `RunMetadata`/`RunConfig` 대신 `ConversionMode=basic`, `BasicConversion`에 분석 가정과 변환 시점 raw 크기/SHA-256을 기록합니다. 이 해시는 측정 당시 원본과의 일치를 보증하지 않습니다. ROOT 검증 탭은 데이터 구조/DSP를 검사하되 provenance를 `WARN`으로 표시합니다. 인증된 RAW↔ROOT 전체 충실도 검증은 여전히 run bundle을 요구합니다. 기본 모드도 malformed/truncated DAT, 변환 중 입력 변경, 기존 ROOT 덮어쓰기를 거부합니다.
+
+Run 번호는 파일명 **끝의** `_runNNN`(또는 뒤에 `_partNN`/`_thNN`이 붙은 형태)에서만 읽습니다. 예를 들어 `sample_run2_run021_part17.dat`는 run **21**입니다. 경로나 파일명 앞쪽 숫자는 무시합니다. CLI `-r`/metadata와 실제 suffix가 충돌하면 계속 오류 처리합니다. 기본 모드에서 번호를 모르면 `RunNumber=0`, `RunNumberSource=unknown`으로 명시하며 GUI의 `0`은 자동 선택입니다.
+
+CLI에서 `-c`/`-m`을 전달하거나 인접 sidecar가 하나라도 발견되면 기존 검증 모드가 적용됩니다. sidecar 누락·변조·실패 상태를 조용히 무시하지 않습니다. 의도적으로 기본 분석을 할 때만 `--basic`을 쓰며 `-c`/`-m`과 혼용할 수 없습니다.
+
+검증 가능한 run bundle을 다른 디스크나 호스트로 옮길 때는 raw, `<raw>.config.conf`, `<raw>.run.json`을 함께 복사하고 production에 세 경로를 명시하십시오.
 
 ```bash
 ./bin/production_dt5730 \
@@ -453,7 +473,7 @@ GUI 없이 같은 읽기 전용 검증을 실행할 수도 있습니다. `--max-
 * **🚀 DAQ Control:** 파일 브라우저 연동, 인가 전압(HV) 문자열 기입, 런 조건(Events/Time) 및 분할/스캔(Scan) 배치 모드 설정. 모던 라이트 테마 기반의 2단 실시간 대시보드(Storage, Hz, MB/s, publish API failure 등) 및 컬러 파싱 터미널 창 제공.
 * **⚙️ Hardware Config:** 기록/트리거 채널 마스크, self/external/software-random 소스와 평균 rate, pair AND/OR 논리, 채널별 target baseline % 또는 고급 raw DAC, baseline-relative mV threshold, input range, RecordLength 등을 GUI에서 편집합니다. 최종 DC-offset DAC와 absolute discriminator code는 frontend의 채널별 실측 calibration으로 정합니다.
 * **📈 Live Monitor:** ZMQ 소켓 실시간 파형과 baseline-subtracted full-waveform signed charge 스펙트럼을 표시합니다. 활성 채널 자동 감지 오버레이와 기본 100,000개/Unlimited history를 지원하며, 이 preview 적분은 production ROOT schema 3의 peak-centered charge와 별개입니다.
-* **🔬 Offline Production:** `.dat` -> `.root` 변환 전담. Run number/config/runtime metadata를 함께 전달하고 ROOT에 보존하며, schema 3 polarity-corrected peak T0 기록, `[-20 ns,+40 ns)` signed charge, 파형 강제 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
+* **🔬 Offline Production:** `.dat` -> `.root` 기본 변환 및 선택적 config/runtime metadata 검증. 기본 분석은 polarity/baseline 구간을 선택하고 미검증 상태를 명시합니다. 검증 모드는 원본 설정과 metadata를 ROOT에 보존합니다. schema 3 polarity-corrected peak T0 기록, `[-20 ns,+40 ns)` signed charge, 파형 저장(-w), ETA 및 특정 Event ID 디버깅(-d)을 지원합니다.
 * **✅ ROOT Validation:** `./bin/root_validate_dt5730`을 별도 프로세스로 실행해 production ROOT를 수정하지 않고 전체 event 또는 제한 prefix를 검사합니다. file identity/SHA-256, ROOT recovery/schema/branch, EventID/TTT/counter/shape, summary, finite/range/saturation, baseline settling, threshold 실효값, routing, embedded config/metadata/binary provenance를 영역별 PASS/WARN/FAIL로 표시합니다. 검증 결과에는 production `Charge_CHn`의 채널별 히스토그램과 full/prefix/stride 표본 범위도 함께 표시됩니다. 선택적으로 모든 RAW header·sample·DSP 결과와 ROOT를 정확히 대조하며, 기존 경로를 덮어쓰지 않는 별도 JSON 보고서를 원자적으로 내보낼 수 있습니다. Production 완료 파일은 자동으로 이 탭의 입력란에 전달되지만 검증 시작은 사용자가 직접 누릅니다.
 * **🗄️ Run DB History:** SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업 및 당시 `.conf` 파일 스냅샷 추적.
 

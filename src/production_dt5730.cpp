@@ -1541,9 +1541,11 @@ bool MetadataPathWasRelocated(const Json& metadata,
 }
 
 std::optional<int> RunNumberFromFilename(const std::string& input_file) {
-    const std::string filename = fs::path(input_file).filename().string();
+    // Earlier run-like text belongs to the operator's basename. Directory
+    // names never participate. Keep this grammar aligned with the GUI DB.
+    const std::string filename = fs::path(input_file).stem().string();
     const std::regex run_token(
-        R"((^|[^A-Za-z0-9])run[_-]?([0-9]+)([^0-9]|$))",
+        R"((^|_)run[_-]?([0-9]+)(_(part[0-9]+|th[0-9]+))?$)",
         std::regex_constants::icase);
     std::smatch match;
     if (!std::regex_search(filename, match, run_token)) return std::nullopt;
@@ -1591,14 +1593,51 @@ int main(int argc, char **argv) {
     int debug_event_id = -1;
     std::optional<int> requested_run_number;
     bool save_waveform = false; 
+    bool force_basic = false;
+    bool basic_dsp_options = false;
+    bool basic_falling = true;
+    int basic_baseline_samples = 150;
+    const option long_options[] = {
+        {"basic", no_argument, nullptr, 'B'},
+        {"polarity", required_argument, nullptr, 'p'},
+        {"baseline-samples", required_argument, nullptr, 'b'},
+        {nullptr, 0, nullptr, 0},
+    };
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:c:m:r:d:w")) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:c:m:r:d:wBp:b:",
+                              long_options, nullptr)) != -1) {
         switch (opt) {
             case 'i': input_file = optarg; break;
             case 'o': output_file = optarg; break;
             case 'c': config_file = optarg; break;
             case 'm': metadata_file = optarg; break;
+            case 'B': force_basic = true; break;
+            case 'p': {
+                const std::string polarity(optarg);
+                if (polarity != "falling" && polarity != "rising") {
+                    std::cerr << "[Error] --polarity must be falling or rising\n";
+                    return 1;
+                }
+                basic_falling = polarity == "falling";
+                basic_dsp_options = true;
+                break;
+            }
+            case 'b': {
+                try {
+                    basic_baseline_samples = ParsePositiveRunNumber(
+                        optarg, "--baseline-samples");
+                    if (static_cast<uint32_t>(basic_baseline_samples) >
+                        dt5730_constraints::kMaximumRecordLengthSamples) {
+                        throw std::runtime_error("--baseline-samples exceeds maximum record length");
+                    }
+                } catch (const std::exception& error) {
+                    std::cerr << "[Error] " << error.what() << "\n";
+                    return 1;
+                }
+                basic_dsp_options = true;
+                break;
+            }
             case 'r': {
                 try {
                     requested_run_number =
@@ -1628,7 +1667,8 @@ int main(int argc, char **argv) {
                 std::cerr << "Usage: " << argv[0]
                           << " [input.dat] [-o output.root] [-c config.conf]"
                              " [-m runtime.run.json] [-r run_number]"
-                             " [-d event_id] [-w]\n";
+                             " [-d event_id] [-w] [--basic]"
+                             " [--polarity falling|rising] [--baseline-samples N]\n";
                 return 1;
         }
     }
@@ -1638,7 +1678,34 @@ int main(int argc, char **argv) {
         std::cerr << "Usage: " << argv[0]
                   << " [input.dat] [-o output.root] [-c config.conf]"
                      " [-m runtime.run.json] [-r run_number]"
-                     " [-d event_id] [-w]\n";
+                     " [-d event_id] [-w] [--basic]"
+                     " [--polarity falling|rising] [--baseline-samples N]\n";
+        return 1;
+    }
+
+    // Never silently downgrade a selected/discoverable bundle on validation
+    // failure. --basic explicitly opts out, including for failed-run data.
+    bool verify_provenance = !force_basic &&
+        (!config_file.empty() || !metadata_file.empty());
+    if (!force_basic && !verify_provenance) {
+        for (const char* suffix : {".config.conf", ".run.json"}) {
+            const std::string sidecar = input_file + suffix;
+            std::error_code error;
+            const fs::file_status status = fs::symlink_status(sidecar, error);
+            if (error && error != std::errc::no_such_file_or_directory) {
+                std::cerr << "[Error] Cannot inspect sidecar " << sidecar
+                          << ": " << error.message() << "\n";
+                return 1;
+            }
+            // A dangling symlink also counts as an existing broken bundle.
+            verify_provenance = verify_provenance || fs::exists(status);
+        }
+    }
+    if ((force_basic && (!config_file.empty() || !metadata_file.empty())) ||
+        (verify_provenance && basic_dsp_options)) {
+        std::cerr << "[Error] Basic DSP options/--basic cannot be combined with "
+                     "verified config/metadata. Use --basic without -c/-m, or "
+                     "use the unchanged run bundle.\n";
         return 1;
     }
 
@@ -1671,7 +1738,7 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Cannot open input file: " + input_file);
         }
 
-        {
+        if (verify_provenance) {
             if (config_file.empty()) config_file = input_file + ".config.conf";
             if (metadata_file.empty()) metadata_file = input_file + ".run.json";
 
@@ -1814,6 +1881,24 @@ int main(int argc, char **argv) {
             RequireConsistentRunNumber(metadata_run, run_number, "RunMetadata");
             RequireConsistentRunNumber(filename_run, run_number,
                                        "input filename");
+        } else {
+            applied_waveform_dsp_schema = cpnr::kWaveformDspCurrentSchema;
+            trigger_is_falling = basic_falling;
+            selected_settings.software_dsp.waveform.baseline_samples =
+                static_cast<std::size_t>(basic_baseline_samples);
+            const auto filename_run = RunNumberFromFilename(input_file);
+            run_number = requested_run_number.value_or(filename_run.value_or(0));
+            run_number_source = requested_run_number ? "-r" :
+                                filename_run ? "input filename" : "unknown";
+            RequireConsistentRunNumber(filename_run, run_number, "input filename");
+            std::cerr << "[Warning] BASIC DAT-only conversion: acquisition settings, "
+                         "completion and historical integrity are NOT verified. "
+                         "Sidecars are not used.\n"
+                      << "[Analysis] polarity=" << (trigger_is_falling ? "falling" : "rising")
+                      << ", baseline_samples=" << basic_baseline_samples
+                      << ", DSP schema=" << applied_waveform_dsp_schema
+                      << ", charge window=[-20,+40) ns, units=ADC (charge: ADC*sample)"
+                      << ", run=" << run_number << " (" << run_number_source << ")\n";
         }
     } catch (const std::exception& error) {
         std::cerr << "[Error] " << error.what() << "\n";
@@ -1877,16 +1962,21 @@ int main(int argc, char **argv) {
     raw_input_identity = {
         static_cast<uint64_t>(raw_input_open_status.st_dev),
         static_cast<uint64_t>(raw_input_open_status.st_ino)};
+    if (!verify_provenance) {
+        recorded_raw_size_bytes = static_cast<uint64_t>(raw_input_open_status.st_size);
+    }
     if (static_cast<uint64_t>(raw_input_open_status.st_size) !=
         recorded_raw_size_bytes) {
         std::cerr << "[Error] Raw input size does not match RunMetadata\n";
         return 1;
     }
     try {
-        std::cout << "[Production] Authenticating raw input SHA-256...\n";
-        if (Sha256FileDescriptorHex(raw_input_descriptor.get(),
-                                    recorded_raw_size_bytes) !=
-            recorded_raw_sha256) {
+        std::cout << "[Production] " << (verify_provenance ? "Authenticating" : "Recording")
+                  << " raw input SHA-256...\n";
+        const std::string actual_raw_sha256 = Sha256FileDescriptorHex(
+            raw_input_descriptor.get(), recorded_raw_size_bytes);
+        if (!verify_provenance) recorded_raw_sha256 = actual_raw_sha256;
+        if (actual_raw_sha256 != recorded_raw_sha256) {
             std::cerr << "[Error] Raw input SHA-256 does not match RunMetadata\n";
             return 1;
         }
@@ -1996,26 +2086,41 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        bool initial_write_failed =
+        bool initial_write_failed = verify_provenance && (
             config_macro.Write("RunConfig") <= 0 ||
             WriteStringObject("RunConfigExact", config_contents) <= 0 ||
             WriteStringObject("RunConfigSha256", Sha256Hex(config_contents)) <= 0 ||
             WriteStringObject("RunMetadata", metadata_contents) <= 0 ||
             WriteStringObject("RunMetadataSha256",
                               Sha256Hex(metadata_contents)) <= 0 ||
-            WriteStringObject("InputFile", AbsolutePath(input_file)) <= 0 ||
             WriteStringObject("ConfigFile", AbsolutePath(config_file)) <= 0 ||
             WriteStringObject("MetadataFile", AbsolutePath(metadata_file)) <= 0 ||
             WriteStringObject("RecordedRawOutputPath", recorded_raw_path) <= 0 ||
-            WriteStringObject("ResolvedRawInputPath",
-                              AbsolutePath(input_file)) <= 0 ||
             WriteStringObject("RecordedConfigPath", recorded_config_path) <= 0 ||
             WriteStringObject("ResolvedConfigPath",
                               AbsolutePath(config_file)) <= 0 ||
             WriteStringObject("RecordedMetadataPath",
                               recorded_metadata_path) <= 0 ||
             WriteStringObject("ResolvedMetadataPath",
-                              AbsolutePath(metadata_file)) <= 0 ||
+                              AbsolutePath(metadata_file)) <= 0);
+        if (!verify_provenance) {
+            // Analysis assumptions are not DAQ metadata. Never fabricate a
+            // RunConfig/RunMetadata or pretend hardware was read back.
+            const Json basic_settings = {
+                {"schema_version", 1}, {"polarity", trigger_is_falling ? "falling" : "rising"},
+                {"baseline_samples", basic_baseline_samples},
+                {"waveform_dsp_schema", applied_waveform_dsp_schema},
+                {"raw_size_bytes", recorded_raw_size_bytes},
+                {"raw_sha256_at_conversion", recorded_raw_sha256},
+                {"acquisition_settings_verified", false},
+            };
+            initial_write_failed = WriteStringObject(
+                "BasicConversion", basic_settings.dump()) <= 0;
+        }
+        initial_write_failed = initial_write_failed ||
+            WriteStringObject("ConversionMode", verify_provenance ? "verified" : "basic") <= 0 ||
+            WriteStringObject("InputFile", AbsolutePath(input_file)) <= 0 ||
+            WriteStringObject("ResolvedRawInputPath", AbsolutePath(input_file)) <= 0 ||
             WriteStringObject("ExecutablePath", executable_path) <= 0 ||
             WriteStringObject("ExecutableSha256", executable_sha256) <= 0 ||
             WriteStringObject("ExecutableBuildTime", CPNR_BUILD_TIMESTAMP) <= 0 ||
@@ -2122,11 +2227,27 @@ int main(int argc, char **argv) {
         current_event++;
         record_len_branch = header.RecordLength; 
 
+        if (!verify_provenance && is_first_event) {
+            expected_record_length = header.RecordLength;
+            expected_channel_mask = header.ChannelMask;
+            if (selected_settings.software_dsp.waveform.baseline_samples >=
+                header.RecordLength) {
+                std::cerr << "\n[Error] --baseline-samples must be smaller than "
+                             "the DAT record length\n";
+                conversion_failed = true;
+                g_running = 0;
+                break;
+            }
+        }
+
         if (header.RecordLength <
                 dt5730_constraints::kMinimumRecordLengthSamples ||
             header.RecordLength >
                 dt5730_constraints::kMaximumRecordLengthSamples ||
-            header.RecordLength % expected_record_length_granularity != 0U ||
+            (verify_provenance
+                 ? header.RecordLength % expected_record_length_granularity != 0U
+                 : (header.RecordLength % 8U != 0U &&
+                    header.RecordLength % dt5730_constraints::kRecordLengthGranularitySamples != 0U)) ||
             header.RecordLength != expected_record_length ||
             header.ChannelMask == 0U || (header.ChannelMask & ~0xFFU) != 0U ||
             header.ChannelMask != expected_channel_mask ||

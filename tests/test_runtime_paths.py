@@ -403,11 +403,27 @@ class RuntimePathTests(unittest.TestCase):
                 "/data/run.root", max_events=1, raw_fidelity=True
             )
 
-    def test_non_positive_run_number_is_rejected(self):
+    def test_basic_production_only_requires_dat_and_explicit_assumptions(self):
+        arguments = build_production_arguments(
+            "/data/Cs137.dat", basic=True, polarity="rising", baseline_samples=100,
+        )
+        self.assertEqual(arguments, [
+            "-i", "/data/Cs137.dat", "--basic", "--polarity", "rising",
+            "--baseline-samples", "100",
+        ])
+        for kwargs in ({"polarity": "other"}, {"baseline_samples": 0},
+                       {"baseline_samples": 102401}, {"config_snapshot": "/tmp/a"}):
+            with self.assertRaises(RuntimeValidationError):
+                build_production_arguments("/tmp/input.dat", basic=True, **kwargs)
+        auto = build_production_arguments("/tmp/a", "/tmp/b", 0, "/tmp/c")
+        self.assertNotIn("-r", auto)
+        self.assertNotIn("--basic", auto)
+
+    def test_invalid_run_number_is_rejected(self):
         with self.assertRaises(RuntimeValidationError):
             build_frontend_command("/bin/true", "/tmp/a", "/tmp/b", 0, "/tmp/c")
         with self.assertRaises(RuntimeValidationError):
-            build_production_arguments("/tmp/a", "/tmp/b", 0, "/tmp/c")
+            build_production_arguments("/tmp/a", "/tmp/b", -1, "/tmp/c")
 
     def test_stale_binary_and_hash_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

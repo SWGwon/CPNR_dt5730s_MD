@@ -50,8 +50,20 @@ def _absolute_path(value):
 
 
 def _infer_run_number(output_file):
-    match = re.search(r"_run([0-9]+)(?:\D|$)", str(output_file))
-    return int(match.group(1)) if match else 0
+    # Only the terminal suffix, optionally followed by a DAQ segment, is an
+    # identity token. Keep this grammar aligned with the production converter.
+    stem = os.path.splitext(os.path.basename(os.fspath(output_file)))[0]
+    match = re.search(
+        r"(?:^|_)run[_-]?([0-9]+)(?:_(?:part[0-9]+|th[0-9]+))?$",
+        stem, re.IGNORECASE,
+    )
+    if not match:
+        return 0
+    digits = match.group(1).lstrip("0")
+    if len(digits) > 10:
+        return 0
+    number = int(digits or "0")
+    return number if 0 < number <= 2147483647 else 0
 
 
 class DatabaseManager:

@@ -906,6 +906,32 @@ void make_legacy(const char *path, bool malformed_event_id_array = false,
 
 
 class RootValidationIntegrationTests(unittest.TestCase):
+    def test_basic_conversion_checks_dsp_without_claiming_hardware_provenance(self):
+        with tempfile.TemporaryDirectory(prefix="cpnr_basic_validation_") as temp:
+            directory = Path(temp)
+            for polarity in ("falling", "rising"):
+                raw = directory / f"Cs137_{polarity}.dat"
+                write_raw_fixture(raw, polarity=polarity)
+                output = directory / f"{polarity}.root"
+                result = subprocess.run([
+                    str(PRODUCTION), str(raw), "--basic", "--polarity", polarity,
+                    "--baseline-samples", "100", "-w", "-o", str(output),
+                ], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                before = read_only_identity(output)
+                validation = run_validator(output)
+                report = decode_report_with_exit(validation)
+                by_name = {check["name"]: check for check in report["checks"]}
+                self.assertEqual(by_name["runtime_metadata"]["status"], "WARN")
+                self.assertEqual(by_name["basic_analysis_settings"]["status"], "WARN")
+                self.assertEqual(by_name["run_number"]["status"], "WARN")
+                self.assertEqual(by_name["waveform_dsp_contract"]["status"], "PASS")
+                self.assertEqual(report["overall_status"], "WARN", report["checks"])
+                self.assertEqual(read_only_identity(output), before)
+                self.assertNotIn("legacy_trigger_inference", by_name)
+                fidelity = decode_report_with_exit(run_validator(output, raw_fidelity=True))
+                self.assertEqual(fidelity["overall_status"], "FAIL")
+
     def assert_charge_histogram(
         self,
         channel: dict,

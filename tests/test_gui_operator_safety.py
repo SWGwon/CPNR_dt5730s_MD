@@ -1046,6 +1046,53 @@ class GuiOperatorSafetyTests(unittest.TestCase):
         ):
             return production_module.ProductionTab()
 
+    def test_production_dat_only_launch_ignores_stale_context_fields(self):
+        from widgets import ProductionTab as production_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / "bin").mkdir()
+            executable = project / "bin" / "production_dt5730"
+            executable.write_bytes(b"fixture executable")
+            raw = project / "sample_run2_run021_part17.dat"
+            raw.write_bytes(b"fixture raw")
+            tab = self.make_production_tab(project)
+            tab.set_run_context({
+                "raw_file": "old.dat", "config_path": "missing.conf",
+                "metadata_path": "missing.json", "run_number": 999,
+            })
+            self.assertTrue(tab.chk_verify_metadata.isChecked())
+            tab._raw_input_edited(str(raw))
+            tab.input_edit.setText(str(raw))
+            tab.config_edit.setText("nonexistent-stale.conf")
+            tab.metadata_edit.setText("nonexistent-stale.json")
+            tab.chk_debug_mode.setChecked(False)
+            tab.combo_basic_polarity.setCurrentText("rising")
+            tab.spin_basic_baseline.setValue(100)
+            self.assertFalse(tab.chk_verify_metadata.isChecked())
+            self.assertFalse(tab.config_edit.isEnabled())
+            self.assertEqual(tab.spin_run_number.value(), 0)
+            self.assertIsNone(tab.completed_run_context)
+            with (
+                mock.patch.object(production_module, "verify_deployed_gui"),
+                mock.patch.object(production_module, "verify_binary_fresh",
+                                  return_value=production_module.file_identity(executable)),
+                mock.patch.object(production_module, "verify_expected_hashes") as hashes,
+                mock.patch.object(tab.process, "start") as start,
+            ):
+                tab.run_conversion()
+                start.assert_called_once()
+                program, args = start.call_args.args
+                self.assertEqual(program, str(executable))
+                self.assertIn("--basic", args)
+                self.assertEqual(args[args.index("--polarity") + 1], "rising")
+                self.assertEqual(args[args.index("--baseline-samples") + 1], "100")
+                for option in ("-r", "-c", "-m"):
+                    self.assertNotIn(option, args)
+                self.assertEqual(list(hashes.call_args.args[0]), [str(executable)])
+            tab._run_active = False
+            tab.deleteLater()
+
     @unittest.skipUnless(os.name == "posix", "QProcess shell test is POSIX-only")
     def test_production_reads_real_stderr_channel_and_recovers_on_exit(self):
         with tempfile.TemporaryDirectory() as directory:

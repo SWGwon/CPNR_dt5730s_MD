@@ -752,22 +752,36 @@ def build_frontend_command(
 
 def build_production_arguments(
     raw_input: os.PathLike[str] | str,
-    config_snapshot: os.PathLike[str] | str,
-    run_number: int,
-    metadata_input: os.PathLike[str] | str,
+    config_snapshot: os.PathLike[str] | str | None = None,
+    run_number: int = 0,
+    metadata_input: os.PathLike[str] | str | None = None,
     *,
     root_output: os.PathLike[str] | str | None = None,
     save_waveforms: bool = False,
     debug_event_id: int | None = None,
+    basic: bool = False,
+    polarity: str = "falling",
+    baseline_samples: int = 150,
 ) -> list[str]:
-    if run_number <= 0:
-        raise RuntimeValidationError("run number는 양수여야 합니다.")
-    raw, config, metadata = _absolute_strings(
-        [raw_input, config_snapshot, metadata_input]
-    )
-    arguments = [
-        "-i", raw, "-c", config, "-r", str(run_number), "-m", metadata,
-    ]
+    if run_number < 0:
+        raise RuntimeValidationError("run number는 0(자동) 이상이어야 합니다.")
+    arguments = ["-i", str(Path(raw_input).resolve())]
+    if basic:
+        if config_snapshot or metadata_input:
+            raise RuntimeValidationError("기본 변환에는 config/metadata를 전달하지 않습니다.")
+        if polarity not in ("falling", "rising") or not 1 <= baseline_samples <= 102400:
+            raise RuntimeValidationError("기본 변환의 polarity/baseline samples가 잘못되었습니다.")
+        arguments.extend([
+            "--basic", "--polarity", polarity,
+            "--baseline-samples", str(baseline_samples),
+        ])
+    else:
+        if not config_snapshot or not metadata_input:
+            raise RuntimeValidationError("검증 변환에는 config와 metadata가 필요합니다.")
+        config, metadata = _absolute_strings([config_snapshot, metadata_input])
+        arguments.extend(["-c", config, "-m", metadata])
+    if run_number:
+        arguments.extend(["-r", str(run_number)])
     if root_output:
         arguments.extend(["-o", str(Path(root_output).resolve())])
     if save_waveforms:

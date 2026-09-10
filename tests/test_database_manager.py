@@ -19,10 +19,27 @@ from core.DatabaseManager import (  # noqa: E402
     DatabaseManager,
     DatabaseMigrationError,
     SCHEMA_VERSION,
+    _infer_run_number,
 )
 
 
 class DatabaseManagerTests(unittest.TestCase):
+    def test_only_trailing_run_suffix_is_inferred(self):
+        for basename in ("1800V", "Cs137", "sample_run2", "sample_run0",
+                         "sample_run2147483648", "sample_RUN2", "sample_run2V",
+                         "sample_run_2", "sample_run-2", "sample_run2.5mV"):
+            for segment in ("", "_part17", "_th14000"):
+                path = f"/campaign_run999/{basename}_run021{segment}.dat"
+                with self.subTest(path=path):
+                    self.assertEqual(_infer_run_number(path), 21)
+        for name in ("Cs137.dat", "sample_run2V.dat", "sample_run2_retry.dat",
+                     "sample_run2_th1_retry.dat", "sample_run0.dat",
+                     "sample_run2147483648.dat"):
+            self.assertEqual(_infer_run_number(f"/campaign_run999/{name}"), 0)
+        for name in ("run021.dat", "sample_RUN021_part17.dat",
+                     "sample_run_021.dat", "sample_run-021.dat"):
+            self.assertEqual(_infer_run_number(name), 21)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary_directory.name)
@@ -34,6 +51,13 @@ class DatabaseManagerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_record_start_fallback_uses_suffix_not_directory_or_prefix(self):
+        manager = DatabaseManager(self.db_path)
+        run_id = manager.record_run_start(
+            self.data_dir / "sample_run2_run021_part17.dat", {}, self.config_path,
+        )
+        self.assertEqual(manager.get_run(run_id)["run_number"], 21)
 
     def record(self, manager, name="sample_run007.dat", **kwargs):
         return manager.record_run_start(
