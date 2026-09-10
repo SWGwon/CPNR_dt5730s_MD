@@ -251,9 +251,13 @@ if(BUILD_TESTING)
     add_test(NAME gui_monitor_safety_regression
         COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
                 tests/test_monitor_safety.py)
+    add_test(NAME gui_production_batch_regression
+        COMMAND ${CPNR_GUI_TEST_PYTHON} -m unittest -v
+                tests/test_production_batch.py)
     set_tests_properties(
         gui_operator_safety_regression gui_process_lifecycle_regression
         gui_root_validation_lifecycle_regression gui_monitor_safety_regression
+        gui_production_batch_regression
         PROPERTIES
           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
           ENVIRONMENT "QT_QPA_PLATFORM=offscreen"

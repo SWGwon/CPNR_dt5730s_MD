@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QComboBox)
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess, QTimer
 from core.DatabaseManager import DatabaseManager
+from widgets.ProductionBatch import ProductionBatch
 from core.runtime_paths import (
     RuntimeValidationError,
     build_production_arguments,
@@ -56,6 +57,10 @@ class ProductionTab(QWidget):
         self.current_root_output = ""
         self.completed_run_context = None
         self._stderr_buffer = ""
+        self._stdout_buffer = ""
+        self._stderr_history = ""
+        self._last_launch_error = ""
+        self._pending_run_context = None
         self._run_active = False
         self._cancel_requested = False
         self._active_db_run_id = None
@@ -67,6 +72,7 @@ class ProductionTab(QWidget):
         self._force_stop_offered = False
         self.init_ui()
         self.load_settings()
+        self._sync_busy_controls()
         self.log_pattern = re.compile(r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)")
 
     def init_ui(self):
@@ -137,6 +143,7 @@ class ProductionTab(QWidget):
         self.lbl_basic_note.setWordWrap(True)
         io_layout.addWidget(self.lbl_basic_note, 8, 0, 1, 3)
         io_group.setLayout(io_layout); layout.addWidget(io_group)
+        self.io_group = io_group
 
         opt_group = QGroupBox("Conversion Options & Time-Machine Debugger")
         opt_layout = QHBoxLayout()
@@ -167,6 +174,15 @@ class ProductionTab(QWidget):
         opt_layout.addWidget(self.btn_prev); opt_layout.addWidget(self.btn_next); opt_layout.addWidget(self.spin_jump); opt_layout.addWidget(self.btn_jump); opt_layout.addWidget(self.btn_quit)
         opt_group.setLayout(opt_layout); layout.addWidget(opt_group)
 
+        batch_group = QGroupBox("Batch Production")
+        batch_layout = QVBoxLayout(batch_group)
+        self.batch = ProductionBatch(self.proj_dir, self)
+        self.batch.btn_start.clicked.connect(self.start_batch)
+        self.batch.jobRequested.connect(self._run_batch_job)
+        self.batch.activeChanged.connect(self._batch_active_changed)
+        batch_layout.addWidget(self.batch)
+        layout.addWidget(batch_group)
+
         dash_group = QGroupBox("Conversion Status Dashboard")
         dash_layout = QVBoxLayout()
         self.progress_bar = QProgressBar(); self.progress_bar.setValue(0); self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter); self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #5cb85c; }")
@@ -178,13 +194,81 @@ class ProductionTab(QWidget):
         layout.addWidget(dash_group)
 
         self.log_console = QTextEdit(); self.log_console.setReadOnly(True); self.log_console.setMaximumHeight(200)
+        self.log_console.document().setMaximumBlockCount(3000)
         self.log_console.setStyleSheet("background-color: #f8f9fa; color: #333333; font-family: monospace; border: 1px solid #ced4da;")
         layout.addWidget(self.log_console)
         self.setLayout(layout)
         self.set_debug_controls_enabled(False)
 
     def toggle_debug_ui(self, state):
-        self.spin_debug_start.setEnabled(self.chk_debug_mode.isChecked())
+        self.spin_debug_start.setEnabled(
+            self.chk_debug_mode.isChecked() and not self.has_pending_work()
+        )
+
+    def has_pending_work(self):
+        return (self._run_active or self.batch.active or
+                self.process.state() != QProcess.ProcessState.NotRunning)
+
+    def _sync_busy_controls(self):
+        busy = self.has_pending_work()
+        self.io_group.setEnabled(not busy)
+        self.chk_save_waveforms.setEnabled(not busy)
+        self.chk_debug_mode.setEnabled(not busy)
+        self.spin_debug_start.setEnabled(not busy and self.chk_debug_mode.isChecked())
+        self.btn_run.setEnabled(not busy)
+        self.batch.set_busy(busy)
+        if self.batch.active and not self._cancel_requested:
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.setText("Stop Batch")
+        elif not busy:
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stop Conversion")
+        if not busy and self._pending_run_context is not None:
+            context = self._pending_run_context
+            self._pending_run_context = None
+            self.set_run_context(context)
+
+    def start_batch(self):
+        if self.has_pending_work():
+            return
+        if self.chk_debug_mode.isChecked():
+            self.log_console.append("[Batch] Turn off Interactive Debug Mode before starting a batch.")
+            return
+        if not self.batch.jobs:
+            return
+        self.save_settings()
+        self.log_console.clear()
+        self._cancel_requested = False
+        self.batch.start({
+            "verified": self.chk_verify_metadata.isChecked(),
+            "polarity": self.combo_basic_polarity.currentText(),
+            "baseline_samples": self.spin_basic_baseline.value(),
+            "save_waveforms": self.chk_save_waveforms.isChecked(),
+        })
+
+    def _batch_active_changed(self, active):
+        self.log_console.append(
+            "[Batch] Started: outputs beside each DAT; automatic per-file run number."
+            if active else "[Batch] Finished. " + self.batch.summary.text()
+        )
+        self._sync_busy_controls()
+
+    def _run_batch_job(self, job):
+        self.log_console.append(f"<b>[Batch] Input:</b> {html.escape(job['raw'])}")
+        launched = self._launch_conversion(
+            # Let the converter derive its no-clobber default itself. Resolving
+            # an explicit output through a newly-created symlink could redirect
+            # the destination between the queue check and process launch.
+            raw_value=job["raw"], output_value="",
+            config_value=job["raw"] + ".config.conf" if job["verified"] else "",
+            metadata_value=job["raw"] + ".run.json" if job["verified"] else "",
+            run_number=0, verified=job["verified"], polarity=job["polarity"],
+            baseline_samples=job["baseline_samples"], save_waveforms=job["save_waveforms"],
+            debug_event_id=None, context={},
+        )
+        if not launched:
+            self.batch.complete_current("Failed", self._last_launch_error)
+            self._sync_busy_controls()
 
     def toggle_metadata_ui(self, checked):
         for widget in (self.config_edit, self.metadata_edit,
@@ -302,6 +386,12 @@ class ProductionTab(QWidget):
     def set_run_context(self, context):
         """Populate conversion provenance from a successfully completed DAQ run."""
 
+        if self.has_pending_work():
+            self._pending_run_context = dict(context)
+            self.log_console.append(
+                "[Run Context] A new DAQ context arrived; deferred until production is idle."
+            )
+            return
         self.completed_run_context = dict(context)
         self.input_edit.setText(context.get("raw_file", ""))
         self.config_edit.setText(context.get("config_path", ""))
@@ -318,27 +408,41 @@ class ProductionTab(QWidget):
         )
 
     def run_conversion(self):
-        if (
-            self._run_active
-            or self.process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self.has_pending_work():
             self.log_console.append(
                 "<span style='color:#b45309;'>[Warning] Conversion이 이미 "
                 "실행 중이므로 중복 실행하지 않았습니다.</span>"
             )
             return
         self.save_settings()
-        raw_value = self.input_edit.text().strip()
-        config_value = self.config_edit.text().strip()
-        metadata_value = self.metadata_edit.text().strip()
-        output_value = self.output_edit.text().strip()
-        verified = self.chk_verify_metadata.isChecked()
+        self._launch_conversion(
+            raw_value=self.input_edit.text().strip(),
+            config_value=self.config_edit.text().strip(),
+            metadata_value=self.metadata_edit.text().strip(),
+            output_value=self.output_edit.text().strip(),
+            run_number=self.spin_run_number.value(),
+            verified=self.chk_verify_metadata.isChecked(),
+            polarity=self.combo_basic_polarity.currentText(),
+            baseline_samples=self.spin_basic_baseline.value(),
+            save_waveforms=self.chk_save_waveforms.isChecked(),
+            debug_event_id=self.spin_debug_start.value() if self.chk_debug_mode.isChecked() else None,
+            context=dict(self.completed_run_context or {}),
+        )
+
+    def _launch_conversion(self, *, raw_value, config_value, metadata_value,
+                           output_value, run_number, verified, polarity,
+                           baseline_samples, save_waveforms, debug_event_id, context):
+        self._last_launch_error = ""
+        if self._run_active or self.process.state() != QProcess.ProcessState.NotRunning:
+            self._last_launch_error = "A conversion process is already active"
+            return False
         if not raw_value or (verified and (not config_value or not metadata_value)):
+            self._last_launch_error = "DAT input is required; verified mode also requires config and metadata"
             self.log_console.append(
                 "<span style='color:red;'>[Error] Select a DAT input. "
                 "Verified mode also requires the exact run config and metadata.</span>"
             )
-            return
+            return False
 
         try:
             verify_deployed_gui(self.runtime_gui_dir, self.proj_dir)
@@ -357,7 +461,6 @@ class ProductionTab(QWidget):
             )
             config_identity = file_identity(config_path) if verified else None
             metadata_identity = file_identity(metadata_path) if verified else None
-            context = self.completed_run_context or {}
             context_raw = context.get("raw_file")
             if verified and context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
                 expected_config = resolve_path(
@@ -387,7 +490,7 @@ class ProductionTab(QWidget):
             )
             if output_path:
                 os.makedirs(output_path.parent, exist_ok=True)
-            is_debug_mode = self.chk_debug_mode.isChecked()
+            is_debug_mode = debug_event_id is not None
             resolved_root_output = (
                 output_path or default_production_output(raw_path)
             )
@@ -399,16 +502,14 @@ class ProductionTab(QWidget):
             args = build_production_arguments(
                 raw_path,
                 config_path,
-                self.spin_run_number.value(),
+                run_number,
                 metadata_path,
                 root_output=(None if is_debug_mode else output_path),
-                save_waveforms=self.chk_save_waveforms.isChecked(),
-                debug_event_id=(
-                    self.spin_debug_start.value() if is_debug_mode else None
-                ),
+                save_waveforms=save_waveforms,
+                debug_event_id=debug_event_id,
                 basic=not verified,
-                polarity=self.combo_basic_polarity.currentText(),
-                baseline_samples=self.spin_basic_baseline.value(),
+                polarity=polarity,
+                baseline_samples=baseline_samples,
             )
             expected_hashes = {executable: executable_identity["sha256"]}
             if verified:
@@ -416,11 +517,12 @@ class ProductionTab(QWidget):
                 expected_hashes[str(metadata_path)] = metadata_identity["sha256"]
             verify_expected_hashes(expected_hashes)
         except (OSError, RuntimeValidationError) as exc:
+            self._last_launch_error = str(exc)
             self.log_console.append(
                 f"<span style='color:red;'>[Error] Conversion launch blocked: "
-                f"{exc}</span>"
+                f"{html.escape(str(exc))}</span>"
             )
-            return
+            return False
 
         self.current_raw_file = str(raw_path)
         self.current_root_output = (
@@ -428,8 +530,12 @@ class ProductionTab(QWidget):
         )
         self.progress_bar.setValue(0); self.progress_bar.setFormat("%p%")
         self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
-        self.log_console.clear(); self.last_stats = {}
+        if not self.batch.active:
+            self.log_console.clear()
+        self.last_stats = {}
         self._stderr_buffer = ""
+        self._stdout_buffer = ""
+        self._stderr_history = ""
         self._run_active = True
         self._cancel_requested = False
         self._active_debug_mode = is_debug_mode
@@ -519,9 +625,14 @@ class ProductionTab(QWidget):
                 "is read-only and will not change production DB status.</span>"
             )
         self.process.setWorkingDirectory(self.proj_dir)
+        self._sync_busy_controls()
         self.process.start(str(executable), args)
+        return True
 
     def stop_all(self, auto_force=False):
+        # Cancel queued work before terminating the child, including the
+        # no-child gap and the application's shutdown path.
+        self.batch.stop()
         if self.process.state() != QProcess.ProcessState.NotRunning:
             if self._force_stop_offered and not auto_force:
                 self.force_stop()
@@ -544,6 +655,7 @@ class ProductionTab(QWidget):
     def force_stop(self):
         """Explicit recovery action; normal Stop never blocks or kills."""
 
+        self.batch.stop()
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self._cancel_requested = True
             self._stop_grace_timer.stop()
@@ -582,12 +694,19 @@ class ProductionTab(QWidget):
 
     @pyqtSlot()
     def handle_stdout(self):
-        while self.process.canReadLine():
-            line = self.process.readLine().data().decode('utf-8', errors='ignore').strip()
+        self._stdout_buffer += bytes(self.process.readAllStandardOutput()).decode(
+            'utf-8', errors='replace'
+        )
+        # Production prints progress with carriage returns, without newlines.
+        lines = re.split(r'[\r\n]', self._stdout_buffer)
+        self._stdout_buffer = lines.pop()
+        for line in lines:
+            line = line.strip()
             if not line: continue
             clean_line = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('', line)
             match = self.log_pattern.search(clean_line)
             if match:
+                self.batch.set_current_progress(float(match.group(1)))
                 self.progress_bar.setValue(int(float(match.group(1)))); self.lbl_events.setText(f"Events: {int(match.group(2)):,}")
                 self.lbl_speed.setText(f"Speed: {match.group(3)} MB/s"); self.lbl_eta.setText(f"ETA: {match.group(4)} s")
                 self.last_stats = {"events": match.group(2), "avg_speed": match.group(3)}
@@ -601,6 +720,7 @@ class ProductionTab(QWidget):
             'utf-8', errors='replace'
         )
         if payload:
+            self._stderr_history = (self._stderr_history + payload)[-4096:]
             self._stderr_buffer += payload
             self._consume_stderr(final=False)
 
@@ -643,6 +763,8 @@ class ProductionTab(QWidget):
                 error_message=self.process.errorString(),
             )
             self._active_debug_mode = False
+            self.batch.complete_current("Failed", self.process.errorString())
+            self._sync_busy_controls()
 
     def _record_production_terminal(
         self, status, exit_code, *, root_file=None, error_message=None
@@ -692,8 +814,13 @@ class ProductionTab(QWidget):
 
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
+        if not self._run_active:
+            return
         self._stop_grace_timer.stop()
         self.handle_stdout()
+        if self._stdout_buffer:
+            self.log_console.append(html.escape(self._stdout_buffer))
+            self._stdout_buffer = ""
         self.handle_stderr()
         self._consume_stderr(final=True)
         self._run_active = False
@@ -745,6 +872,7 @@ class ProductionTab(QWidget):
                     f"debug exited with code {exitCode}.</span>"
                 )
             self._active_debug_mode = False
+            self._sync_busy_controls()
             return
 
         # A validated, newly-created ROOT output is stronger completion truth
@@ -809,3 +937,10 @@ class ProductionTab(QWidget):
                 "published.</b></span>"
             )
         self._active_debug_mode = False
+        self.batch.complete_current(
+            "Succeeded" if completed_output_truth else
+            "Cancelled" if self._cancel_requested else "Failed",
+            "Completed" if completed_output_truth else
+            (terminal_error or "Conversion failed") + "\n" + self._stderr_history,
+        )
+        self._sync_busy_controls()

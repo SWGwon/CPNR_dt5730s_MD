@@ -422,6 +422,12 @@ Frontend는 시작 전과 종료 직전에 strict health/config readback을 수�
 
 메타데이터는 파형을 ROOT로 변환하는 데 필수는 아닙니다. GUI에서 DAT를 선택하고 **Run ROOT Conversion**을 누르면 됩니다. **Verify original run config + metadata**를 선택하면 기존의 엄격한 검증을 수행합니다. DAQ 완료 context를 자동 전달받을 때는 이 검증 옵션이 켜집니다. 다른 DAT를 선택하면 이전 run 번호·출력 경로·context를 초기화합니다.
 
+여러 DAT를 처리하려면 **Batch Production → Add DAT files…**에서 다중 선택하거나 **Add folder…**로 폴더의 DAT 파일을 추가한 뒤 **Start Batch**를 누르십시오. 폴더 추가는 해당 폴더만 대상으로 하며 하위 폴더와 `.dat.partial`은 제외합니다. 중복 경로는 한 번만 등록됩니다. 목록은 메모리에만 유지되며, 실행 중 파일 추가/삭제와 분석 옵션 변경은 차단됩니다.
+
+배치는 한 파일씩 순차 처리하며 각 DAT 옆에 `*_prod.root`를 저장합니다. 단일 파일 입력란의 output/run/config/metadata 값은 재사용하지 않습니다. run 번호는 파일마다 자동 결정하고, 검증 모드에서는 각 DAT의 `.config.conf`/`.run.json`을 사용합니다. polarity, baseline samples, 파형 저장 여부는 시작 시 공통 옵션으로 고정합니다. 서로 다른 분석 옵션이 필요한 데이터는 배치를 나눠 실행하십시오. 대량 변환에서는 interactive debug를 끄십시오.
+
+목록에 파일별 `Pending / Running / Succeeded / Failed / Skipped / Cancelled`와 오류 내용, 전체 처리 개수를 표시합니다. 기존 ROOT는 내용 검증 없이 **Skipped**로 표시하고 덮어쓰지 않습니다. **Continue after a failed file**을 끄면 첫 실패 뒤의 대기 작업을 취소합니다. **Stop Batch**는 현재 변환에 정상 종료를 요청하고 남은 작업의 실행을 취소합니다. 다시 **Start Batch**를 누르면 목록을 재시도하되 이미 생성된 출력은 건너뜁니다. GUI 종료 시에도 대기 작업이 새로 시작되지 않도록 취소하며, 실행 중 들어온 새 DAQ context는 배치가 끝난 뒤 반영합니다.
+
 ```bash
 # sidecar 없이 DAT만 있는 경우 (기본: falling, 선두 150 samples baseline)
 ./bin/production_dt5730 sample_run2_run021_part17.dat

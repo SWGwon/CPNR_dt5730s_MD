@@ -231,10 +231,7 @@ class MainWindow(QMainWindow):
 
     def _workers_active(self):
         daq_active = self._daq_process_active()
-        production_active = (
-            self.production_tab.process.state()
-            != QProcess.ProcessState.NotRunning
-        )
+        production_active = self.production_tab.has_pending_work()
         validation_active = self.root_validation_tab.has_pending_work()
         return daq_active or production_active or validation_active
 
